@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  compliance:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Ban AI-authored commits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags --no-recurse-submodules origin "$BASE_SHA"
+          offenders=$(git log --no-merges --pretty=format:'%H %an <%ae> committed by %cn <%ce>' "$BASE_SHA".."$HEAD_SHA" \
+            | grep -iE '(claude|codex)' || true)
+          if [ -n "$offenders" ]; then
+            echo "Commits authored or committed by Claude or Codex are not allowed:"
+            echo "$offenders"
+            exit 1
+          fi
+      - name: Non ASCII characters
+        run: |
+          if grep -P -n "[^\x00-\x7F]" -r --include="*.py" --include="*.toml" --exclude-dir='.*' .; then
+            echo "Non-ASCII characters detected"
+            exit 1
+          fi
+
+  ci:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache
+        id: rust-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/uv
+            ~/.cargo/bin/just
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.cache/uv/
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pyproject.toml', 'uv.lock', '.github/workflows/*.yml') }}
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install just
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: cargo install --force --version 1.36.0 just --locked
+
+      - name: Install uv
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: cargo install --force --version 0.9.11 uv --locked
+
+      - name: Run tests
+        run: just test
+
+      - name: Run coverage
+        run: just coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          use_oidc: true
+          fail_ci_if_error: true
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: |
+            htmlcov/
+            coverage.xml
+          if-no-files-found: error
