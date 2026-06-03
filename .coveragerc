@@ -1,0 +1,14 @@
+[run]
+source = daw_ai
+relative_files = true
+omit =
+    */migrations/*
+    */tests.py
+    */test/*
+    */asgi.py
+    */wsgi.py
+    */settings/prod.py
+
+[report]
+exclude_lines =
+    pragma: no cover
