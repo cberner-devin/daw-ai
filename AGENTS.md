@@ -2,6 +2,12 @@
 
 This file tells coding agents how to work productively in this repository.
 
+## charter.md
+
+Treat the charter.md file as the authoritative project document from the user. NEVER modify it yourself,
+unless the user explicitly instructs you to. It should only be modified by the user. Your job is
+to implement the project and features that they describe in this document.
+
 ## Before completing codebase-changing work
 
 **Run `just test` and confirm it passes after making any change that can affect the codebase
