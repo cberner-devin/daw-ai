@@ -31,65 +31,28 @@ jobs:
           fi
       - name: Non ASCII characters
         run: |
-          if grep -P -n "[^\x00-\x7F]" -r --include="*.py" --include="*.toml" --exclude-dir='.*' .; then
+          if grep -P -n "[^\x00-\x7F]" -r --include="*.rs" --include="*.toml" --include="*.js" --exclude-dir=.git .; then
             echo "Non-ASCII characters detected"
             exit 1
           fi
 
   ci:
     runs-on: ubuntu-latest
-
-    permissions:
-      id-token: write
-      contents: read
-
     steps:
       - uses: actions/checkout@v6
-      - name: Cache
-        id: rust-cache
+      - name: Install just
+        run: cargo install --force --version 1.49.0 just --locked
+      - name: Install Rust MSRV
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.85.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Cache Rust build
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/bin/uv
-            ~/.cargo/bin/just
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            ~/.cache/uv/
-          key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pyproject.toml', 'uv.lock', '.github/workflows/*.yml') }}
-
-      - name: Install Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Install just
-        if: steps.rust-cache.outputs.cache-hit != 'true'
-        run: cargo install --force --version 1.36.0 just --locked
-
-      - name: Install uv
-        if: steps.rust-cache.outputs.cache-hit != 'true'
-        run: cargo install --force --version 0.9.11 uv --locked
-
-      - name: Run tests
+          path: target
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+      - name: Run checks and tests
         run: just test
-
-      - name: Run coverage
-        run: just coverage
-
-      - name: Upload coverage to Codecov
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: codecov/codecov-action@v5
-        with:
-          files: ./coverage.xml
-          use_oidc: true
-          fail_ci_if_error: false
-
-      - name: Upload coverage reports
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-reports
-          path: |
-            htmlcov/
-            coverage.xml
-          if-no-files-found: error

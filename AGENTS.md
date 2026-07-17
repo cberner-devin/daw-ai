@@ -12,8 +12,9 @@ to implement the project and features that they describe in this document.
 
 **Run `just test` and confirm it passes after making any change that can affect the codebase
 in the current working directory.**
-This target runs the `pre` recipe first, which executes `uv sync --all-groups`,
-`uv run ruff check .`, and `uv run mypy .`, and then runs the Django test suite.
+This target runs the `pre` recipe first, which checks Rust formatting, runs Clippy with warnings
+denied, and checks the JavaScript syntax. It then runs the Rust test suite, builds the server,
+and exercises the core UI workflows in headless Chrome or Chromium.
 If any of those fail, fix the underlying issue; do not bypass checks.
 
 ## Style guide
@@ -34,4 +35,4 @@ often a good way to achieve coverage without bloating the suite.
    and your agent name at the end of the commit message. Use the same style as the
    [Linux Kernel's coding assistant guidelines](https://github.com/torvalds/linux/blob/master/Documentation/process/coding-assistants.rst).
 2. Make one commit per feature or bug fix when opening a PR. Multiple commits or fixup commits should
-   not be merged to the main branch.
+   not be merged to the default branch.
