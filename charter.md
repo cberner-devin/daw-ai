@@ -16,6 +16,16 @@ There is also an advanced view which the user can open that shows the details of
 that the agent has implemented for the track. This should be similar to a traditional DAW, but prioritize simple
 interfaces over super powerful tools.
 
+### Sound tools
+
+The following sound tools should be implemented and available in the advanced view of the UI and also to the AI model.
+
+* Clip: Contains notes or drum events, including their timing, duration, pitch, and velocity.
+* Instrument: Produces sound from musical events. Instruments may be synthesizers or sample-based instruments and expose configurable parameters.
+* Effect: Processes sound produced by an instrument, such as a filter, distortion, compressor, delay, or reverb, and exposes configurable parameters. May be chained with previous Effect.
+* Modulator: Generates time-varying control values—such as envelopes, LFOs, or arbitrary curves—which can control any Instrument or Effect parameter.
+
+Routing: Instruments, effects, and modulators can be connected into a signal chain.
 
 ### Implementation
 
