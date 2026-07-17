@@ -12,7 +12,9 @@ pub enum Action {
     Mute {
         target: Option<TrackRole>,
     },
-    Drop,
+    Drop {
+        build: f32,
+    },
     AddTrack {
         role: TrackRole,
     },
@@ -68,7 +70,7 @@ impl PromptEngine {
 
         if contains_any(&normalized, &["drop"]) {
             return EditPlan {
-                action: Action::Drop,
+                action: Action::Drop { build: 0.4 },
                 summary: "Built a high-energy drop with a lead, denser drums, and bass movement"
                     .to_owned(),
             };
@@ -385,7 +387,7 @@ mod tests {
         );
 
         let drop = PromptEngine::interpret("insert a sick drop here", 112);
-        assert_eq!(drop.action, Action::Drop);
+        assert_eq!(drop.action, Action::Drop { build: 0.4 });
     }
 
     #[test]

@@ -64,6 +64,7 @@
       this.reverbImpulse = null;
       this.trackGraphs = new Map();
       this.activeSources = new Set();
+      this.triggeredDropImpacts = new Set();
     }
 
     get isPlaying() {
@@ -108,6 +109,7 @@
       if (this.playhead >= state.project.duration - 0.01) this.playhead = 0;
 
       this.createTrackGraphs();
+      this.triggeredDropImpacts.clear();
       this.playbackState = "playing";
       this.contextStartedAt = this.context.currentTime;
       this.projectStartedAt = this.playhead;
@@ -281,6 +283,13 @@
         for (const edit of state.project.edits) {
           if (edit.start >= this.projectStartedAt) boundaries.add(edit.start);
           if (edit.end >= this.projectStartedAt) boundaries.add(edit.end);
+          const dropAction = this.findDropAction(edit.action);
+          if (dropAction) {
+            const timing = this.dropTiming(dropAction, edit);
+            for (const boundary of [timing.midpoint, timing.gapStart, timing.impact]) {
+              if (boundary >= this.projectStartedAt) boundaries.add(boundary);
+            }
+          }
         }
         for (const clip of track.clips) {
           if (clip.start >= this.projectStartedAt) boundaries.add(clip.start);
@@ -333,21 +342,25 @@
         },
         chorus: 0,
         compression: 0,
+        drop: null,
       };
       for (const effect of track.effects) {
         if (effect.enabled) this.applyEffect(effect.name, effect.mix, automation);
       }
       for (const edit of state.project.edits) {
         if (time >= edit.start && time < edit.end) {
-          this.applyAutomationAction(edit.action, track.role, automation);
+          this.applyAutomationAction(edit.action, track.role, automation, edit, time);
         }
+      }
+      if (automation.drop) {
+        this.applyDropAutomation(automation.drop.action, track.role, automation, automation.drop.edit, time);
       }
       return automation;
     }
 
-    applyAutomationAction(action, role, automation) {
+    applyAutomationAction(action, role, automation, edit, time) {
       if (action.type === "compound") {
-        for (const child of action.actions) this.applyAutomationAction(child, role, automation);
+        for (const child of action.actions) this.applyAutomationAction(child, role, automation, edit, time);
         return;
       }
       if (action.target !== "all" && action.target !== role) return;
@@ -359,7 +372,59 @@
       }
       if (action.type === "effect") this.applyEffect(action.name, action.value, automation);
       if (action.type === "remove-effect") this.removeEffect(action.name, automation);
-      if (action.type === "drop") automation.gain *= 1.08;
+      if (action.type === "drop") automation.drop = { action, edit };
+    }
+
+    findDropAction(action) {
+      if (action.type === "drop") return action;
+      if (action.type !== "compound") return null;
+      for (const child of action.actions) {
+        const drop = this.findDropAction(child);
+        if (drop) return drop;
+      }
+      return null;
+    }
+
+    dropTiming(action, edit) {
+      const buildFraction = clamp(Number(action.value ?? 0.4), 0.25, 0.6);
+      const impact = edit.start + (edit.end - edit.start) * buildFraction;
+      const gapDuration = Math.min(60 / state.project.bpm, (impact - edit.start) * 0.25);
+      const gapStart = impact - gapDuration;
+      const midpoint = edit.start + (gapStart - edit.start) * 0.55;
+      return { buildFraction, gapStart, impact, midpoint };
+    }
+
+    applyDropAutomation(action, role, automation, edit, time) {
+      const timing = this.dropTiming(action, edit);
+      if (time < timing.impact) {
+        if (time >= timing.gapStart) {
+          automation.gain = 0;
+          return;
+        }
+        const progress = clamp((time - edit.start) / Math.max(0.01, timing.gapStart - edit.start), 0, 1);
+        if (role === "drums") {
+          automation.gain *= 0.9 + progress * 0.08;
+          automation.compression = Math.max(automation.compression, 0.28);
+        } else {
+          automation.gain *= 0.74 - progress * 0.24;
+          automation.filter += 0.08 + progress * 0.28;
+        }
+        return;
+      }
+
+      const impactGain = {
+        drums: 1.22,
+        bass: 1.18,
+        chords: 0.78,
+        lead: 1.16,
+        texture: 0.86,
+      }[role];
+      automation.gain *= impactGain;
+      if (role === "bass" || role === "lead") automation.filter += 0.35;
+      if (role === "drums" || role === "bass") {
+        automation.compression = Math.max(automation.compression, 0.68);
+      }
+      if (role === "lead") automation.echo = Math.max(automation.echo, 0.3);
     }
 
     applyEffect(name, mix, automation) {
@@ -494,7 +559,7 @@
         const modifiers = this.modifiers(track, projectTime);
 
         if (track.role === "drums") {
-          this.scheduleDrums(step, audioTime, 1, modifiers, track.id);
+          this.scheduleDrums(step, audioTime, 1, modifiers, track.id, projectTime, stepDuration);
         } else if (track.role === "bass") {
           this.scheduleBass(step, audioTime, stepDuration, 1, modifiers, track.id);
         } else if (track.role === "chords") {
@@ -538,24 +603,53 @@
     }
 
     modifiers(track, time) {
-      const result = { rhythm: 0, release: 1, drop: false };
+      const result = {
+        rhythm: 0,
+        release: 1,
+        dropAction: null,
+        dropEdit: null,
+        dropPhase: "none",
+        dropProgress: 0,
+        dropImpact: 0,
+      };
       for (const edit of state.project.edits) {
         if (time < edit.start || time >= edit.end) continue;
-        this.applyPatternAction(edit.action, track.role, result);
+        this.applyPatternAction(edit.action, track.role, result, edit);
+      }
+      if (result.dropAction) {
+        const timing = this.dropTiming(result.dropAction, result.dropEdit);
+        result.dropImpact = timing.impact;
+        if (time < timing.impact) {
+          result.dropPhase = "build";
+          result.dropProgress = clamp(
+            (time - result.dropEdit.start) / Math.max(0.01, timing.impact - result.dropEdit.start),
+            0,
+            1,
+          );
+          result.rhythm += 0.1 + result.dropProgress * 0.65;
+        } else {
+          result.dropPhase = "impact";
+          result.dropProgress = clamp(
+            (time - timing.impact) / Math.max(0.01, result.dropEdit.end - timing.impact),
+            0,
+            1,
+          );
+          result.rhythm += 0.8;
+        }
       }
       return result;
     }
 
-    applyPatternAction(action, role, result) {
+    applyPatternAction(action, role, result, edit) {
       if (action.type === "compound") {
-        for (const child of action.actions) this.applyPatternAction(child, role, result);
+        for (const child of action.actions) this.applyPatternAction(child, role, result, edit);
         return;
       }
       if (action.target !== "all" && action.target !== role) return;
       if (action.type === "rhythm") result.rhythm += action.value;
       if (action.type === "drop") {
-        result.drop = true;
-        result.rhythm += 0.55;
+        result.dropAction = action;
+        result.dropEdit = edit;
       }
     }
 
@@ -565,10 +659,19 @@
       return baseInterval;
     }
 
-    scheduleDrums(step, time, gain, modifiers, trackId) {
-      const dense = modifiers.rhythm > 0.15 || modifiers.drop;
+    scheduleDrums(step, time, gain, modifiers, trackId, projectTime, stepDuration) {
+      const dense = modifiers.rhythm > 0.15;
       const sparse = modifiers.rhythm < -0.15;
-      if (step === 0 || step === 8 || (dense && (step === 6 || step === 14))) {
+      const dropId = modifiers.dropEdit?.id;
+      const firstImpact =
+        modifiers.dropPhase === "impact" &&
+        projectTime < modifiers.dropImpact + stepDuration + 0.0001 &&
+        !this.triggeredDropImpacts.has(dropId);
+      if (firstImpact) {
+        this.triggeredDropImpacts.add(dropId);
+        this.kick(time, gain * 0.82, trackId);
+        this.crash(time, gain * 0.18, trackId);
+      } else if (step === 0 || step === 8 || (dense && (step === 6 || step === 14))) {
         this.kick(time, gain * 0.54, trackId);
       }
       if (step === 4 || step === 12) this.snare(time, gain * 0.25, trackId);
@@ -578,15 +681,19 @@
     }
 
     scheduleBass(step, time, stepDuration, gain, modifiers, trackId, elapsed = 0) {
-      const interval = this.rhythmInterval(4, modifiers);
+      const impact = modifiers.dropPhase === "impact";
+      const interval = impact ? 2 : this.rhythmInterval(4, modifiers);
       if (step % interval !== 0) return;
-      const notes = [55, 55, 65.41, 49, 55, 73.42, 65.41, 49];
+      const notes = impact
+        ? [41.2, 41.2, 49, 36.71, 41.2, 55, 49, 36.71]
+        : [55, 55, 65.41, 49, 55, 73.42, 65.41, 49];
       const frequency = notes[Math.floor(step / 2) % notes.length];
-      this.tone(frequency, time, stepDuration * Math.min(2.8, interval * 0.7), gain * 0.21, "square", modifiers, 850, trackId, elapsed);
+      const duration = impact ? stepDuration * 1.35 : stepDuration * Math.min(2.8, interval * 0.7);
+      this.tone(frequency, time, duration, gain * (impact ? 0.3 : 0.21), "square", modifiers, 850, trackId, elapsed);
     }
 
     scheduleChords(localStep, time, stepDuration, gain, modifiers, trackId, elapsed = 0) {
-      const interval = this.rhythmInterval(8, modifiers);
+      const interval = modifiers.dropPhase === "impact" ? 8 : this.rhythmInterval(8, modifiers);
       if (localStep % interval !== 0) return;
       const chordIndex = Math.floor(localStep / 8) % 4;
       const chords = [
@@ -601,11 +708,24 @@
     }
 
     scheduleLead(step, time, stepDuration, gain, modifiers, trackId, elapsed = 0) {
-      const interval = this.rhythmInterval(4, modifiers);
+      const impact = modifiers.dropPhase === "impact";
+      const interval = impact ? 2 : this.rhythmInterval(4, modifiers);
       if (step % interval !== 0) return;
-      const notes = [440, 523.25, 659.25, 587.33, 493.88, 440, 392, 493.88];
+      const notes = impact
+        ? [220, 261.63, 220, 196, 174.61, 196, 220, 146.83]
+        : [440, 523.25, 659.25, 587.33, 493.88, 440, 392, 493.88];
       const frequency = notes[Math.floor(step / 2) % notes.length];
-      this.tone(frequency, time, stepDuration * 1.55, gain * 0.1, "sawtooth", modifiers, 2400, trackId, elapsed);
+      this.tone(
+        frequency,
+        time,
+        stepDuration * (impact ? 1.3 : 1.55),
+        gain * (impact ? 0.14 : 0.1),
+        "sawtooth",
+        modifiers,
+        2400,
+        trackId,
+        elapsed,
+      );
     }
 
     scheduleTexture(localStep, time, gain, modifiers, trackId, elapsed = 0) {
@@ -627,6 +747,13 @@
       oscillator.frequency.setValueAtTime(frequency, time);
       filter.type = "lowpass";
       filter.frequency.value = baseFilter;
+      if (modifiers.dropPhase === "impact" && type === "square") {
+        filter.frequency.setValueAtTime(baseFilter * 0.55, time);
+        filter.frequency.exponentialRampToValueAtTime(
+          baseFilter * 1.4,
+          time + Math.min(0.18, remaining * 0.45),
+        );
+      }
       if (elapsed > 0) {
         envelope.gain.setValueAtTime(Math.max(0.0002, level * (remaining / release)), time);
       } else {
@@ -698,6 +825,24 @@
       this.trackSource(source);
       source.start(time);
       source.stop(time + 0.05);
+    }
+
+    crash(time, level, trackId) {
+      const source = this.context.createBufferSource();
+      const filter = this.context.createBiquadFilter();
+      const envelope = this.context.createGain();
+      source.buffer = this.noiseBuffer;
+      source.dawAiImpactCrash = true;
+      filter.type = "highpass";
+      filter.frequency.value = 2600;
+      envelope.gain.setValueAtTime(level, time);
+      envelope.gain.exponentialRampToValueAtTime(0.0001, time + 0.48);
+      source.connect(filter);
+      filter.connect(envelope);
+      this.routeVoice(envelope, trackId);
+      this.trackSource(source);
+      source.start(time);
+      source.stop(time + 0.49);
     }
   }
 
@@ -992,9 +1137,9 @@
     if (!event.target.closest(".track-lane") || !state.project) return;
     if (event.pointerType === "touch" && !state.touchSelectionMode) return;
     state.dragPointer = event.pointerId;
-    state.dragAnchor = Math.min(timelineTimeFromPointer(event), state.project.duration - 0.25);
-    state.selectionStart = state.dragAnchor;
-    state.selectionEnd = Math.min(state.project.duration, state.dragAnchor + 0.25);
+    state.dragAnchor = timelineTimeFromPointer(event);
+    state.selectionStart = Math.min(state.dragAnchor, state.project.duration - 0.25);
+    state.selectionEnd = state.selectionStart + 0.25;
     elements.trackRows.setPointerCapture(event.pointerId);
     renderSelection();
   }
@@ -1002,11 +1147,14 @@
   function moveSelection(event) {
     if (event.pointerId !== state.dragPointer) return;
     const current = timelineTimeFromPointer(event);
+    if (current === state.dragAnchor) {
+      state.selectionStart = Math.min(state.dragAnchor, state.project.duration - 0.25);
+      state.selectionEnd = state.selectionStart + 0.25;
+      renderSelection();
+      return;
+    }
     state.selectionStart = Math.min(state.dragAnchor, current);
     state.selectionEnd = Math.max(state.dragAnchor, current);
-    if (state.selectionEnd - state.selectionStart < 0.25) {
-      state.selectionEnd = Math.min(state.project.duration, state.selectionStart + 0.25);
-    }
     renderSelection();
   }
 
@@ -1059,8 +1207,11 @@
   async function submitPrompt(event) {
     event.preventDefault();
     if (state.promptPending) return;
-    const prompt = elements.promptInput.value.trim();
+    const submittedText = elements.promptInput.value;
+    const prompt = submittedText.trim();
     if (!prompt) return;
+    const selectionStart = state.selectionStart;
+    const selectionEnd = state.selectionEnd;
     state.promptPending = true;
     elements.composeButton.disabled = true;
     elements.composeButton.querySelector("span").textContent = "Codex is planning...";
@@ -1073,12 +1224,12 @@
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body: new URLSearchParams({
               prompt,
-              start: String(state.selectionStart),
-              end: String(state.selectionEnd),
+              start: String(selectionStart),
+              end: String(selectionEnd),
             }),
           });
           state.project = response.project;
-          elements.promptInput.value = "";
+          if (elements.promptInput.value === submittedText) elements.promptInput.value = "";
           renderProject();
           return response;
         }),

@@ -426,6 +426,14 @@ async function run() {
       "31.8s - 32.0s",
       "right-edge click must retain a valid selection",
     );
+    await mouse(cdp, appSession, "mousePressed", lane.right - 1, lane.y, 1);
+    await mouse(cdp, appSession, "mouseMoved", lane.left + lane.width * 0.75, lane.y, 1);
+    await mouse(cdp, appSession, "mouseReleased", lane.left + lane.width * 0.75, lane.y);
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('#selection-readout').textContent"),
+      "24.0s - 32.0s",
+      "a backward drag must preserve the true right-edge anchor",
+    );
 
     await mouse(cdp, appSession, "mousePressed", lane.left + lane.width * 0.25, lane.y, 1);
     await mouse(cdp, appSession, "mouseMoved", lane.left + lane.width * 0.5, lane.y, 1);
@@ -521,6 +529,7 @@ async function run() {
       { requests: 1, submitDisabled: true, transportActive: false },
       "prompt shortcuts must share one in-flight edit request",
     );
+    await evaluate(cdp, appSession, "document.querySelector('#prompt-input').value = 'draft the next edit'");
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await waitFor(
       async () => evaluate(cdp, appSession, "document.querySelector('#play-button').classList.contains('is-playing')"),
@@ -535,6 +544,11 @@ async function run() {
       await evaluate(cdp, appSession, "document.querySelector('#compose-button').disabled"),
       false,
       "prompt submission must release its lock after completion",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('#prompt-input').value"),
+      "draft the next edit",
+      "a successful request must preserve prompt text drafted while it was pending",
     );
     const promptedEditResumeTime = await evaluate(
       cdp,
@@ -763,6 +777,89 @@ async function run() {
       async () => evaluate(cdp, appSession, "!document.querySelector('#play-button').classList.contains('is-playing')"),
       "playback pause after mixer regression",
     );
+    await evaluate(cdp, appSession, `(() => {
+      const lane = document.querySelector('.track-lane');
+      lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true, cancelable: true }));
+      for (let index = 0; index < 32; index += 1) {
+        lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
+      }
+      const originalFetch = window.fetch;
+      const deferredMix = [];
+      window.__queuedMixRequestCount = 0;
+      window.__queuedPromptBody = null;
+      window.fetch = function fetch(resource, options) {
+        if (resource === '/api/mix') {
+          window.__queuedMixRequestCount += 1;
+          return new Promise((resolve, reject) => deferredMix.push({ resource, options, resolve, reject }));
+        }
+        if (resource === '/api/edits') window.__queuedPromptBody = options.body.toString();
+        return originalFetch(resource, options);
+      };
+      window.__releaseQueuedMix = () => {
+        const request = deferredMix.shift();
+        originalFetch(request.resource, request.options).then(request.resolve, request.reject);
+      };
+      window.__restoreFetchAfterQueuedPrompt = () => {
+        window.fetch = originalFetch;
+      };
+      document.querySelector('[data-volume-track="1"]').dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('#selection-readout').textContent"),
+      "8.0s - 16.0s",
+      "the queued prompt regression must begin with the intended selection",
+    );
+    await waitFor(
+      async () => evaluate(cdp, appSession, "window.__queuedMixRequestCount === 1"),
+      "blocking mixer mutation before prompt",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const input = document.querySelector('#prompt-input');
+      input.value = 'increase volume';
+      document.querySelector('#prompt-form').requestSubmit();
+      document.querySelector('.track-lane').dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Home', bubbles: true, cancelable: true }),
+      );
+    })()`);
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('#selection-readout').textContent"),
+      "0.0s - 8.0s",
+      "selection must remain editable while the prompt waits in the mutation queue",
+    );
+    await evaluate(cdp, appSession, "window.__releaseQueuedMix()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "window.__queuedPromptBody !== null"),
+      "queued prompt request",
+    );
+    const queuedPromptRange = await evaluate(
+      cdp,
+      appSession,
+      "Object.fromEntries(new URLSearchParams(window.__queuedPromptBody))",
+    );
+    assert.equal(queuedPromptRange.start, "8", "a queued prompt must retain its submitted start");
+    assert.equal(queuedPromptRange.end, "16", "a queued prompt must retain its submitted end");
+    await evaluate(cdp, appSession, "window.__restoreFetchAfterQueuedPrompt()");
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "document.querySelectorAll('.edit-item').length === 1 && !document.querySelector('#compose-button').disabled",
+        ),
+      "queued prompt completion",
+    );
+    const queuedPromptProject = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    assert.equal(queuedPromptProject.edits[0].start, 8);
+    assert.equal(queuedPromptProject.edits[0].end, 16);
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 0"),
+      "queued prompt undo",
+    );
     await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
     assert.equal(
       await evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').inert"),
@@ -781,8 +878,10 @@ async function run() {
       window.__convolverCount = 0;
       window.__reverbBuffers = [];
       window.__noiseBuffers = [];
+      window.__bufferSources = [];
       const originalClose = AudioContext.prototype.close;
       const originalCreateBuffer = AudioContext.prototype.createBuffer;
+      const originalCreateBufferSource = AudioContext.prototype.createBufferSource;
       const originalGain = AudioContext.prototype.createGain;
       const originalOscillator = AudioContext.prototype.createOscillator;
       const originalOscillatorStart = OscillatorNode.prototype.start;
@@ -805,6 +904,11 @@ async function run() {
         if (arguments_[0] === 2) window.__reverbBuffers.push(buffer);
         if (arguments_[0] === 1) window.__noiseBuffers.push(buffer);
         return buffer;
+      };
+      AudioContext.prototype.createBufferSource = function createBufferSource(...arguments_) {
+        const source = originalCreateBufferSource.apply(this, arguments_);
+        window.__bufferSources.push(source);
+        return source;
       };
       AudioContext.prototype.close = function close() {
         window.__audioCloseCount += 1;
@@ -905,6 +1009,172 @@ async function run() {
       "synthesized noise must be stable across playback contexts",
     );
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "!document.querySelector('#play-button').classList.contains('is-playing')"),
+      "pause before drop workflow",
+    );
+    const audioCloseCountBeforeDrop = await evaluate(cdp, appSession, "window.__audioCloseCount");
+
+    await mouse(cdp, appSession, "mousePressed", lane.left, lane.y, 1);
+    await mouse(cdp, appSession, "mouseMoved", lane.left + lane.width * (4 / 32), lane.y, 1);
+    await mouse(cdp, appSession, "mouseReleased", lane.left + lane.width * (4 / 32), lane.y);
+    await submitPrompt(cdp, appSession, "add a lead", 1);
+    await waitFor(
+      async () => evaluate(cdp, appSession, "!document.querySelector('#compose-button').disabled"),
+      "lead before drop completion",
+    );
+    const leadBeforeDrop = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json()).then((project) => project.tracks.find((track) => track.role === 'lead'))",
+    );
+    assert.deepEqual(
+      leadBeforeDrop.clips.map((clip) => [clip.label, clip.start, clip.end]),
+      [["AI variation", 0, 4]],
+      "the regression must begin with lead material covering the drop region",
+    );
+
+    await submitPrompt(cdp, appSession, "insert a sick drop here", 2);
+    await waitFor(
+      async () => evaluate(cdp, appSession, "!document.querySelector('#compose-button').disabled"),
+      "first drop completion",
+    );
+    const dropProject = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+    const dropLead = dropProject.tracks.find((track) => track.role === "lead");
+    assert.deepEqual(dropProject.edits[1].action, { type: "drop", value: 0.4, target: "all" });
+    assert.deepEqual(
+      dropLead.clips.map((clip) => [clip.label, clip.start, clip.end]),
+      [["Drop hook", 1.6, 4]],
+      "the drop must replace overlapping lead material and begin its hook at impact",
+    );
+
+    await submitPrompt(cdp, appSession, "make the drop hit harder", 3);
+    await waitFor(
+      async () => evaluate(cdp, appSession, "!document.querySelector('#compose-button').disabled"),
+      "drop refinement completion",
+    );
+    const refinedDrop = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+    assert.equal(refinedDrop.tracks.length, 4, "refining a drop must reuse its lead track");
+    assert.equal(
+      refinedDrop.tracks.find((track) => track.role === "lead").clips.length,
+      1,
+      "refining the same drop must not duplicate its hook",
+    );
+
+    await evaluate(cdp, appSession, `(() => {
+      window.__gainNodes = [];
+      window.__oscillators = [];
+      window.__bufferSources = [];
+      document.querySelector('#rewind-button').click();
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#play-button').classList.contains('is-playing')"),
+      "drop playback",
+    );
+    assert.equal(
+      await evaluate(
+        cdp,
+        appSession,
+        `window.__oscillators.some((node) => node.dawAiTrackId === ${dropLead.id})`,
+      ),
+      false,
+      "the impact lead must remain silent during the build",
+    );
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "Number(document.querySelector('#current-time').textContent.split(':')[1]) >= 1.3",
+        ),
+      "drop pre-impact gap",
+    );
+    assert.equal(
+      await evaluate(
+        cdp,
+        appSession,
+        `window.__gainNodes
+          .filter((node) => node.dawAiAutomation === 'level' && [1, 2, 3].includes(node.dawAiTrackId))
+          .every((node) => node.gain.value === 0)`,
+      ),
+      true,
+      "the arrangement must cut to silence immediately before impact",
+    );
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `window.__oscillators.some((node) => node.dawAiTrackId === ${dropLead.id})`,
+      ),
+      "drop impact lead",
+    );
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `window.__gainNodes.find(
+            (node) => node.dawAiAutomation === 'level' && node.dawAiTrackId === 1,
+          ).gain.value > ${refinedDrop.tracks[0].volume * 1.1} &&
+          window.__gainNodes.find(
+            (node) => node.dawAiAutomation === 'level' && node.dawAiTrackId === 2,
+          ).gain.value > ${refinedDrop.tracks[1].volume * 1.1}`,
+        ),
+      "drop impact level lift",
+    );
+    const impactLevels = await evaluate(cdp, appSession, `({
+      drums: window.__gainNodes.find((node) => node.dawAiAutomation === 'level' && node.dawAiTrackId === 1).gain.value,
+      bass: window.__gainNodes.find((node) => node.dawAiAutomation === 'level' && node.dawAiTrackId === 2).gain.value,
+    })`);
+    assert.ok(impactLevels.drums > refinedDrop.tracks[0].volume * 1.1, "drop impact must lift the drums");
+    assert.ok(impactLevels.bass > refinedDrop.tracks[1].volume * 1.1, "drop impact must lift the bass");
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "Number(document.querySelector('#current-time').textContent.split(':')[1]) >= 1.9",
+        ),
+      "drop impact one-shot window",
+    );
+    assert.equal(
+      await evaluate(
+        cdp,
+        appSession,
+        "window.__bufferSources.filter((source) => source.dawAiImpactCrash).length",
+      ),
+      1,
+      "a drop must schedule exactly one impact crash",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 2"),
+      "drop refinement undo",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "document.querySelectorAll('.edit-item').length === 1 && document.querySelectorAll('.track-row').length === 4",
+        ),
+      "drop creation undo",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "document.querySelectorAll('.edit-item').length === 0 && document.querySelectorAll('.track-row').length === 3",
+        ),
+      "existing lead undo",
+    );
+    await evaluate(cdp, appSession, `window.__audioCloseCount = ${audioCloseCountBeforeDrop}`);
 
     await mouse(cdp, appSession, "mousePressed", lane.left + lane.width * (0.25 / 32), lane.y, 1);
     await mouse(cdp, appSession, "mouseMoved", lane.left + lane.width * (0.5 / 32), lane.y, 1);
@@ -1273,7 +1543,7 @@ async function run() {
     assert.equal(consoleErrors.length, 0, "application emitted browser console errors");
 
     console.log(
-      "Browser workflows passed: mobile page/timeline panning, keyboard selection, serialized transport, voice chase, regional effects/filtering, short clips, targeted rhythm, prompt single-flight/undo, mixer focus/transport, modal, cross-origin guard",
+      "Browser workflows passed: mobile page/timeline panning, keyboard selection, serialized transport, voice chase, structured drops, regional effects/filtering, short clips, targeted rhythm, prompt single-flight/undo, mixer focus/transport, modal, cross-origin guard",
     );
   } finally {
     if (attacker) await new Promise((resolve) => attacker.close(resolve));

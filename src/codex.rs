@@ -225,7 +225,9 @@ fn action_from_json(value: &JsonValue) -> Result<Action, PlannerError> {
             target,
         }),
         "mute" => Ok(Action::Mute { target }),
-        "drop" if target.is_none() => Ok(Action::Drop),
+        "drop" if target.is_none() && (0.25..=0.6).contains(&value) => Ok(Action::Drop {
+            build: value as f32,
+        }),
         "add-track" => target
             .map(|role| Action::AddTrack { role })
             .ok_or_else(|| invalid("add-track requires a role target")),
@@ -612,6 +614,27 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn parses_a_drop_build_fraction() {
+        let plan = plan_from_json(
+            r#"{
+                "summary":"Built tension and landed a heavy drop",
+                "actions":[
+                    {"kind":"drop","target":"all","name":"None","value":0.4}
+                ]
+            }"#,
+        )
+        .expect("valid drop plan");
+        assert_eq!(plan.action, Action::Drop { build: 0.4 });
+
+        for value in [0.0, 0.8] {
+            let invalid = format!(
+                r#"{{"summary":"Bad drop","actions":[{{"kind":"drop","target":"all","name":"None","value":{value}}}]}}"#
+            );
+            assert!(plan_from_json(&invalid).is_err());
+        }
     }
 
     #[test]
