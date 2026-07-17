@@ -19,6 +19,12 @@ interfaces over super powerful tools.
 
 ### Implementation
 
-The interface should be a local webserver with no authentication required. It should run on port 8866 by default.
+The interface should be a local webserver with no authentication required. It should run on port 8888 by default.
 The backend is written in Rust. The client code should be responsive and the UI should work on mobile or a desktop
 browser.
+
+The AI used should be the local Codex agent. Installing and authenticating Codex is a required part of the installation
+process that the user must complete.
+
+Since Codex is best at writing code and config files, the internal synth and other tools that DAW-AI uses should
+be represented a way that is friendly for Codex.
