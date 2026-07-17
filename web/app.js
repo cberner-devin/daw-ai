@@ -46,7 +46,7 @@
     drawerHideTimer: null,
   };
 
-  let mixChangeQueue = Promise.resolve();
+  let projectMutationQueue = Promise.resolve();
 
   class AudioEngine {
     constructor() {
@@ -918,26 +918,35 @@
     }
   }
 
-  async function preservePlayback(operation) {
-    const resumePlayback = audio.isActive;
-    audio.stop(true);
+  async function replaceProject(operation, options = {}) {
+    const preservePosition = options.preservePosition !== false;
+    const resumePlayback = options.resumePlayback !== false && audio.isActive;
+    audio.stop(preservePosition);
+    let projectReplaced = false;
     try {
-      return await operation();
+      const result = await operation();
+      projectReplaced = true;
+      return result;
     } finally {
-      if (resumePlayback && !audio.isActive) await audio.start();
+      const startedDuringReplacement = audio.isActive;
+      if (projectReplaced && startedDuringReplacement) audio.stop(preservePosition);
+      if ((resumePlayback || startedDuringReplacement) && !audio.isActive) await audio.start();
     }
   }
 
+  function enqueueProjectMutation(operation) {
+    const queuedMutation = projectMutationQueue.then(operation, operation);
+    projectMutationQueue = queuedMutation.catch(() => {});
+    return queuedMutation;
+  }
+
   function changeMix(trackId, values, focusControl) {
-    const applyChange = () => applyMixChange(trackId, values, focusControl);
-    const queuedChange = mixChangeQueue.then(applyChange, applyChange);
-    mixChangeQueue = queuedChange.catch(() => {});
-    return queuedChange;
+    return enqueueProjectMutation(() => applyMixChange(trackId, values, focusControl));
   }
 
   async function applyMixChange(trackId, values, focusControl) {
     try {
-      await preservePlayback(async () => {
+      await replaceProject(async () => {
         state.project = await api("/api/mix", {
           method: "POST",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -1057,21 +1066,23 @@
     elements.composeButton.querySelector("span").textContent = "Codex is planning...";
     elements.savedState.textContent = "Waiting for Codex";
     try {
-      const result = await preservePlayback(async () => {
-        const response = await api("/api/edits", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            prompt,
-            start: String(state.selectionStart),
-            end: String(state.selectionEnd),
-          }),
-        });
-        state.project = response.project;
-        elements.promptInput.value = "";
-        renderProject();
-        return response;
-      });
+      const result = await enqueueProjectMutation(() =>
+        replaceProject(async () => {
+          const response = await api("/api/edits", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({
+              prompt,
+              start: String(state.selectionStart),
+              end: String(state.selectionEnd),
+            }),
+          });
+          state.project = response.project;
+          elements.promptInput.value = "";
+          renderProject();
+          return response;
+        }),
+      );
       showToast(result.message);
     } catch (error) {
       showToast(error.message, true);
@@ -1083,11 +1094,19 @@
     }
   }
 
-  async function undo() {
+  function undo() {
+    return enqueueProjectMutation(applyUndo);
+  }
+
+  async function applyUndo() {
     try {
-      audio.stop(true);
-      state.project = await api("/api/undo", { method: "POST" });
-      renderProject();
+      await replaceProject(
+        async () => {
+          state.project = await api("/api/undo", { method: "POST" });
+          renderProject();
+        },
+        { resumePlayback: false },
+      );
       showToast("Last change undone");
     } catch (error) {
       showToast(error.message, true);
@@ -1096,12 +1115,20 @@
 
   async function reset() {
     if (!window.confirm("Reset to the original demo arrangement? You can still undo this.")) return;
+    await enqueueProjectMutation(applyReset);
+  }
+
+  async function applyReset() {
     try {
-      audio.stop(false);
-      state.project = await api("/api/reset", { method: "POST" });
-      state.selectionStart = 8;
-      state.selectionEnd = 16;
-      renderProject();
+      await replaceProject(
+        async () => {
+          state.project = await api("/api/reset", { method: "POST" });
+          state.selectionStart = 8;
+          state.selectionEnd = 16;
+          renderProject();
+        },
+        { preservePosition: false, resumePlayback: false },
+      );
       showToast("Demo arrangement restored");
     } catch (error) {
       showToast(error.message, true);

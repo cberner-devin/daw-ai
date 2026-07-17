@@ -456,6 +456,17 @@ async function run() {
     await mouse(cdp, appSession, "mouseMoved", lane.left + lane.width * 0.5, lane.y, 1);
     await mouse(cdp, appSession, "mouseReleased", lane.left + lane.width * 0.5, lane.y);
 
+    await evaluate(cdp, appSession, `(() => {
+      const originalClose = AudioContext.prototype.close;
+      window.__promptAudioCloseCount = 0;
+      AudioContext.prototype.close = function close() {
+        window.__promptAudioCloseCount += 1;
+        return originalClose.call(this);
+      };
+      window.__restoreAudioCloseAfterPrompt = () => {
+        AudioContext.prototype.close = originalClose;
+      };
+    })()`);
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await waitFor(
       async () => evaluate(cdp, appSession, "document.querySelector('#play-button').classList.contains('is-playing')"),
@@ -475,7 +486,7 @@ async function run() {
         ),
       "transport movement before prompted edit",
     );
-    const promptSingleFlight = await evaluate(cdp, appSession, `(() => {
+    const promptSingleFlight = await evaluate(cdp, appSession, `(async () => {
       const originalFetch = window.fetch;
       const deferred = [];
       window.__promptRequestCount = 0;
@@ -498,6 +509,7 @@ async function run() {
       input.dispatchEvent(new KeyboardEvent('keydown', {
         key: 'Enter', code: 'Enter', metaKey: true, bubbles: true, cancelable: true,
       }));
+      await Promise.resolve();
       return {
         requests: window.__promptRequestCount,
         submitDisabled: document.querySelector('#compose-button').disabled,
@@ -508,6 +520,11 @@ async function run() {
       promptSingleFlight,
       { requests: 1, submitDisabled: true, transportActive: false },
       "prompt shortcuts must share one in-flight edit request",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#play-button').classList.contains('is-playing')"),
+      "playback started while prompt is pending",
     );
     await evaluate(cdp, appSession, "window.__releasePromptRequests()");
     await waitFor(
@@ -534,11 +551,12 @@ async function run() {
         ),
       "playback restoration after prompted edit",
     );
-    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
-    await waitFor(
-      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 0"),
-      "single-flight prompt undo",
+    assert.equal(
+      await evaluate(cdp, appSession, "window.__promptAudioCloseCount"),
+      2,
+      "playback started during a prompt must be rebuilt for the accepted project",
     );
+    await evaluate(cdp, appSession, "window.__restoreAudioCloseAfterPrompt()");
 
     await evaluate(cdp, appSession, `(() => {
       const input = document.querySelector('#prompt-input');
@@ -546,7 +564,7 @@ async function run() {
       document.querySelector('#prompt-form').requestSubmit();
     })()`);
     await waitFor(
-      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 1"),
+      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 2"),
       "compound AI edit",
     );
     const compoundProject = await evaluate(
@@ -555,9 +573,10 @@ async function run() {
       "fetch('/api/project').then((response) => response.json())",
     );
     assert.equal(compoundProject.tracks.length, 3, "effect prompt must not add a track");
-    assert.equal(compoundProject.edits[0].action.type, "compound");
+    const compoundEdit = compoundProject.edits[compoundProject.edits.length - 1];
+    assert.equal(compoundEdit.action.type, "compound");
     assert.deepEqual(
-      compoundProject.edits[0].action.actions.map((action) => action.type),
+      compoundEdit.action.actions.map((action) => action.type),
       ["effect", "filter"],
     );
     const compoundPills = await evaluate(
@@ -572,10 +591,49 @@ async function run() {
       "Advanced must expose the filter half of a compound edit",
     );
 
-    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await evaluate(cdp, appSession, `(() => {
+      const originalFetch = window.fetch;
+      const deferred = [];
+      window.__undoRequestCount = 0;
+      window.fetch = function fetch(resource, options) {
+        if (resource !== '/api/undo') return originalFetch(resource, options);
+        window.__undoRequestCount += 1;
+        return new Promise((resolve, reject) => deferred.push({ resource, options, resolve, reject }));
+      };
+      window.__releaseNextUndoRequest = () => {
+        const request = deferred.shift();
+        if (!request) return false;
+        originalFetch(request.resource, request.options).then(request.resolve, request.reject);
+        return true;
+      };
+      window.__restoreFetchAfterUndo = () => {
+        window.fetch = originalFetch;
+      };
+      const button = document.querySelector('#undo-button');
+      button.click();
+      button.click();
+    })()`);
+    await waitFor(
+      async () => evaluate(cdp, appSession, "window.__undoRequestCount === 1"),
+      "first serialized undo request",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "window.__undoRequestCount"),
+      1,
+      "a second undo must wait for the first project snapshot",
+    );
+    await evaluate(cdp, appSession, "window.__releaseNextUndoRequest()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "window.__undoRequestCount === 2"),
+      "second serialized undo request",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      window.__restoreFetchAfterUndo();
+      window.__releaseNextUndoRequest();
+    })()`);
     await waitFor(
       async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 0"),
-      "undo",
+      "serialized undo completion",
     );
 
     await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
