@@ -247,7 +247,11 @@ impl Action {
                 "{{\"type\":\"mute\",\"target\":{}}}",
                 role_json(*target)
             ),
-            Self::Drop => write!(output, "{{\"type\":\"drop\",\"target\":\"all\"}}"),
+            Self::Drop { build } => write!(
+                output,
+                "{{\"type\":\"drop\",\"value\":{},\"target\":\"all\"}}",
+                decimal(*build)
+            ),
             Self::AddTrack { role } => write!(
                 output,
                 "{{\"type\":\"add-track\",\"target\":{}}}",
@@ -406,7 +410,7 @@ impl Studio {
                 }
             }
             Action::AddTrack { role } => self.add_track(*role, start, end, "AI variation"),
-            Action::Drop => self.add_track(TrackRole::Lead, start, end, "Drop hook"),
+            Action::Drop { build } => self.add_drop(start, end, *build),
             Action::Tempo { bpm } => self.project.bpm = *bpm,
             Action::Gain { .. }
             | Action::Mute { .. }
@@ -492,6 +496,68 @@ impl Studio {
         }];
         self.project.tracks.push(track);
     }
+
+    fn add_drop(&mut self, start: f32, end: f32, build: f32) {
+        let impact = start + (end - start) * build;
+        let Some(track_index) = self
+            .project
+            .tracks
+            .iter()
+            .position(|track| track.role == TrackRole::Lead)
+        else {
+            self.add_track(TrackRole::Lead, impact, end, "Drop hook");
+            return;
+        };
+
+        let clip_id = self.take_id();
+        self.replace_track_region(
+            track_index,
+            start,
+            end,
+            Clip {
+                id: clip_id,
+                label: "Drop hook".to_owned(),
+                start: impact,
+                end,
+                style: "generated".to_owned(),
+            },
+        );
+    }
+
+    fn replace_track_region(
+        &mut self,
+        track_index: usize,
+        start: f32,
+        end: f32,
+        replacement: Clip,
+    ) {
+        let clips = std::mem::take(&mut self.project.tracks[track_index].clips);
+        let mut retained = Vec::with_capacity(clips.len() + 1);
+        for clip in clips {
+            if clip.end <= start || clip.start >= end {
+                retained.push(clip);
+                continue;
+            }
+
+            let spans_left_boundary = clip.start < start;
+            if spans_left_boundary {
+                let mut left = clip.clone();
+                left.end = start;
+                retained.push(left);
+            }
+            if clip.end > end {
+                let mut right = clip;
+                if spans_left_boundary {
+                    right.id = self.take_id();
+                }
+                right.start = end;
+                retained.push(right);
+            }
+        }
+        retained.push(replacement);
+        retained.sort_by(|left, right| left.start.total_cmp(&right.start));
+        self.project.tracks[track_index].clips = retained;
+    }
 }
 
 fn collect_created_roles(action: &Action, roles: &mut Vec<TrackRole>) {
@@ -502,7 +568,7 @@ fn collect_created_roles(action: &Action, roles: &mut Vec<TrackRole>) {
             }
         }
         Action::AddTrack { role } => roles.push(*role),
-        Action::Drop => roles.push(TrackRole::Lead),
+        Action::Drop { .. } => roles.push(TrackRole::Lead),
         Action::Gain { .. }
         | Action::Mute { .. }
         | Action::Effect { .. }
@@ -533,7 +599,7 @@ fn validate_targets_exist(action: &Action, roles: &[TrackRole]) -> Result<(), St
                 Ok(())
             }
         }
-        Action::Drop | Action::AddTrack { .. } | Action::Tempo { .. } => Ok(()),
+        Action::Drop { .. } | Action::AddTrack { .. } | Action::Tempo { .. } => Ok(()),
     }
 }
 
@@ -698,10 +764,62 @@ mod tests {
         assert!(summary.contains("drop"));
         assert_eq!(studio.project().tracks.len(), 4);
         assert_eq!(studio.project().edits.len(), 1);
+        let lead = studio
+            .project()
+            .tracks
+            .iter()
+            .find(|track| track.role == TrackRole::Lead)
+            .expect("drop lead");
+        assert_eq!(lead.clips.len(), 1);
+        assert!((lead.clips[0].start - 11.2).abs() < 0.001);
+        assert_eq!(lead.clips[0].end, 16.0);
+
+        studio
+            .apply_prompt(8.0, 16.0, "make the drop hit harder")
+            .expect("valid refinement");
+        let lead = studio
+            .project()
+            .tracks
+            .iter()
+            .find(|track| track.role == TrackRole::Lead)
+            .expect("refined drop lead");
+        assert_eq!(studio.project().tracks.len(), 4);
+        assert_eq!(lead.clips.len(), 1);
+
+        assert!(studio.undo());
+        assert_eq!(studio.project().tracks.len(), 4);
         assert!(studio.undo());
         assert_eq!(studio.project().tracks.len(), 3);
         assert!(studio.project().edits.is_empty());
         assert!(!studio.undo());
+    }
+
+    #[test]
+    fn drop_replaces_existing_lead_material_in_its_region() {
+        let mut studio = Studio::new();
+        studio
+            .apply_prompt(0.0, 8.0, "add a lead")
+            .expect("existing lead");
+        studio
+            .apply_prompt(2.0, 6.0, "insert a sick drop here")
+            .expect("drop over existing lead");
+
+        let clips = &studio
+            .project()
+            .tracks
+            .iter()
+            .find(|track| track.role == TrackRole::Lead)
+            .expect("lead track")
+            .clips;
+        assert_eq!(clips.len(), 3);
+        assert_eq!(clips[0].label, "AI variation");
+        assert_eq!((clips[0].start, clips[0].end), (0.0, 2.0));
+        assert_eq!(clips[1].label, "Drop hook");
+        assert!((clips[1].start - 3.6).abs() < 0.001);
+        assert_eq!(clips[1].end, 6.0);
+        assert_eq!(clips[2].label, "AI variation");
+        assert_eq!((clips[2].start, clips[2].end), (6.0, 8.0));
+        assert!(clips.windows(2).all(|pair| pair[0].end <= pair[1].start));
     }
 
     #[test]
