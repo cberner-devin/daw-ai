@@ -61,4 +61,4 @@ Run formatting checks, Clippy with warnings denied, Rust tests, and the headless
 just test
 ```
 
-The server binds only to `127.0.0.1`, requires no web authentication, and embeds the client assets in the executable. Its same-origin API lives under `/api`. The test suite injects the deterministic demo planner with `DAW_AI_PROMPT_ENGINE=demo`, so CI never needs Codex credentials or model usage.
+The server binds only to `127.0.0.1`, requires no web authentication, and embeds the client assets in the executable. Its same-origin API lives under `/api`. Reverse proxies can publish any hostname without DAW-AI configuration; preserve the public `Host` header or send it as `X-Forwarded-Host` so mutation origins can be verified. The test suite injects the deterministic demo planner with `DAW_AI_PROMPT_ENGINE=demo`, so CI never needs Codex credentials or model usage.

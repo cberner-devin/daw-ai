@@ -78,8 +78,8 @@ impl Router {
     }
 
     fn handle(&self, request: &Request) -> Response {
-        if !request.has_trusted_host() {
-            return Response::json(403, error_json("untrusted host rejected"));
+        if !request.has_valid_host() {
+            return Response::json(403, error_json("invalid host rejected"));
         }
         if request.is_mutation() && !request.is_trusted_mutation() {
             return Response::json(403, error_json("cross-origin request rejected"));
@@ -349,28 +349,41 @@ impl Request {
             )
     }
 
-    fn has_trusted_host(&self) -> bool {
+    fn has_valid_host(&self) -> bool {
         self.headers
             .get("host")
-            .is_some_and(|host| is_loopback_host(host))
+            .is_some_and(|host| parse_authority(host).is_some())
+            && self
+                .headers
+                .get("x-forwarded-host")
+                .is_none_or(|host| forwarded_host(host).is_some())
+    }
+
+    fn public_host(&self) -> Option<&str> {
+        if !self.has_valid_host() {
+            return None;
+        }
+        self.headers
+            .get("x-forwarded-host")
+            .and_then(|host| forwarded_host(host))
+            .or_else(|| self.headers.get("host").map(String::as_str))
     }
 
     fn is_trusted_mutation(&self) -> bool {
-        let Some(host) = self.headers.get("host") else {
+        let Some(host) = self.public_host() else {
             return false;
         };
-        if !is_loopback_host(host)
-            || self
-                .headers
-                .get("sec-fetch-site")
-                .is_some_and(|site| site == "cross-site")
+        if self
+            .headers
+            .get("sec-fetch-site")
+            .is_some_and(|site| site.eq_ignore_ascii_case("cross-site"))
         {
             return false;
         }
 
         self.headers
             .get("origin")
-            .is_none_or(|origin| origin == &format!("http://{host}"))
+            .is_none_or(|origin| origin_matches_host(origin, host))
     }
 }
 
@@ -452,12 +465,79 @@ fn parse_form(body: &str) -> HashMap<String, String> {
         .collect()
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    let (hostname, port) = host
-        .split_once(':')
-        .map_or((host, None), |(hostname, port)| (hostname, Some(port)));
-    matches!(hostname, "127.0.0.1" | "localhost")
-        && port.is_none_or(|port| port.parse::<u16>().is_ok_and(|port| port > 0))
+fn forwarded_host(value: &str) -> Option<&str> {
+    let host = value.split(',').next()?.trim();
+    parse_authority(host).map(|_| host)
+}
+
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let (authority, default_port) = origin
+        .strip_prefix("http://")
+        .map(|authority| (authority, 80))
+        .or_else(|| {
+            origin
+                .strip_prefix("https://")
+                .map(|authority| (authority, 443))
+        })
+        .unwrap_or(("", 0));
+    if default_port == 0 {
+        return false;
+    }
+    let Some((origin_host, origin_port)) = parse_authority(authority) else {
+        return false;
+    };
+    let Some((request_host, request_port)) = parse_authority(host) else {
+        return false;
+    };
+    origin_host.eq_ignore_ascii_case(request_host)
+        && origin_port.unwrap_or(default_port) == request_port.unwrap_or(default_port)
+}
+
+fn parse_authority(value: &str) -> Option<(&str, Option<u16>)> {
+    if value.is_empty()
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || value.contains(['/', '\\', '?', '#', '@', ','])
+    {
+        return None;
+    }
+
+    if value.starts_with('[') {
+        let end = value.find(']')?;
+        let hostname = &value[..=end];
+        if hostname.len() <= 2 {
+            return None;
+        }
+        let remainder = &value[end + 1..];
+        let port = if remainder.is_empty() {
+            None
+        } else {
+            Some(parse_port(remainder.strip_prefix(':')?)?)
+        };
+        return Some((hostname, port));
+    }
+
+    let (hostname, port) = value
+        .rsplit_once(':')
+        .map_or((value, None), |(hostname, port)| (hostname, Some(port)));
+    if hostname.is_empty()
+        || hostname.contains(':')
+        || !hostname
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return None;
+    }
+    let port = match port {
+        Some(port) => Some(parse_port(port)?),
+        None => None,
+    };
+    Some((hostname, port))
+}
+
+fn parse_port(value: &str) -> Option<u16> {
+    value.parse::<u16>().ok().filter(|port| *port > 0)
 }
 
 fn url_decode(value: &str) -> String {
@@ -681,24 +761,62 @@ mod tests {
 
         hostile
             .headers
-            .insert("origin".to_owned(), "http://127.0.0.1:8888".to_owned());
+            .insert("host".to_owned(), "studio.example".to_owned());
+        hostile
+            .headers
+            .insert("origin".to_owned(), "https://attacker.example".to_owned());
         hostile
             .headers
             .insert("sec-fetch-site".to_owned(), "same-origin".to_owned());
+        assert_eq!(router.handle(&hostile).status, 403);
+
+        hostile
+            .headers
+            .insert("origin".to_owned(), "https://studio.example".to_owned());
         assert_eq!(router.handle(&hostile).status, 200);
         let project = router.handle(&request("GET", "/api/project", ""));
         assert!(project.body.contains("\"waveform\":\"sawtooth\""));
     }
 
     #[test]
-    fn rejects_hostile_hosts_before_serving_project_data() {
+    fn supports_reverse_proxy_hosts_without_configuration() {
         let router = Router::demo();
-        let mut hostile = request("GET", "/api/project", "");
-        hostile
+        let mut direct = request("GET", "/api/project", "");
+        direct
             .headers
-            .insert("host".to_owned(), "studio.attacker.example".to_owned());
+            .insert("host".to_owned(), "studio.example".to_owned());
 
-        let response = router.handle(&hostile);
+        let response = router.handle(&direct);
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("Neon First Light"));
+
+        let mut forwarded = request(
+            "POST",
+            "/api/sound-tools",
+            "track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth",
+        );
+        forwarded.headers.insert(
+            "x-forwarded-host".to_owned(),
+            "studio.example:443, proxy.internal".to_owned(),
+        );
+        forwarded
+            .headers
+            .insert("origin".to_owned(), "https://studio.example".to_owned());
+        forwarded
+            .headers
+            .insert("sec-fetch-site".to_owned(), "same-origin".to_owned());
+        assert_eq!(router.handle(&forwarded).status, 200);
+    }
+
+    #[test]
+    fn rejects_malformed_host_authorities() {
+        let router = Router::demo();
+        let mut invalid = request("GET", "/api/project", "");
+        invalid
+            .headers
+            .insert("host".to_owned(), "studio.example/path".to_owned());
+
+        let response = router.handle(&invalid);
         assert_eq!(response.status, 403);
         assert!(!response.body.contains("Neon First Light"));
     }
