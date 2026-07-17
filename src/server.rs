@@ -96,9 +96,10 @@ impl Router {
             }
             ("POST", "/api/edits") => self.apply_edit(&request.body),
             ("POST", "/api/mix") => self.change_mix(&request.body),
+            ("POST", "/api/sound-tools") => self.change_sound_tool(&request.body),
             ("POST", "/api/undo") => self.undo(),
             ("POST", "/api/reset") => self.reset(),
-            (_, "/api/edits" | "/api/mix" | "/api/undo" | "/api/reset") => {
+            (_, "/api/edits" | "/api/mix" | "/api/sound-tools" | "/api/undo" | "/api/reset") => {
                 Response::json(405, error_json("method not allowed")).with_header("Allow", "POST")
             }
             (_, "/api/project" | "/api/health") => {
@@ -192,6 +193,44 @@ impl Router {
 
         let mut studio = self.lock_studio();
         match studio.set_mix(track_id, volume, muted) {
+            Ok(()) => Response::json(200, studio.to_json()),
+            Err(error) => Response::json(422, studio_error(error)),
+        }
+    }
+
+    fn change_sound_tool(&self, body: &str) -> Response {
+        let form = parse_form(body);
+        let Some(track_id) = form
+            .get("track_id")
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return Response::json(422, error_json("track_id is required"));
+        };
+        let Some(tool) = form.get("tool") else {
+            return Response::json(422, error_json("tool is required"));
+        };
+        let Some(tool_id) = form
+            .get("tool_id")
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return Response::json(422, error_json("tool_id is required"));
+        };
+        let clip_id = match form.get("clip_id") {
+            Some(value) => match value.parse::<u64>() {
+                Ok(value) => Some(value),
+                Err(_) => return Response::json(422, error_json("clip_id must be an integer")),
+            },
+            None => None,
+        };
+        let Some(parameter) = form.get("parameter") else {
+            return Response::json(422, error_json("parameter is required"));
+        };
+        let Some(value) = form.get("value") else {
+            return Response::json(422, error_json("value is required"));
+        };
+
+        let mut studio = self.lock_studio();
+        match studio.configure_sound_tool(track_id, tool, tool_id, clip_id, parameter, value) {
             Ok(()) => Response::json(200, studio.to_json()),
             Err(error) => Response::json(422, studio_error(error)),
         }
@@ -306,7 +345,7 @@ impl Request {
         self.method == "POST"
             && matches!(
                 self.path.as_str(),
-                "/api/edits" | "/api/mix" | "/api/undo" | "/api/reset"
+                "/api/edits" | "/api/mix" | "/api/sound-tools" | "/api/undo" | "/api/reset"
             )
     }
 
@@ -470,6 +509,8 @@ fn studio_error(error: StudioError) -> String {
         StudioError::InvalidSelection => error_json("select a valid part of the track"),
         StudioError::UnknownTrack => error_json("track not found"),
         StudioError::InvalidMix => error_json("invalid mixer setting"),
+        StudioError::UnknownSoundTool => error_json("sound tool not found"),
+        StudioError::InvalidSoundTool => error_json("invalid sound tool setting"),
     }
 }
 
@@ -511,6 +552,27 @@ mod tests {
 
         let project = router.handle(&request("GET", "/api/project", ""));
         assert!(project.body.contains("increase volume"));
+    }
+
+    #[test]
+    fn sound_tool_api_updates_the_shared_graph() {
+        let router = Router::demo();
+        let response = router.handle(&request(
+            "POST",
+            "/api/sound-tools",
+            "track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth",
+        ));
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("\"waveform\":\"sawtooth\""));
+
+        let invalid = router.handle(&request(
+            "POST",
+            "/api/sound-tools",
+            "track_id=2&tool=instrument&tool_id=201&parameter=attack&value=99",
+        ));
+        assert_eq!(invalid.status, 422);
+        let project = router.handle(&request("GET", "/api/project", ""));
+        assert!(project.body.contains("\"waveform\":\"sawtooth\""));
     }
 
     #[test]
@@ -609,6 +671,14 @@ mod tests {
         let project = router.handle(&request("GET", "/api/project", ""));
         assert!(!project.body.contains("increase volume"));
 
+        hostile.path = "/api/sound-tools".to_owned();
+        hostile.body =
+            "track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth".to_owned();
+        assert_eq!(router.handle(&hostile).status, 403);
+        let project = router.handle(&request("GET", "/api/project", ""));
+        assert!(project.body.contains("\"waveform\":\"square\""));
+        assert!(!project.body.contains("\"waveform\":\"sawtooth\""));
+
         hostile
             .headers
             .insert("origin".to_owned(), "http://127.0.0.1:8888".to_owned());
@@ -616,6 +686,8 @@ mod tests {
             .headers
             .insert("sec-fetch-site".to_owned(), "same-origin".to_owned());
         assert_eq!(router.handle(&hostile).status, 200);
+        let project = router.handle(&request("GET", "/api/project", ""));
+        assert!(project.body.contains("\"waveform\":\"sawtooth\""));
     }
 
     #[test]

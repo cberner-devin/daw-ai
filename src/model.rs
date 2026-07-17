@@ -4,6 +4,15 @@ use crate::prompt::{Action, PromptEngine};
 
 const HISTORY_LIMIT: usize = 50;
 
+struct ModulationTarget {
+    id: String,
+    label: String,
+    minimum: f32,
+    maximum: f32,
+    scale: f32,
+    mode: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrackRole {
     Drums,
@@ -39,6 +48,7 @@ impl TrackRole {
 
 #[derive(Clone, Debug)]
 pub struct Effect {
+    pub id: u64,
     pub name: String,
     pub mix: f32,
     pub enabled: bool,
@@ -46,10 +56,22 @@ pub struct Effect {
 
 #[derive(Clone, Debug)]
 pub struct Instrument {
+    pub id: u64,
     pub engine: String,
     pub waveform: String,
-    pub attack: String,
-    pub release: String,
+    pub attack: f32,
+    pub release: f32,
+    pub tone: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClipEvent {
+    pub id: u64,
+    pub kind: String,
+    pub time: f32,
+    pub duration: f32,
+    pub pitch: u8,
+    pub velocity: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +81,25 @@ pub struct Clip {
     pub start: f32,
     pub end: f32,
     pub style: String,
+    pub loop_beats: f32,
+    pub events: Vec<ClipEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Modulator {
+    pub id: u64,
+    pub name: String,
+    pub shape: String,
+    pub rate: f32,
+    pub depth: f32,
+    pub target: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct Routing {
+    pub effect_order: Vec<u64>,
+    pub output: String,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +112,8 @@ pub struct Track {
     pub muted: bool,
     pub instrument: Instrument,
     pub effects: Vec<Effect>,
+    pub modulators: Vec<Modulator>,
+    pub routing: Routing,
     pub clips: Vec<Clip>,
 }
 
@@ -109,6 +152,26 @@ impl Project {
             ],
             edits: Vec::new(),
         }
+    }
+
+    fn highest_id(&self) -> u64 {
+        let mut highest = self.edits.iter().map(|edit| edit.id).max().unwrap_or(0);
+        for track in &self.tracks {
+            highest = highest.max(track.id).max(track.instrument.id);
+            for effect in &track.effects {
+                highest = highest.max(effect.id);
+            }
+            for modulator in &track.modulators {
+                highest = highest.max(modulator.id);
+            }
+            for clip in &track.clips {
+                highest = highest.max(clip.id);
+                for event in &clip.events {
+                    highest = highest.max(event.id);
+                }
+            }
+        }
+        highest
     }
 
     #[must_use]
@@ -150,7 +213,8 @@ impl Track {
             concat!(
                 "{{\"id\":{},\"name\":{},\"role\":{},\"color\":{},",
                 "\"volume\":{},\"muted\":{},\"instrument\":{{",
-                "\"engine\":{},\"waveform\":{},\"attack\":{},\"release\":{}}},\"effects\":["
+                "\"id\":{},\"type\":\"instrument\",\"engine\":{},\"waveform\":{},",
+                "\"parameters\":{{\"attack\":{},\"release\":{},\"tone\":{}}}}},\"effects\":["
             ),
             self.id,
             json_string(&self.name),
@@ -158,10 +222,12 @@ impl Track {
             json_string(&self.color),
             decimal(self.volume),
             self.muted,
+            self.instrument.id,
             json_string(&self.instrument.engine),
             json_string(&self.instrument.waveform),
-            json_string(&self.instrument.attack),
-            json_string(&self.instrument.release)
+            decimal(self.instrument.attack),
+            decimal(self.instrument.release),
+            decimal(self.instrument.tone)
         )
         .expect("writing to a string cannot fail");
 
@@ -171,15 +237,100 @@ impl Track {
             }
             write!(
                 output,
-                "{{\"name\":{},\"mix\":{},\"enabled\":{}}}",
+                concat!(
+                    "{{\"id\":{},\"type\":\"effect\",\"name\":{},",
+                    "\"enabled\":{},\"parameters\":{{\"mix\":{}}}}}"
+                ),
+                effect.id,
                 json_string(&effect.name),
-                decimal(effect.mix),
-                effect.enabled
+                effect.enabled,
+                decimal(effect.mix)
             )
             .expect("writing to a string cannot fail");
         }
 
-        output.push_str("],\"clips\":[");
+        output.push_str("],\"modulators\":[");
+        for (index, modulator) in self.modulators.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            write!(
+                output,
+                concat!(
+                    "{{\"id\":{},\"type\":\"modulator\",\"name\":{},",
+                    "\"shape\":{},\"enabled\":{},\"target\":{},",
+                    "\"parameters\":{{\"rate\":{},\"depth\":{}}}}}"
+                ),
+                modulator.id,
+                json_string(&modulator.name),
+                json_string(&modulator.shape),
+                modulator.enabled,
+                json_string(&modulator.target),
+                decimal(modulator.rate),
+                decimal(modulator.depth)
+            )
+            .expect("writing to a string cannot fail");
+        }
+
+        output.push_str("],\"modulationTargets\":[");
+        for (index, target) in modulation_targets(self).iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            write!(
+                output,
+                concat!(
+                    "{{\"id\":{},\"label\":{},\"minimum\":{},",
+                    "\"maximum\":{},\"scale\":{},\"mode\":{}}}"
+                ),
+                json_string(&target.id),
+                json_string(&target.label),
+                decimal(target.minimum),
+                decimal(target.maximum),
+                decimal(target.scale),
+                json_string(target.mode)
+            )
+            .expect("writing to a string cannot fail");
+        }
+
+        output.push_str("],\"routing\":{\"audio\":[");
+        write!(
+            output,
+            "{},{}",
+            json_string("clips"),
+            json_string(&format!("instrument:{}", self.instrument.id))
+        )
+        .expect("writing to a string cannot fail");
+        for effect_id in &self.routing.effect_order {
+            write!(output, ",{}", json_string(&format!("effect:{effect_id}")))
+                .expect("writing to a string cannot fail");
+        }
+        write!(
+            output,
+            ",{}],\"control\":[",
+            json_string(&self.routing.output)
+        )
+        .expect("writing to a string cannot fail");
+        for (index, modulator) in self
+            .modulators
+            .iter()
+            .filter(|modulator| modulator.enabled)
+            .enumerate()
+        {
+            if index > 0 {
+                output.push(',');
+            }
+            write!(
+                output,
+                "{{\"source\":{},\"target\":{}}}",
+                json_string(&format!("modulator:{}", modulator.id)),
+                json_string(&modulator.target)
+            )
+            .expect("writing to a string cannot fail");
+        }
+        output.push_str("],\"output\":");
+        output.push_str(&json_string(&self.routing.output));
+        output.push_str("},\"clips\":[");
         for (index, clip) in self.clips.iter().enumerate() {
             if index > 0 {
                 output.push(',');
@@ -188,15 +339,36 @@ impl Track {
                 output,
                 concat!(
                     "{{\"id\":{},\"label\":{},\"start\":{},\"end\":{},",
-                    "\"style\":{}}}"
+                    "\"style\":{},\"loopBeats\":{},\"events\":["
                 ),
                 clip.id,
                 json_string(&clip.label),
                 decimal(clip.start),
                 decimal(clip.end),
-                json_string(&clip.style)
+                json_string(&clip.style),
+                decimal(clip.loop_beats)
             )
             .expect("writing to a string cannot fail");
+            for (event_index, event) in clip.events.iter().enumerate() {
+                if event_index > 0 {
+                    output.push(',');
+                }
+                write!(
+                    output,
+                    concat!(
+                        "{{\"id\":{},\"type\":{},\"time\":{},\"duration\":{},",
+                        "\"pitch\":{},\"velocity\":{}}}"
+                    ),
+                    event.id,
+                    json_string(&event.kind),
+                    decimal(event.time),
+                    decimal(event.duration),
+                    event.pitch,
+                    decimal(event.velocity)
+                )
+                .expect("writing to a string cannot fail");
+            }
+            output.push_str("]}");
         }
         output.push_str("]}");
     }
@@ -257,6 +429,52 @@ impl Action {
                 "{{\"type\":\"add-track\",\"target\":{}}}",
                 json_string(role.as_str())
             ),
+            Self::Instrument { waveform, target } => write!(
+                output,
+                concat!(
+                    "{{\"type\":\"instrument\",\"name\":{},",
+                    "\"value\":0.0,\"target\":{}}}"
+                ),
+                json_string(waveform),
+                json_string(target.as_str())
+            ),
+            Self::Modulator {
+                parameter,
+                depth,
+                target,
+            } => write!(
+                output,
+                concat!(
+                    "{{\"type\":\"modulator\",\"name\":{},",
+                    "\"value\":{},\"target\":{}}}"
+                ),
+                json_string(parameter),
+                decimal(*depth),
+                json_string(target.as_str())
+            ),
+            Self::Configure {
+                track_id,
+                target,
+                tool,
+                tool_id,
+                clip_id,
+                parameter,
+                value,
+            } => write!(
+                output,
+                concat!(
+                    "{{\"type\":\"configure\",\"target\":{},\"trackId\":{},",
+                    "\"tool\":{},\"toolId\":{},\"clipId\":{},",
+                    "\"parameter\":{},\"setting\":{}}}"
+                ),
+                json_string(target.as_str()),
+                track_id,
+                json_string(tool),
+                tool_id,
+                clip_id.unwrap_or(0),
+                json_string(parameter),
+                json_string(value)
+            ),
             Self::Effect { name, mix, target } => write!(
                 output,
                 concat!(
@@ -303,6 +521,8 @@ pub enum StudioError {
     InvalidSelection,
     UnknownTrack,
     InvalidMix,
+    UnknownSoundTool,
+    InvalidSoundTool,
 }
 
 pub struct Studio {
@@ -320,10 +540,15 @@ impl Default for Studio {
 impl Studio {
     #[must_use]
     pub fn new() -> Self {
+        let project = Project::demo();
+        let next_id = project
+            .highest_id()
+            .checked_add(1)
+            .expect("demo project exhausted the ID namespace");
         Self {
-            project: Project::demo(),
+            project,
             history: Vec::new(),
-            next_id: 100,
+            next_id,
         }
     }
 
@@ -375,11 +600,16 @@ impl Studio {
         plan: crate::prompt::EditPlan,
     ) -> Result<String, StudioError> {
         self.validate_edit(start, end, prompt)?;
-        self.validate_action_targets(&plan.action)?;
+        let mut candidate = Self {
+            project: self.project.clone(),
+            history: Vec::new(),
+            next_id: self.next_id,
+        };
+        candidate.apply_action(&plan.action, start, end)?;
         let prompt = prompt.trim();
         self.remember();
-
-        self.apply_action(&plan.action, start, end);
+        self.project = candidate.project;
+        self.next_id = candidate.next_id;
 
         let summary = plan.summary;
         let edit_id = self.take_id();
@@ -395,29 +625,69 @@ impl Studio {
         Ok(summary)
     }
 
-    fn validate_action_targets(&self, action: &Action) -> Result<(), StudioError> {
-        let mut roles: Vec<TrackRole> =
-            self.project.tracks.iter().map(|track| track.role).collect();
-        collect_created_roles(action, &mut roles);
-        validate_targets_exist(action, &roles)
-    }
-
-    fn apply_action(&mut self, action: &Action, start: f32, end: f32) {
+    fn apply_action(&mut self, action: &Action, start: f32, end: f32) -> Result<(), StudioError> {
         match action {
             Action::Compound { actions } => {
                 for action in actions {
-                    self.apply_action(action, start, end);
+                    self.apply_action(action, start, end)?;
+                }
+                Ok(())
+            }
+            Action::AddTrack { role } => {
+                self.add_track(*role, start, end, "AI variation");
+                Ok(())
+            }
+            Action::Drop { build } => {
+                self.add_drop(start, end, *build);
+                Ok(())
+            }
+            Action::Tempo { bpm } => {
+                self.project.bpm = *bpm;
+                Ok(())
+            }
+            Action::Instrument { waveform, target } => {
+                let track_index = role_action_track_index(&self.project, *target, None)
+                    .ok_or(StudioError::UnknownTrack)?;
+                self.project.tracks[track_index].instrument.waveform = (*waveform).to_owned();
+                Ok(())
+            }
+            Action::Modulator {
+                parameter,
+                depth,
+                target,
+            } => self.add_modulator(*target, parameter, *depth),
+            Action::Configure {
+                track_id,
+                target,
+                tool,
+                tool_id,
+                clip_id,
+                parameter,
+                value,
+                ..
+            } => {
+                let track = self
+                    .project
+                    .tracks
+                    .iter_mut()
+                    .find(|track| track.id == *track_id && track.role == *target)
+                    .ok_or(StudioError::UnknownTrack)?;
+                configure_track_tool(track, tool, *tool_id, *clip_id, parameter, value)
+            }
+            Action::Gain { target, .. }
+            | Action::Mute { target }
+            | Action::Effect { target, .. }
+            | Action::RemoveEffect { target, .. }
+            | Action::Filter { target, .. }
+            | Action::Rhythm { target, .. } => {
+                if target.is_some_and(|target| {
+                    !self.project.tracks.iter().any(|track| track.role == target)
+                }) {
+                    Err(StudioError::UnknownTrack)
+                } else {
+                    Ok(())
                 }
             }
-            Action::AddTrack { role } => self.add_track(*role, start, end, "AI variation"),
-            Action::Drop { build } => self.add_drop(start, end, *build),
-            Action::Tempo { bpm } => self.project.bpm = *bpm,
-            Action::Gain { .. }
-            | Action::Mute { .. }
-            | Action::Effect { .. }
-            | Action::RemoveEffect { .. }
-            | Action::Filter { .. }
-            | Action::Rhythm { .. } => {}
         }
     }
 
@@ -454,6 +724,29 @@ impl Studio {
         Ok(())
     }
 
+    pub fn configure_sound_tool(
+        &mut self,
+        track_id: u64,
+        tool: &str,
+        tool_id: u64,
+        clip_id: Option<u64>,
+        parameter: &str,
+        value: &str,
+    ) -> Result<(), StudioError> {
+        let mut project = self.project.clone();
+        let track = project
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or(StudioError::UnknownTrack)?;
+        configure_track_tool(track, tool, tool_id, clip_id, parameter, value)?;
+
+        self.remember();
+        project.version = self.project.version + 1;
+        self.project = project;
+        Ok(())
+    }
+
     pub fn undo(&mut self) -> bool {
         let Some(mut previous) = self.history.pop() else {
             return false;
@@ -479,22 +772,42 @@ impl Studio {
 
     fn take_id(&mut self) -> u64 {
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("project ID namespace exhausted");
         id
     }
 
     fn add_track(&mut self, role: TrackRole, start: f32, end: f32, label: &str) {
         let track_id = self.take_id();
-        let clip_id = self.take_id();
         let mut track = generated_track(track_id, role);
-        track.clips = vec![Clip {
-            id: clip_id,
-            label: label.to_owned(),
-            start,
-            end,
-            style: "generated".to_owned(),
-        }];
+        track.instrument.id = self.take_id();
+        for effect in &mut track.effects {
+            effect.id = self.take_id();
+        }
+        track.routing.effect_order = track.effects.iter().map(|effect| effect.id).collect();
+        for modulator in &mut track.modulators {
+            modulator.id = self.take_id();
+        }
+        track.clips = vec![self.generated_clip(label, start, end, "generated", role)];
         self.project.tracks.push(track);
+    }
+
+    fn generated_clip(
+        &mut self,
+        label: &str,
+        start: f32,
+        end: f32,
+        style: &str,
+        role: TrackRole,
+    ) -> Clip {
+        let clip_id = self.take_id();
+        let mut generated = clip(clip_id, label, start, end, style, role);
+        for event in &mut generated.events {
+            event.id = self.take_id();
+        }
+        generated
     }
 
     fn add_drop(&mut self, start: f32, end: f32, build: f32) {
@@ -509,19 +822,37 @@ impl Studio {
             return;
         };
 
-        let clip_id = self.take_id();
-        self.replace_track_region(
-            track_index,
-            start,
-            end,
-            Clip {
-                id: clip_id,
-                label: "Drop hook".to_owned(),
-                start: impact,
-                end,
-                style: "generated".to_owned(),
+        let replacement =
+            self.generated_clip("Drop hook", impact, end, "generated", TrackRole::Lead);
+        self.replace_track_region(track_index, start, end, replacement);
+    }
+
+    fn add_modulator(
+        &mut self,
+        role: TrackRole,
+        parameter: &str,
+        depth: f32,
+    ) -> Result<(), StudioError> {
+        if !self.project.tracks.iter().any(|track| track.role == role) {
+            return Err(StudioError::UnknownTrack);
+        }
+        let track_index = role_action_track_index(&self.project, role, Some(parameter))
+            .ok_or(StudioError::InvalidSoundTool)?;
+        let id = self.take_id();
+        self.project.tracks[track_index].modulators.push(Modulator {
+            id,
+            name: "AI modulation".to_owned(),
+            shape: "sine".to_owned(),
+            rate: if parameter == "instrument.pitch" {
+                5.0
+            } else {
+                0.5
             },
-        );
+            depth,
+            target: parameter.to_owned(),
+            enabled: true,
+        });
+        Ok(())
     }
 
     fn replace_track_region(
@@ -560,118 +891,310 @@ impl Studio {
     }
 }
 
-fn collect_created_roles(action: &Action, roles: &mut Vec<TrackRole>) {
-    match action {
-        Action::Compound { actions } => {
-            for action in actions {
-                collect_created_roles(action, roles);
-            }
-        }
-        Action::AddTrack { role } => roles.push(*role),
-        Action::Drop { .. } => roles.push(TrackRole::Lead),
-        Action::Gain { .. }
-        | Action::Mute { .. }
-        | Action::Effect { .. }
-        | Action::RemoveEffect { .. }
-        | Action::Filter { .. }
-        | Action::Rhythm { .. }
-        | Action::Tempo { .. } => {}
-    }
-}
-
-fn validate_targets_exist(action: &Action, roles: &[TrackRole]) -> Result<(), StudioError> {
-    match action {
-        Action::Compound { actions } => {
-            for action in actions {
-                validate_targets_exist(action, roles)?;
+fn configure_track_tool(
+    track: &mut Track,
+    tool: &str,
+    tool_id: u64,
+    clip_id: Option<u64>,
+    parameter: &str,
+    value: &str,
+) -> Result<(), StudioError> {
+    match tool {
+        "instrument" => configure_instrument(&mut track.instrument, tool_id, parameter, value),
+        "effect" => {
+            let effect = track
+                .effects
+                .iter_mut()
+                .find(|effect| effect.id == tool_id)
+                .ok_or(StudioError::UnknownSoundTool)?;
+            match parameter {
+                "mix" => effect.mix = parse_range(value, 0.0, 1.0)?,
+                "enabled" => effect.enabled = parse_bool(value)?,
+                _ => return Err(StudioError::InvalidSoundTool),
             }
             Ok(())
         }
-        Action::Gain { target, .. }
-        | Action::Mute { target }
-        | Action::Effect { target, .. }
-        | Action::RemoveEffect { target, .. }
-        | Action::Filter { target, .. }
-        | Action::Rhythm { target, .. } => {
-            if target.is_some_and(|target| !roles.contains(&target)) {
-                Err(StudioError::UnknownTrack)
-            } else {
-                Ok(())
+        "modulator" => {
+            if parameter == "target" && !valid_modulator_target(track, value) {
+                return Err(StudioError::InvalidSoundTool);
             }
+            let modulator = track
+                .modulators
+                .iter_mut()
+                .find(|modulator| modulator.id == tool_id)
+                .ok_or(StudioError::UnknownSoundTool)?;
+            match parameter {
+                "shape"
+                    if matches!(
+                        value,
+                        "sine" | "triangle" | "square" | "random" | "envelope"
+                    ) =>
+                {
+                    modulator.shape = value.to_owned();
+                }
+                "rate" => modulator.rate = parse_range(value, 0.01, 20.0)?,
+                "depth" => modulator.depth = parse_range(value, 0.0, 1.0)?,
+                "target" => modulator.target = value.to_owned(),
+                "enabled" => modulator.enabled = parse_bool(value)?,
+                _ => return Err(StudioError::InvalidSoundTool),
+            }
+            Ok(())
         }
-        Action::Drop { .. } | Action::AddTrack { .. } | Action::Tempo { .. } => Ok(()),
+        "event" => {
+            let clip = track
+                .clips
+                .iter_mut()
+                .find(|clip| Some(clip.id) == clip_id)
+                .ok_or(StudioError::UnknownSoundTool)?;
+            let event = clip
+                .events
+                .iter_mut()
+                .find(|event| event.id == tool_id)
+                .ok_or(StudioError::UnknownSoundTool)?;
+            match parameter {
+                "time" => event.time = parse_range_exclusive(value, 0.0, clip.loop_beats)?,
+                "duration" => event.duration = parse_range(value, 0.0625, clip.loop_beats)?,
+                "pitch" => event.pitch = parse_integer_range(value, 0, 127)? as u8,
+                "velocity" => event.velocity = parse_range(value, 0.01, 1.0)?,
+                _ => return Err(StudioError::InvalidSoundTool),
+            }
+            clip.events
+                .sort_by(|left, right| left.time.total_cmp(&right.time));
+            Ok(())
+        }
+        "routing" if parameter == "position" => {
+            let position = parse_integer_range(
+                value,
+                0,
+                track.routing.effect_order.len().saturating_sub(1) as u64,
+            )? as usize;
+            let current = track
+                .routing
+                .effect_order
+                .iter()
+                .position(|effect_id| *effect_id == tool_id)
+                .ok_or(StudioError::UnknownSoundTool)?;
+            let effect_id = track.routing.effect_order.remove(current);
+            track.routing.effect_order.insert(position, effect_id);
+            Ok(())
+        }
+        "routing" => Err(StudioError::InvalidSoundTool),
+        _ => Err(StudioError::UnknownSoundTool),
     }
+}
+
+fn configure_instrument(
+    instrument: &mut Instrument,
+    tool_id: u64,
+    parameter: &str,
+    value: &str,
+) -> Result<(), StudioError> {
+    if instrument.id != tool_id {
+        return Err(StudioError::UnknownSoundTool);
+    }
+    match parameter {
+        "waveform" if matches!(value, "sine" | "triangle" | "sawtooth" | "square") => {
+            instrument.waveform = value.to_owned();
+        }
+        "attack" => instrument.attack = parse_range(value, 0.001, 2.0)?,
+        "release" => instrument.release = parse_range(value, 0.02, 5.0)?,
+        "tone" => instrument.tone = parse_range(value, 0.0, 1.0)?,
+        _ => return Err(StudioError::InvalidSoundTool),
+    }
+    Ok(())
+}
+
+fn parse_range(value: &str, minimum: f32, maximum: f32) -> Result<f32, StudioError> {
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite() && (minimum..=maximum).contains(value))
+        .ok_or(StudioError::InvalidSoundTool)
+}
+
+fn parse_range_exclusive(value: &str, minimum: f32, maximum: f32) -> Result<f32, StudioError> {
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= minimum && *value < maximum)
+        .ok_or(StudioError::InvalidSoundTool)
+}
+
+fn parse_integer_range(value: &str, minimum: u64, maximum: u64) -> Result<u64, StudioError> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| (minimum..=maximum).contains(value))
+        .ok_or(StudioError::InvalidSoundTool)
+}
+
+fn parse_bool(value: &str) -> Result<bool, StudioError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(StudioError::InvalidSoundTool),
+    }
+}
+
+fn modulation_targets(track: &Track) -> Vec<ModulationTarget> {
+    let mut targets = vec![
+        ModulationTarget {
+            id: "instrument.attack".to_owned(),
+            label: "Instrument attack".to_owned(),
+            minimum: 0.001,
+            maximum: 2.0,
+            scale: 0.5,
+            mode: "add",
+        },
+        ModulationTarget {
+            id: "instrument.release".to_owned(),
+            label: "Instrument release".to_owned(),
+            minimum: 0.02,
+            maximum: 5.0,
+            scale: 2.0,
+            mode: "add",
+        },
+        ModulationTarget {
+            id: "instrument.tone".to_owned(),
+            label: "Instrument tone".to_owned(),
+            minimum: 0.0,
+            maximum: 1.0,
+            scale: 1.0,
+            mode: "add",
+        },
+        ModulationTarget {
+            id: "instrument.pitch".to_owned(),
+            label: "Instrument pitch".to_owned(),
+            minimum: -2.0,
+            maximum: 2.0,
+            scale: 2.0,
+            mode: "add",
+        },
+        ModulationTarget {
+            id: "track.volume".to_owned(),
+            label: "Track volume".to_owned(),
+            minimum: 0.0,
+            maximum: 1.5,
+            scale: 1.0,
+            mode: "multiply",
+        },
+    ];
+    targets.extend(track.effects.iter().map(|effect| ModulationTarget {
+        id: format!("effect:{}.mix", effect.id),
+        label: format!("{} mix", effect.name),
+        minimum: 0.0,
+        maximum: 1.0,
+        scale: 1.0,
+        mode: "add",
+    }));
+    targets
+}
+
+fn valid_modulator_target(track: &Track, value: &str) -> bool {
+    modulation_targets(track)
+        .iter()
+        .any(|target| target.id == value)
+}
+
+fn role_action_track_index(
+    project: &Project,
+    role: TrackRole,
+    modulator_target: Option<&str>,
+) -> Option<usize> {
+    project.tracks.iter().rposition(|track| {
+        track.role == role
+            && modulator_target.is_none_or(|target| valid_modulator_target(track, target))
+    })
 }
 
 fn demo_track(id: u64, role: TrackRole, name: &str, color: &str) -> Track {
     let mut track = generated_track(id, role);
     track.name = name.to_owned();
     track.color = color.to_owned();
-    track.clips = vec![Clip {
-        id: id + 10,
-        label: match role {
+    track.clips = vec![clip(
+        id + 10,
+        match role {
             TrackRole::Drums => "Pocket beat",
             TrackRole::Bass => "Warm pulse",
             TrackRole::Chords => "Four-chord glow",
             TrackRole::Lead => "Lead phrase",
             TrackRole::Texture => "Air layer",
-        }
-        .to_owned(),
-        start: 0.0,
-        end: 32.0,
-        style: "foundation".to_owned(),
-    }];
+        },
+        0.0,
+        32.0,
+        "foundation",
+        role,
+    )];
     track
 }
 
 fn generated_track(id: u64, role: TrackRole) -> Track {
-    let (name, color, engine, waveform, attack, release, effects) = match role {
+    let (name, color, engine, waveform, attack, release, tone, effect_specs, modulator) = match role
+    {
         TrackRole::Drums => (
             "AI Drum Rack",
             "#ffb86b",
             "Synthesized drum rack",
-            "Noise + sine",
-            "Fast",
-            "Tight",
-            vec![effect("Punch compressor", 0.34)],
+            "sine",
+            0.002,
+            0.18,
+            0.82,
+            vec![("Punch compressor", 0.34)],
+            ("Pulse envelope", "envelope", 2.0, 0.12, "instrument.tone"),
         ),
         TrackRole::Bass => (
             "AI Bass",
             "#74e0bc",
             "Monophonic subtractive synth",
-            "Rounded square",
-            "8 ms",
-            "180 ms",
-            vec![effect("Low-pass filter", 0.46)],
+            "square",
+            0.008,
+            0.18,
+            0.32,
+            vec![("Low-pass filter", 0.46)],
+            ("Bass movement", "sine", 0.25, 0.18, "instrument.tone"),
         ),
         TrackRole::Chords => (
             "AI Chords",
             "#8ca9ff",
             "Polyphonic pad",
-            "Triangle",
-            "90 ms",
-            "1.2 s",
-            vec![effect("Chorus", 0.28), effect("Room", 0.2)],
+            "triangle",
+            0.09,
+            1.2,
+            0.48,
+            vec![("Chorus", 0.28), ("Room", 0.2)],
+            ("Slow bloom", "triangle", 0.125, 0.16, "instrument.tone"),
         ),
         TrackRole::Lead => (
             "AI Lead",
             "#d99cff",
             "Monophonic lead synth",
-            "Sawtooth",
-            "12 ms",
-            "320 ms",
-            vec![effect("Echo", 0.24)],
+            "sawtooth",
+            0.012,
+            0.32,
+            0.64,
+            vec![("Echo", 0.24)],
+            ("Lead vibrato", "sine", 5.0, 0.08, "instrument.pitch"),
         ),
         TrackRole::Texture => (
             "AI Texture",
             "#ff91ad",
             "Granular atmosphere",
-            "Filtered noise",
-            "600 ms",
-            "2.4 s",
-            vec![effect("Shimmer", 0.38)],
+            "sine",
+            0.6,
+            2.4,
+            0.7,
+            vec![("Shimmer", 0.38)],
+            ("Atmosphere drift", "random", 0.18, 0.22, "instrument.tone"),
         ),
     };
+
+    let instrument_id = tool_id(id, 1);
+    let effects = effect_specs
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, mix))| effect(tool_id(id, index as u64 + 10), name, mix))
+        .collect::<Vec<_>>();
+    let effect_order = effects.iter().map(|effect| effect.id).collect();
 
     Track {
         id,
@@ -687,18 +1210,104 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
         },
         muted: false,
         instrument: Instrument {
+            id: instrument_id,
             engine: engine.to_owned(),
             waveform: waveform.to_owned(),
-            attack: attack.to_owned(),
-            release: release.to_owned(),
+            attack,
+            release,
+            tone,
         },
         effects,
+        modulators: vec![Modulator {
+            id: tool_id(id, 50),
+            name: modulator.0.to_owned(),
+            shape: modulator.1.to_owned(),
+            rate: modulator.2,
+            depth: modulator.3,
+            target: modulator.4.to_owned(),
+            enabled: true,
+        }],
+        routing: Routing {
+            effect_order,
+            output: "master".to_owned(),
+        },
         clips: Vec::new(),
     }
 }
 
-fn effect(name: &str, mix: f32) -> Effect {
+fn clip(id: u64, label: &str, start: f32, end: f32, style: &str, role: TrackRole) -> Clip {
+    Clip {
+        id,
+        label: label.to_owned(),
+        start,
+        end,
+        style: style.to_owned(),
+        loop_beats: 4.0,
+        events: pattern_events(id, role),
+    }
+}
+
+fn pattern_events(clip_id: u64, role: TrackRole) -> Vec<ClipEvent> {
+    let specs: Vec<(&str, f32, f32, u8, f32)> = match role {
+        TrackRole::Drums => vec![
+            ("kick", 0.0, 0.25, 36, 0.92),
+            ("hat", 0.0, 0.12, 42, 0.58),
+            ("hat", 0.5, 0.12, 42, 0.42),
+            ("snare", 1.0, 0.25, 38, 0.78),
+            ("hat", 1.0, 0.12, 42, 0.58),
+            ("hat", 1.5, 0.12, 42, 0.42),
+            ("kick", 2.0, 0.25, 36, 0.88),
+            ("hat", 2.0, 0.12, 42, 0.58),
+            ("hat", 2.5, 0.12, 42, 0.42),
+            ("snare", 3.0, 0.25, 38, 0.78),
+            ("hat", 3.0, 0.12, 42, 0.58),
+            ("hat", 3.5, 0.12, 42, 0.42),
+        ],
+        TrackRole::Bass => vec![
+            ("note", 0.0, 0.7, 33, 0.82),
+            ("note", 1.0, 0.7, 33, 0.72),
+            ("note", 2.0, 0.7, 36, 0.78),
+            ("note", 3.0, 0.7, 31, 0.74),
+        ],
+        TrackRole::Chords => vec![
+            ("note", 0.0, 1.85, 57, 0.62),
+            ("note", 0.0, 1.85, 60, 0.56),
+            ("note", 0.0, 1.85, 64, 0.54),
+            ("note", 2.0, 1.85, 53, 0.6),
+            ("note", 2.0, 1.85, 57, 0.54),
+            ("note", 2.0, 1.85, 60, 0.52),
+        ],
+        TrackRole::Lead => vec![
+            ("note", 0.0, 0.75, 69, 0.72),
+            ("note", 1.0, 0.75, 76, 0.75),
+            ("note", 2.0, 0.75, 71, 0.72),
+            ("note", 3.0, 0.75, 67, 0.66),
+        ],
+        TrackRole::Texture => vec![("note", 0.0, 3.8, 64, 0.5), ("note", 0.0, 3.4, 71, 0.38)],
+    };
+    specs
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, (kind, time, duration, pitch, velocity))| ClipEvent {
+                id: clip_id * 100 + index as u64 + 1,
+                kind: kind.to_owned(),
+                time,
+                duration,
+                pitch,
+                velocity,
+            },
+        )
+        .collect()
+}
+
+const fn tool_id(track_id: u64, offset: u64) -> u64 {
+    track_id * 100 + offset
+}
+
+fn effect(id: u64, name: &str, mix: f32) -> Effect {
     Effect {
+        id,
         name: name.to_owned(),
         mix,
         enabled: true,
@@ -706,7 +1315,7 @@ fn effect(name: &str, mix: f32) -> Effect {
 }
 
 fn decimal(value: f32) -> String {
-    let mut value = format!("{value:.3}");
+    let mut value = format!("{value:.6}");
     while value.ends_with('0') {
         value.pop();
     }
@@ -751,7 +1360,310 @@ mod tests {
         assert_eq!(project.bpm, 112);
         assert_eq!(project.tracks.len(), 3);
         assert!(project.tracks.iter().all(|track| !track.clips.is_empty()));
+        assert!(project.tracks.iter().all(|track| {
+            !track.clips[0].events.is_empty()
+                && !track.modulators.is_empty()
+                && track.routing.effect_order.len() == track.effects.len()
+        }));
         assert!(project.to_json().contains("Neon First Light"));
+        assert!(project.to_json().contains("\"routing\""));
+        assert!(project.to_json().contains("\"loopBeats\""));
+    }
+
+    #[test]
+    fn sound_tools_are_configurable_and_undoable() {
+        let mut studio = Studio::new();
+        let bass = &studio.project().tracks[1];
+        let bass_id = bass.id;
+        let instrument_id = bass.instrument.id;
+        let effect_id = bass.effects[0].id;
+        let modulator_id = bass.modulators[0].id;
+        let clip_id = bass.clips[0].id;
+        let event_id = bass.clips[0].events[0].id;
+        let chords_id = studio.project().tracks[2].id;
+        let later_effect_id = studio.project().tracks[2].routing.effect_order[1];
+
+        studio
+            .configure_sound_tool(
+                bass_id,
+                "instrument",
+                instrument_id,
+                None,
+                "waveform",
+                "sawtooth",
+            )
+            .expect("configurable instrument");
+        studio
+            .configure_sound_tool(bass_id, "effect", effect_id, None, "mix", "0.72")
+            .expect("configurable effect");
+        studio
+            .configure_sound_tool(
+                bass_id,
+                "modulator",
+                modulator_id,
+                None,
+                "target",
+                "track.volume",
+            )
+            .expect("configurable modulator");
+        studio
+            .configure_sound_tool(bass_id, "event", event_id, Some(clip_id), "pitch", "40")
+            .expect("configurable clip event");
+        studio
+            .configure_sound_tool(
+                bass_id,
+                "event",
+                event_id,
+                Some(clip_id),
+                "duration",
+                "0.0625",
+            )
+            .expect("precise clip duration");
+        studio
+            .configure_sound_tool(chords_id, "routing", later_effect_id, None, "position", "0")
+            .expect("configurable effect routing");
+
+        let bass = &studio.project().tracks[1];
+        assert_eq!(bass.instrument.waveform, "sawtooth");
+        assert_eq!(bass.effects[0].mix, 0.72);
+        assert_eq!(bass.modulators[0].target, "track.volume");
+        assert_eq!(bass.clips[0].events[0].pitch, 40);
+        assert_eq!(bass.clips[0].events[0].duration, 0.0625);
+        assert!(studio.to_json().contains("\"duration\":0.0625"));
+        assert_eq!(
+            studio.project().tracks[2].routing.effect_order[0],
+            later_effect_id
+        );
+        assert!(studio.undo());
+        assert_ne!(
+            studio.project().tracks[2].routing.effect_order[0],
+            later_effect_id
+        );
+    }
+
+    #[test]
+    fn publishes_and_accepts_every_modulation_target() {
+        let mut studio = Studio::new();
+        let bass = &studio.project().tracks[1];
+        let bass_id = bass.id;
+        let modulator_id = bass.modulators[0].id;
+        let targets = modulation_targets(bass)
+            .into_iter()
+            .map(|target| target.id)
+            .collect::<Vec<_>>();
+
+        assert!(targets.contains(&"instrument.attack".to_owned()));
+        assert!(targets.contains(&"instrument.release".to_owned()));
+        assert!(targets.contains(&"instrument.tone".to_owned()));
+        assert!(targets.contains(&"instrument.pitch".to_owned()));
+        assert!(targets.contains(&"track.volume".to_owned()));
+        assert!(targets.iter().any(|target| target.starts_with("effect:")));
+
+        for target in &targets {
+            studio
+                .configure_sound_tool(bass_id, "modulator", modulator_id, None, "target", target)
+                .expect("published target must be accepted by validation");
+        }
+        let json = studio.to_json();
+        assert!(json.contains("\"modulationTargets\""));
+        for target in targets {
+            assert!(json.contains(&json_string(&target)));
+        }
+    }
+
+    #[test]
+    fn disabled_modulators_are_not_active_control_routes() {
+        let mut studio = Studio::new();
+        let bass = &studio.project().tracks[1];
+        let bass_id = bass.id;
+        let modulator_id = bass.modulators[0].id;
+        studio
+            .configure_sound_tool(bass_id, "modulator", modulator_id, None, "enabled", "false")
+            .expect("disable modulator");
+
+        let json = studio.to_json();
+        assert!(json.contains(&format!("\"id\":{modulator_id},\"type\":\"modulator\"")));
+        assert!(json.contains("\"enabled\":false"));
+        assert!(!json.contains(&format!("\"source\":\"modulator:{modulator_id}\"")));
+    }
+
+    #[test]
+    fn generated_modulators_use_collision_free_sound_tool_ids() {
+        let mut studio = Studio::new();
+        let drums = &studio.project().tracks[0];
+        let drums_id = drums.id;
+        let seeded_modulator_id = drums.modulators[0].id;
+        let seeded_depth = drums.modulators[0].depth;
+
+        for index in 0..30 {
+            let plan = crate::prompt::EditPlan {
+                action: Action::Modulator {
+                    parameter: "instrument.tone".to_owned(),
+                    depth: 0.2,
+                    target: TrackRole::Drums,
+                },
+                summary: format!("Added drum modulator {index}"),
+            };
+            studio
+                .apply_plan(0.0, 4.0, "add drum modulation", plan)
+                .expect("valid drum modulator");
+        }
+
+        let mut sound_tool_ids = Vec::new();
+        for track in &studio.project().tracks {
+            sound_tool_ids.push(track.instrument.id);
+            sound_tool_ids.extend(track.effects.iter().map(|effect| effect.id));
+            sound_tool_ids.extend(track.modulators.iter().map(|modulator| modulator.id));
+        }
+        let unique_ids = sound_tool_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique_ids.len(), sound_tool_ids.len());
+
+        let newest_modulator_id = studio.project().tracks[0]
+            .modulators
+            .last()
+            .expect("generated modulator")
+            .id;
+        studio
+            .configure_sound_tool(
+                drums_id,
+                "modulator",
+                newest_modulator_id,
+                None,
+                "depth",
+                "0.73",
+            )
+            .expect("newest modulator remains addressable");
+        let drums = &studio.project().tracks[0];
+        assert_eq!(
+            drums
+                .modulators
+                .iter()
+                .find(|modulator| modulator.id == newest_modulator_id)
+                .expect("newest modulator by stable ID")
+                .depth,
+            0.73
+        );
+        assert_eq!(
+            drums
+                .modulators
+                .iter()
+                .find(|modulator| modulator.id == seeded_modulator_id)
+                .expect("seeded modulator by stable ID")
+                .depth,
+            seeded_depth
+        );
+    }
+
+    #[test]
+    fn role_actions_target_the_latest_matching_track() {
+        let mut studio = Studio::new();
+        let original_bass_id = studio.project().tracks[1].id;
+        let plan = crate::prompt::EditPlan {
+            action: Action::Compound {
+                actions: vec![
+                    Action::AddTrack {
+                        role: TrackRole::Bass,
+                    },
+                    Action::Instrument {
+                        waveform: "sawtooth",
+                        target: TrackRole::Bass,
+                    },
+                    Action::Modulator {
+                        parameter: "instrument.attack".to_owned(),
+                        depth: 0.3,
+                        target: TrackRole::Bass,
+                    },
+                ],
+            },
+            summary: "Added a moving saw bass".to_owned(),
+        };
+        studio
+            .apply_plan(4.0, 8.0, "add a moving saw bass", plan)
+            .expect("configure newly added duplicate role");
+
+        let basses = studio
+            .project()
+            .tracks
+            .iter()
+            .filter(|track| track.role == TrackRole::Bass)
+            .collect::<Vec<_>>();
+        assert_eq!(basses.len(), 2);
+        assert_eq!(basses[0].id, original_bass_id);
+        assert_eq!(basses[0].instrument.waveform, "square");
+        assert_eq!(basses[0].modulators.len(), 1);
+        assert_eq!(basses[1].instrument.waveform, "sawtooth");
+        assert_eq!(basses[1].modulators.len(), 2);
+        assert_eq!(basses[1].modulators[1].target, "instrument.attack");
+
+        let later_effect_id = basses[1].effects[0].id;
+        let effect_target = format!("effect:{later_effect_id}.mix");
+        let plan = crate::prompt::EditPlan {
+            action: Action::Modulator {
+                parameter: effect_target.clone(),
+                depth: 0.2,
+                target: TrackRole::Bass,
+            },
+            summary: "Modulated the later bass effect".to_owned(),
+        };
+        studio
+            .apply_plan(4.0, 8.0, "move the later bass filter", plan)
+            .expect("resolve a stable effect on a later duplicate role");
+        let basses = studio
+            .project()
+            .tracks
+            .iter()
+            .filter(|track| track.role == TrackRole::Bass)
+            .collect::<Vec<_>>();
+        assert_eq!(basses[0].modulators.len(), 1);
+        assert_eq!(basses[1].modulators.last().unwrap().target, effect_target);
+    }
+
+    #[test]
+    fn sound_tool_validation_preserves_the_project() {
+        let mut studio = Studio::new();
+        let before = studio.to_json();
+        let bass = &studio.project().tracks[1];
+        let bass_id = bass.id;
+        let instrument_id = bass.instrument.id;
+        assert_eq!(
+            studio
+                .configure_sound_tool(bass_id, "instrument", instrument_id, None, "attack", "20",),
+            Err(StudioError::InvalidSoundTool)
+        );
+        assert_eq!(studio.to_json(), before);
+    }
+
+    #[test]
+    fn applies_stable_id_sound_tool_actions() {
+        let mut studio = Studio::new();
+        let bass = &studio.project().tracks[1];
+        let clip_id = bass.clips[0].id;
+        let event_id = bass.clips[0].events[0].id;
+        let plan = crate::prompt::EditPlan {
+            action: Action::Configure {
+                track_id: bass.id,
+                target: TrackRole::Bass,
+                tool: "event",
+                tool_id: event_id,
+                clip_id: Some(clip_id),
+                parameter: "velocity",
+                value: "0.5".to_owned(),
+            },
+            summary: "Adjusted the bass event".to_owned(),
+        };
+        studio
+            .apply_plan(0.0, 4.0, "soften the first bass event", plan)
+            .expect("valid stable-ID action");
+        assert_eq!(studio.project().tracks[1].clips[0].events[0].velocity, 0.5);
+        assert!(
+            studio
+                .project()
+                .to_json()
+                .contains("\"type\":\"configure\"")
+        );
     }
 
     #[test]
@@ -819,7 +1731,59 @@ mod tests {
         assert_eq!(clips[1].end, 6.0);
         assert_eq!(clips[2].label, "AI variation");
         assert_eq!((clips[2].start, clips[2].end), (6.0, 8.0));
+        assert_ne!(clips[0].id, clips[2].id);
+        assert_eq!(clips[0].events[0].id, clips[2].events[0].id);
         assert!(clips.windows(2).all(|pair| pair[0].end <= pair[1].start));
+    }
+
+    #[test]
+    fn compound_actions_commit_only_after_sequential_validation() {
+        let mut studio = Studio::new();
+        studio
+            .apply_prompt(0.0, 8.0, "add a lead")
+            .expect("existing lead");
+        let lead = studio
+            .project()
+            .tracks
+            .iter()
+            .find(|track| track.role == TrackRole::Lead)
+            .expect("lead track");
+        let track_id = lead.id;
+        let clip_id = lead.clips[0].id;
+        let event_id = lead.clips[0].events[0].id;
+        let before = studio.to_json();
+        let before_next_id = studio.next_id;
+        let before_history = studio.history.len();
+        let stale_configuration = crate::prompt::EditPlan {
+            action: Action::Compound {
+                actions: vec![
+                    Action::Drop { build: 0.4 },
+                    Action::Configure {
+                        track_id,
+                        target: TrackRole::Lead,
+                        tool: "event",
+                        tool_id: event_id,
+                        clip_id: Some(clip_id),
+                        parameter: "pitch",
+                        value: "80".to_owned(),
+                    },
+                ],
+            },
+            summary: "Dropped then configured stale material".to_owned(),
+        };
+
+        assert_eq!(
+            studio.apply_plan(
+                0.0,
+                8.0,
+                "drop then retune the old lead",
+                stale_configuration
+            ),
+            Err(StudioError::UnknownSoundTool)
+        );
+        assert_eq!(studio.to_json(), before);
+        assert_eq!(studio.next_id, before_next_id);
+        assert_eq!(studio.history.len(), before_history);
     }
 
     #[test]
@@ -865,6 +1829,35 @@ mod tests {
             Err(StudioError::UnknownTrack)
         );
         assert_eq!(studio.to_json(), initial);
+
+        for dependent in [
+            Action::Instrument {
+                waveform: "sawtooth",
+                target: TrackRole::Lead,
+            },
+            Action::Modulator {
+                parameter: "instrument.pitch".to_owned(),
+                depth: 0.2,
+                target: TrackRole::Lead,
+            },
+        ] {
+            let misordered = crate::prompt::EditPlan {
+                action: Action::Compound {
+                    actions: vec![
+                        dependent,
+                        Action::AddTrack {
+                            role: TrackRole::Lead,
+                        },
+                    ],
+                },
+                summary: "Misordered lead setup".to_owned(),
+            };
+            assert_eq!(
+                studio.apply_plan(4.0, 8.0, "configure then add a lead", misordered),
+                Err(StudioError::UnknownTrack)
+            );
+            assert_eq!(studio.to_json(), initial);
+        }
 
         let created_lead = crate::prompt::EditPlan {
             action: Action::Compound {

@@ -114,9 +114,8 @@
       this.contextStartedAt = this.context.currentTime;
       this.projectStartedAt = this.playhead;
       this.scheduleTrackAutomation();
-      const stepDuration = this.stepDuration();
-      this.chaseActiveVoices(stepDuration);
-      this.nextStep = Math.ceil(this.playhead / stepDuration) * stepDuration;
+      this.chaseActiveVoices();
+      this.nextStep = this.playhead;
       this.pump();
       this.timer = window.setInterval(() => this.pump(), 70);
       this.animate();
@@ -195,9 +194,11 @@
       this.trackGraphs.clear();
       for (const track of state.project.tracks) {
         const input = this.context.createGain();
-        const filter = this.context.createBiquadFilter();
+        const toneFilter = this.context.createBiquadFilter();
+        const effectFilter = this.context.createBiquadFilter();
         const filterOutput = this.context.createGain();
         const filterBypass = this.context.createGain();
+        const chainInput = this.context.createGain();
         const gate = this.context.createGain();
         const echoSend = this.context.createGain();
         const delay = this.context.createDelay(2);
@@ -209,7 +210,12 @@
         const compressorSend = this.context.createGain();
         const compressor = this.context.createDynamicsCompressor();
 
-        filter.type = "lowpass";
+        toneFilter.type = "lowpass";
+        toneFilter.dawAiAutomation = "tone";
+        toneFilter.dawAiTrackId = track.id;
+        effectFilter.type = "lowpass";
+        effectFilter.dawAiAutomation = "effect-filter";
+        effectFilter.dawAiTrackId = track.id;
         filterOutput.gain.value = 0;
         filterBypass.gain.value = 0;
         gate.gain.value = 0;
@@ -234,6 +240,7 @@
         filterOutput.dawAiTrackId = track.id;
         filterBypass.dawAiAutomation = "filter-bypass";
         filterBypass.dawAiTrackId = track.id;
+        filterBypass.dawAiBypassedStage = effectFilter;
         echoSend.dawAiAutomation = "echo";
         echoSend.dawAiTrackId = track.id;
         reverbSend.dawAiAutomation = "reverb";
@@ -243,29 +250,44 @@
         compressorSend.dawAiAutomation = "compressor";
         compressorSend.dawAiTrackId = track.id;
 
-        input.connect(filter);
-        input.connect(filterBypass);
-        filter.connect(filterOutput);
-        filterOutput.connect(gate);
-        filterBypass.connect(gate);
-        filter.connect(echoSend);
-        filter.connect(reverbSend);
-        filter.connect(chorusSend);
-        filter.connect(compressorSend);
-        echoSend.connect(delay);
-        delay.connect(gate);
+        input.connect(toneFilter);
+        toneFilter.connect(effectFilter);
+        toneFilter.connect(filterBypass);
+        effectFilter.connect(filterOutput);
+        filterOutput.connect(chainInput);
+        filterBypass.connect(chainInput);
         delay.connect(delayFeedback);
         delayFeedback.connect(delay);
-        reverbSend.connect(reverb);
-        reverb.connect(gate);
-        chorusSend.connect(chorusDelay);
-        chorusDelay.connect(gate);
-        compressorSend.connect(compressor);
-        compressor.connect(gate);
+
+        const stages = {
+          echo: [echoSend, delay],
+          reverb: [reverbSend, reverb],
+          chorus: [chorusSend, chorusDelay],
+          compressor: [compressorSend, compressor],
+        };
+        const routedCategories = track.routing.audio
+          .filter((node) => node.startsWith("effect:"))
+          .map((node) => track.effects.find((effect) => effect.id === Number(node.slice(7))))
+          .filter(Boolean)
+          .map((effect) => this.effectCategory(effect.name))
+          .filter(Boolean);
+        const stageOrder = [...new Set([...routedCategories, "echo", "reverb", "chorus", "compressor"])];
+        let stageSource = chainInput;
+        for (const category of stageOrder) {
+          const [send, processor] = stages[category];
+          const output = this.context.createGain();
+          stageSource.connect(output);
+          stageSource.connect(send);
+          send.connect(processor);
+          processor.connect(output);
+          stageSource = output;
+        }
+        stageSource.connect(gate);
         gate.connect(this.master);
         this.trackGraphs.set(track.id, {
           input,
-          filter,
+          toneFilter,
+          effectFilter,
           filterOutput,
           filterBypass,
           gate,
@@ -295,6 +317,16 @@
           if (clip.start >= this.projectStartedAt) boundaries.add(clip.start);
           if (clip.end >= this.projectStartedAt) boundaries.add(clip.end);
         }
+        for (const modulator of track.modulators) {
+          if (
+            !modulator.enabled ||
+            ["instrument.attack", "instrument.release", "instrument.pitch"].includes(modulator.target)
+          ) continue;
+          const interval = this.modulationInterval([modulator]);
+          for (let time = this.projectStartedAt; time <= state.project.duration; time += interval) {
+            boundaries.add(time);
+          }
+        }
         const orderedBoundaries = [...boundaries].sort((left, right) => left - right);
         const graph = this.trackGraphs.get(track.id);
         for (const boundary of orderedBoundaries) {
@@ -315,12 +347,18 @@
           graph.reverbSend.gain.setValueAtTime(Math.min(0.6, reverbMix * 0.7), audioTime);
           graph.chorusSend.gain.setValueAtTime(Math.min(0.5, automation.chorus * 0.5), audioTime);
           graph.compressorSend.gain.setValueAtTime(Math.min(0.5, automation.compression * 0.45), audioTime);
-          graph.filter.frequency.setValueAtTime(
+          graph.toneFilter.frequency.setValueAtTime(
             clamp(
-              this.baseFilterForRole(track.role) * (1 + automation.filter) * (1 - automation.lowPass * 0.65),
+              this.baseFilterForRole(track.role) *
+                (0.7 + automation.instrumentTone * 0.6) *
+                (1 + automation.filter),
               180,
               9000,
             ),
+            audioTime,
+          );
+          graph.effectFilter.frequency.setValueAtTime(
+            this.effectFilterFrequency(track, automation),
             audioTime,
           );
         }
@@ -330,7 +368,13 @@
     automationAt(track, time) {
       const clipActive = track.clips.some((clip) => time >= clip.start && time < clip.end);
       const automation = {
-        gain: track.muted || !clipActive ? 0 : track.volume,
+        gain: track.muted || !clipActive ? 0 : this.parameterAt(track, "track.volume", track.volume, time),
+        instrumentTone: this.parameterAt(
+          track,
+          "instrument.tone",
+          track.instrument.parameters.tone,
+          time,
+        ),
         filter: 0,
         filterBypass: false,
         lowPass: 0,
@@ -345,7 +389,10 @@
         drop: null,
       };
       for (const effect of track.effects) {
-        if (effect.enabled) this.applyEffect(effect.name, effect.mix, automation);
+        if (!effect.enabled) continue;
+        const target = `effect:${effect.id}.mix`;
+        const mix = this.parameterAt(track, target, effect.parameters.mix, time);
+        this.applyEffect(effect.name, mix, automation);
       }
       for (const edit of state.project.edits) {
         if (time >= edit.start && time < edit.end) {
@@ -356,6 +403,47 @@
         this.applyDropAutomation(automation.drop.action, track.role, automation, automation.drop.edit, time);
       }
       return automation;
+    }
+
+    modulatorValue(modulator, time) {
+      const phase = time * modulator.parameters.rate * Math.PI * 2;
+      let value;
+      if (modulator.shape === "triangle") {
+        value = (2 / Math.PI) * Math.asin(Math.sin(phase));
+      } else if (modulator.shape === "square") {
+        value = Math.sin(phase) >= 0 ? 1 : -1;
+      } else if (modulator.shape === "envelope") {
+        value = Math.abs(Math.sin(phase)) * 2 - 1;
+      } else if (modulator.shape === "random") {
+        value = Math.sin(Math.floor(time * modulator.parameters.rate * 8) * 91.17 + modulator.id) * 0.8;
+      } else {
+        value = Math.sin(phase);
+      }
+      return value * modulator.parameters.depth;
+    }
+
+    modulationInterval(modulators) {
+      const fastestRate = Math.max(...modulators.map((modulator) => modulator.parameters.rate), 0.01);
+      return clamp(1 / (fastestRate * 8), 0.0025, 0.025);
+    }
+
+    parameterAt(track, targetId, baseValue, time) {
+      const target = track.modulationTargets.find((candidate) => candidate.id === targetId);
+      if (!target) return baseValue;
+      const amount = track.modulators
+        .filter((modulator) => modulator.enabled && modulator.target === targetId)
+        .reduce((total, modulator) => total + this.modulatorValue(modulator, time), 0);
+      const value = target.mode === "multiply"
+        ? baseValue * (1 + amount * target.scale)
+        : baseValue + amount * target.scale;
+      return clamp(value, target.minimum, target.maximum);
+    }
+
+    instrumentParametersAt(track, time) {
+      return {
+        attack: this.parameterAt(track, "instrument.attack", track.instrument.parameters.attack, time),
+        release: this.parameterAt(track, "instrument.release", track.instrument.parameters.release, time),
+      };
     }
 
     applyAutomationAction(action, role, automation, edit, time) {
@@ -483,6 +571,23 @@
       }[role];
     }
 
+    effectFilterFrequency(track, automation) {
+      const dryCutoff = 20000;
+      const mix = clamp(automation.lowPass, 0, 1);
+      if (mix === 0) return dryCutoff;
+      const wetCutoff = clamp(this.baseFilterForRole(track.role) * 0.35, 180, 9000);
+      return dryCutoff * ((wetCutoff / dryCutoff) ** mix);
+    }
+
+    effectCategory(name) {
+      const normalized = name.toLowerCase();
+      if (normalized.includes("echo") || normalized.includes("delay")) return "echo";
+      if (normalized === "reverb" || normalized === "room" || normalized === "shimmer") return "reverb";
+      if (normalized.includes("chorus")) return "chorus";
+      if (normalized.includes("compressor") || normalized.includes("compression")) return "compressor";
+      return null;
+    }
+
     createReverbImpulse() {
       const length = Math.floor(this.context.sampleRate * 1.8);
       const impulse = this.context.createBuffer(2, length, this.context.sampleRate);
@@ -537,66 +642,164 @@
       this.updatePosition();
       const scheduleUntil = this.playhead + 0.22;
       const stepDuration = this.stepDuration();
-      while (this.nextStep <= scheduleUntil && this.nextStep < state.project.duration) {
-        this.scheduleStep(this.nextStep, stepDuration);
-        this.nextStep += stepDuration;
+      while (this.nextStep < scheduleUntil && this.nextStep < state.project.duration) {
+        const windowEnd = Math.min(this.nextStep + stepDuration, state.project.duration);
+        this.scheduleWindow(this.nextStep, windowEnd);
+        this.nextStep = windowEnd;
       }
     }
 
-    scheduleStep(projectTime, stepDuration) {
+    scheduleWindow(windowStart, windowEnd) {
       for (const track of state.project.tracks) {
-        const clip = track.clips.find((candidate) => projectTime >= candidate.start && projectTime < candidate.end);
-        if (track.muted || !clip) {
-          continue;
+        if (track.muted) continue;
+        for (const clip of track.clips) {
+          if (clip.end <= windowStart || clip.start >= windowEnd) continue;
+          for (const occurrence of this.clipEventsInWindow(clip, track, windowStart, windowEnd)) {
+            const audioTime = Math.max(
+              this.context.currentTime + 0.005,
+              this.contextStartedAt + occurrence.time - this.projectStartedAt,
+            );
+            this.scheduleClipEvent(
+              occurrence.event,
+              track,
+              audioTime,
+              0,
+              occurrence.time,
+            );
+          }
         }
-        const localStep = Math.floor((projectTime - clip.start) / stepDuration + 0.0001);
-        const step = localStep % 16;
-        const phraseTime = clip.start + localStep * stepDuration;
-        const audioTime = Math.max(
-          this.context.currentTime + 0.005,
-          this.contextStartedAt + phraseTime - this.projectStartedAt,
-        );
-        const modifiers = this.modifiers(track, projectTime);
-
-        if (track.role === "drums") {
-          this.scheduleDrums(step, audioTime, 1, modifiers, track.id, projectTime, stepDuration);
-        } else if (track.role === "bass") {
-          this.scheduleBass(step, audioTime, stepDuration, 1, modifiers, track.id);
-        } else if (track.role === "chords") {
-          this.scheduleChords(localStep, audioTime, stepDuration, 1, modifiers, track.id);
-        } else if (track.role === "lead") {
-          this.scheduleLead(step, audioTime, stepDuration, 1, modifiers, track.id);
-        } else if (track.role === "texture") {
-          this.scheduleTexture(localStep, audioTime, 1, modifiers, track.id);
+        if (track.role !== "drums") continue;
+        for (const edit of state.project.edits) {
+          const dropAction = this.findDropAction(edit.action);
+          if (!dropAction) continue;
+          const impact = this.dropTiming(dropAction, edit).impact;
+          const impactKey = `${track.id}:${impact.toFixed(6)}`;
+          if (this.triggeredDropImpacts.has(impactKey)) continue;
+          const clipActive = track.clips.some((clip) => impact >= clip.start && impact < clip.end);
+          if (clipActive && impact >= windowStart && impact < windowEnd) {
+            this.triggeredDropImpacts.add(impactKey);
+            const audioTime = Math.max(
+              this.context.currentTime + 0.005,
+              this.contextStartedAt + impact - this.projectStartedAt,
+            );
+            this.crash(audioTime, 0.18, track.id);
+          }
         }
       }
     }
 
-    chaseActiveVoices(stepDuration) {
+    clipEventsInWindow(clip, track, windowStart, windowEnd) {
+      const groups = new Map();
+      for (const event of clip.events) {
+        if (!groups.has(event.time)) groups.set(event.time, []);
+        groups.get(event.time).push(event);
+      }
+      const onsets = [...groups.keys()].sort((left, right) => left - right);
+      const pattern = onsets.flatMap((onset, onsetIndex) =>
+        groups.get(onset).map((event) => ({ event, onsetIndex, densityEvent: false })),
+      );
+      for (let index = 0; index < onsets.length; index += 1) {
+        const previous = onsets[index];
+        const next = index + 1 < onsets.length ? onsets[index + 1] : onsets[0] + clip.loopBeats;
+        const gap = next - previous;
+        if (gap < 0.5) continue;
+        const midpoint = (previous + gap / 2) % clip.loopBeats;
+        if (onsets.some((onset) => Math.abs(onset - midpoint) < 0.000001)) continue;
+        for (const event of groups.get(previous)) {
+          pattern.push({
+            event: {
+              ...event,
+              time: midpoint,
+              duration: Math.max(0.0625, event.duration * 0.7),
+              velocity: Math.max(0.01, event.velocity * 0.82),
+            },
+            onsetIndex: index,
+            densityEvent: true,
+          });
+        }
+      }
+
+      const beatDuration = 60 / state.project.bpm;
+      const loopDuration = clip.loopBeats * beatDuration;
+      const firstCycle = Math.max(0, Math.floor((windowStart - clip.start) / loopDuration) - 1);
+      const lastCycle = Math.max(0, Math.floor((windowEnd - clip.start) / loopDuration));
+      const occurrences = [];
+      for (let cycle = firstCycle; cycle <= lastCycle; cycle += 1) {
+        for (const candidate of pattern) {
+          const time = clip.start + cycle * loopDuration + candidate.event.time * beatDuration;
+          if (time < clip.start || time >= clip.end) continue;
+          if (time < windowStart - 0.000001 || time >= windowEnd - 0.000001) continue;
+          const modifiers = this.modifiers(track, time);
+          if (candidate.densityEvent && modifiers.rhythm <= 0.15) continue;
+          if (
+            !candidate.densityEvent &&
+            modifiers.rhythm < -0.15 &&
+            (cycle * onsets.length + candidate.onsetIndex) % 2 !== 0
+          ) continue;
+          occurrences.push({ event: candidate.event, time });
+        }
+      }
+      return occurrences.sort((left, right) => left.time - right.time);
+    }
+
+    scheduleClipEvent(event, track, time, elapsed, projectTime, onsetTime = projectTime) {
+      const velocity = clamp(event.velocity, 0.01, 1);
+      const instrument = this.instrumentParametersAt(track, onsetTime);
+      if (event.type !== "note") {
+        this.drum(event, track, time, projectTime, elapsed, instrument);
+        return;
+      }
+
+      const beatDuration = 60 / state.project.bpm;
+      const frequency = 440 * 2 ** ((event.pitch - 69) / 12);
+      const roleLevel = { bass: 0.24, chords: 0.09, lead: 0.13, texture: 0.07 }[track.role] ?? 0.1;
+      this.tone(
+        frequency,
+        time,
+        event.duration * beatDuration,
+        velocity * roleLevel,
+        track.instrument.waveform,
+        track.id,
+        elapsed,
+        instrument,
+        track,
+        projectTime,
+        event,
+      );
+    }
+
+    chaseActiveVoices() {
       if (this.projectStartedAt <= 0) return;
       const audioTime = this.context.currentTime + 0.005;
       for (const track of state.project.tracks) {
-        if (track.muted || track.role === "drums") continue;
-        const clip = track.clips.find(
-          (candidate) => this.projectStartedAt >= candidate.start && this.projectStartedAt < candidate.end,
+        if (track.muted) continue;
+        const beatDuration = 60 / state.project.bpm;
+        const longestEvent = Math.max(
+          ...track.clips.flatMap((clip) => clip.events.map((event) => event.duration * beatDuration)),
+          0,
         );
-        if (!clip) continue;
-        const lastLocalStep = Math.floor((this.projectStartedAt - clip.start) / stepDuration + 0.0001);
-        for (let localStep = lastLocalStep; localStep >= 0; localStep -= 1) {
-          const phraseTime = clip.start + localStep * stepDuration;
-          const elapsed = this.projectStartedAt - phraseTime;
-          if (elapsed <= 0.001) continue;
-          if (elapsed > 3.5) break;
-          const modifiers = this.modifiers(track, phraseTime);
-          const step = localStep % 16;
-          if (track.role === "bass") {
-            this.scheduleBass(step, audioTime, stepDuration, 1, modifiers, track.id, elapsed);
-          } else if (track.role === "chords") {
-            this.scheduleChords(localStep, audioTime, stepDuration, 1, modifiers, track.id, elapsed);
-          } else if (track.role === "lead") {
-            this.scheduleLead(step, audioTime, stepDuration, 1, modifiers, track.id, elapsed);
-          } else if (track.role === "texture") {
-            this.scheduleTexture(localStep, audioTime, 1, modifiers, track.id, elapsed);
+        const maximumRelease = track.modulationTargets.find(
+          (target) => target.id === "instrument.release",
+        )?.maximum ?? track.instrument.parameters.release;
+        const lookback = Math.max(0, this.projectStartedAt - longestEvent - maximumRelease);
+        for (const clip of track.clips) {
+          if (clip.end <= lookback || clip.start >= this.projectStartedAt) continue;
+          for (const occurrence of this.clipEventsInWindow(clip, track, lookback, this.projectStartedAt)) {
+            const elapsed = this.projectStartedAt - occurrence.time;
+            if (elapsed <= 0.001) continue;
+            const event = occurrence.event;
+            const instrument = this.instrumentParametersAt(track, occurrence.time);
+            const soundingFor = event.duration * beatDuration + instrument.release;
+            if (elapsed < soundingFor) {
+              this.scheduleClipEvent(
+                event,
+                track,
+                audioTime,
+                elapsed,
+                this.projectStartedAt,
+                occurrence.time,
+              );
+            }
           }
         }
       }
@@ -605,12 +808,8 @@
     modifiers(track, time) {
       const result = {
         rhythm: 0,
-        release: 1,
         dropAction: null,
         dropEdit: null,
-        dropPhase: "none",
-        dropProgress: 0,
-        dropImpact: 0,
       };
       for (const edit of state.project.edits) {
         if (time < edit.start || time >= edit.end) continue;
@@ -618,22 +817,14 @@
       }
       if (result.dropAction) {
         const timing = this.dropTiming(result.dropAction, result.dropEdit);
-        result.dropImpact = timing.impact;
         if (time < timing.impact) {
-          result.dropPhase = "build";
-          result.dropProgress = clamp(
+          const progress = clamp(
             (time - result.dropEdit.start) / Math.max(0.01, timing.impact - result.dropEdit.start),
             0,
             1,
           );
-          result.rhythm += 0.1 + result.dropProgress * 0.65;
+          result.rhythm += 0.1 + progress * 0.65;
         } else {
-          result.dropPhase = "impact";
-          result.dropProgress = clamp(
-            (time - timing.impact) / Math.max(0.01, result.dropEdit.end - timing.impact),
-            0,
-            1,
-          );
           result.rhythm += 0.8;
         }
       }
@@ -653,116 +844,182 @@
       }
     }
 
-    rhythmInterval(baseInterval, modifiers) {
-      if (modifiers.rhythm > 0.15) return Math.max(1, baseInterval / 2);
-      if (modifiers.rhythm < -0.15) return baseInterval * 2;
-      return baseInterval;
-    }
-
-    scheduleDrums(step, time, gain, modifiers, trackId, projectTime, stepDuration) {
-      const dense = modifiers.rhythm > 0.15;
-      const sparse = modifiers.rhythm < -0.15;
-      const dropId = modifiers.dropEdit?.id;
-      const firstImpact =
-        modifiers.dropPhase === "impact" &&
-        projectTime < modifiers.dropImpact + stepDuration + 0.0001 &&
-        !this.triggeredDropImpacts.has(dropId);
-      if (firstImpact) {
-        this.triggeredDropImpacts.add(dropId);
-        this.kick(time, gain * 0.82, trackId);
-        this.crash(time, gain * 0.18, trackId);
-      } else if (step === 0 || step === 8 || (dense && (step === 6 || step === 14))) {
-        this.kick(time, gain * 0.54, trackId);
-      }
-      if (step === 4 || step === 12) this.snare(time, gain * 0.25, trackId);
-      if ((!sparse && step % 2 === 0) || (dense && step % 2 === 1)) {
-        this.hat(time, gain * (step % 4 === 0 ? 0.085 : 0.055), trackId);
+    schedulePitchModulation(parameter, track, audioTime, projectTime, duration) {
+      const modulators = track.modulators.filter(
+        (modulator) => modulator.enabled && modulator.target === "instrument.pitch",
+      );
+      if (modulators.length === 0) return;
+      const interval = this.modulationInterval(modulators);
+      for (let offset = 0; offset <= duration; offset += interval) {
+        const semitones = this.parameterAt(track, "instrument.pitch", 0, projectTime + offset);
+        parameter.setValueAtTime(semitones * 100, audioTime + offset);
       }
     }
 
-    scheduleBass(step, time, stepDuration, gain, modifiers, trackId, elapsed = 0) {
-      const impact = modifiers.dropPhase === "impact";
-      const interval = impact ? 2 : this.rhythmInterval(4, modifiers);
-      if (step % interval !== 0) return;
-      const notes = impact
-        ? [41.2, 41.2, 49, 36.71, 41.2, 55, 49, 36.71]
-        : [55, 55, 65.41, 49, 55, 73.42, 65.41, 49];
-      const frequency = notes[Math.floor(step / 2) % notes.length];
-      const duration = impact ? stepDuration * 1.35 : stepDuration * Math.min(2.8, interval * 0.7);
-      this.tone(frequency, time, duration, gain * (impact ? 0.3 : 0.21), "square", modifiers, 850, trackId, elapsed);
-    }
-
-    scheduleChords(localStep, time, stepDuration, gain, modifiers, trackId, elapsed = 0) {
-      const interval = modifiers.dropPhase === "impact" ? 8 : this.rhythmInterval(8, modifiers);
-      if (localStep % interval !== 0) return;
-      const chordIndex = Math.floor(localStep / 8) % 4;
-      const chords = [
-        [220, 261.63, 329.63],
-        [174.61, 220, 261.63],
-        [196, 246.94, 293.66],
-        [164.81, 207.65, 246.94],
-      ];
-      for (const frequency of chords[chordIndex]) {
-        this.tone(frequency, time, stepDuration * Math.min(7.4, interval * 0.925), gain * 0.06, "triangle", modifiers, 1800, trackId, elapsed);
+    drum(event, track, time, projectTime, elapsed, instrument) {
+      const beatDuration = 60 / state.project.bpm;
+      const bodyDuration = Math.max(0.01, event.duration * beatDuration);
+      const totalDuration = bodyDuration + instrument.release;
+      const remaining = totalDuration - elapsed;
+      if (remaining <= 0.01) return;
+      const attack = instrument.attack;
+      const velocity = clamp(event.velocity, 0.01, 1);
+      const frequency = 440 * 2 ** ((event.pitch - 69) / 12);
+      const oscillator = this.context.createOscillator();
+      const tonalEnvelope = this.context.createGain();
+      oscillator.type = track.instrument.waveform;
+      oscillator.dawAiTrackId = track.id;
+      oscillator.dawAiChased = elapsed > 0;
+      oscillator.dawAiEventPitch = event.pitch;
+      oscillator.dawAiEventDuration = event.duration;
+      oscillator.dawAiInstrumentAttack = instrument.attack;
+      oscillator.dawAiInstrumentRelease = instrument.release;
+      if (event.type === "kick") {
+        const startFrequency = frequency * 3.2;
+        const endFrequency = Math.max(20, frequency);
+        if (elapsed < bodyDuration) {
+          const progress = elapsed / bodyDuration;
+          const currentFrequency = startFrequency * (endFrequency / startFrequency) ** progress;
+          oscillator.frequency.setValueAtTime(currentFrequency, time);
+          oscillator.frequency.exponentialRampToValueAtTime(
+            endFrequency,
+            time + bodyDuration - elapsed,
+          );
+        } else {
+          oscillator.frequency.setValueAtTime(endFrequency, time);
+        }
+      } else {
+        oscillator.frequency.setValueAtTime(frequency, time);
       }
-    }
-
-    scheduleLead(step, time, stepDuration, gain, modifiers, trackId, elapsed = 0) {
-      const impact = modifiers.dropPhase === "impact";
-      const interval = impact ? 2 : this.rhythmInterval(4, modifiers);
-      if (step % interval !== 0) return;
-      const notes = impact
-        ? [220, 261.63, 220, 196, 174.61, 196, 220, 146.83]
-        : [440, 523.25, 659.25, 587.33, 493.88, 440, 392, 493.88];
-      const frequency = notes[Math.floor(step / 2) % notes.length];
-      this.tone(
-        frequency,
+      this.schedulePitchModulation(oscillator.detune, track, time, projectTime, remaining);
+      const tonalLevel = velocity * (event.type === "kick" ? 0.58 : event.type === "snare" ? 0.055 : 0.028);
+      this.scheduleVoiceEnvelope(
+        tonalEnvelope.gain,
         time,
-        stepDuration * (impact ? 1.3 : 1.55),
-        gain * (impact ? 0.14 : 0.1),
-        "sawtooth",
-        modifiers,
-        2400,
-        trackId,
+        attack,
+        bodyDuration,
+        totalDuration,
+        tonalLevel,
         elapsed,
       );
+      tonalEnvelope.dawAiVoiceEnvelope = true;
+      tonalEnvelope.dawAiVoiceKind = "tonal";
+      tonalEnvelope.dawAiTrackId = track.id;
+      tonalEnvelope.dawAiEventId = event.id;
+      oscillator.connect(tonalEnvelope);
+      this.routeVoice(tonalEnvelope, track.id);
+      this.trackSource(oscillator);
+      oscillator.start(time);
+      oscillator.stop(time + remaining + 0.01);
+
+      if (event.type === "kick") return;
+      const source = this.context.createBufferSource();
+      const filter = this.context.createBiquadFilter();
+      const noiseEnvelope = this.context.createGain();
+      source.buffer = this.noiseBuffer;
+      source.loop = true;
+      source.dawAiTrackId = track.id;
+      source.dawAiChased = elapsed > 0;
+      source.dawAiEventPitch = event.pitch;
+      source.dawAiEventDuration = event.duration;
+      filter.type = "highpass";
+      filter.frequency.value = clamp(frequency * (event.type === "hat" ? 60 : 24), 300, 12000);
+      const noiseLevel = velocity * (event.type === "hat" ? 0.1 : 0.3);
+      this.scheduleVoiceEnvelope(
+        noiseEnvelope.gain,
+        time,
+        attack,
+        bodyDuration,
+        totalDuration,
+        noiseLevel,
+        elapsed,
+      );
+      noiseEnvelope.dawAiVoiceEnvelope = true;
+      noiseEnvelope.dawAiVoiceKind = "noise";
+      noiseEnvelope.dawAiTrackId = track.id;
+      noiseEnvelope.dawAiEventId = event.id;
+      source.connect(filter);
+      filter.connect(noiseEnvelope);
+      this.routeVoice(noiseEnvelope, track.id);
+      this.trackSource(source);
+      source.start(time);
+      source.stop(time + remaining + 0.01);
     }
 
-    scheduleTexture(localStep, time, gain, modifiers, trackId, elapsed = 0) {
-      if (localStep % this.rhythmInterval(16, modifiers) !== 0) return;
-      this.tone(329.63, time, 2.6, gain * 0.035, "sine", { ...modifiers, release: 2.2 }, 3200, trackId, elapsed);
-      this.tone(493.88, time, 2.2, gain * 0.022, "triangle", { ...modifiers, release: 2 }, 3600, trackId, elapsed);
+    scheduleVoiceEnvelope(parameter, time, attack, bodyDuration, totalDuration, level, elapsed) {
+      const peak = Math.max(0.0002, level);
+      const floor = 0.0001;
+      const remaining = totalDuration - elapsed;
+      const attackDuration = Math.max(0.001, attack);
+      const attackEnd = Math.min(attackDuration, bodyDuration);
+      const levelDuringAttack = (offset) =>
+        floor * (peak / floor) ** clamp(offset / attackDuration, 0, 1);
+      const noteOffLevel = levelDuringAttack(attackEnd);
+      if (elapsed < bodyDuration) {
+        parameter.setValueAtTime(
+          levelDuringAttack(Math.min(elapsed, attackDuration)),
+          time,
+        );
+        if (elapsed < attackEnd) {
+          parameter.exponentialRampToValueAtTime(
+            noteOffLevel,
+            time + attackEnd - elapsed,
+          );
+        }
+        if (bodyDuration > attackEnd) {
+          parameter.setValueAtTime(noteOffLevel, time + bodyDuration - elapsed);
+        }
+      } else {
+        const releaseDuration = Math.max(0.001, totalDuration - bodyDuration);
+        const progress = clamp((elapsed - bodyDuration) / releaseDuration, 0, 1);
+        const currentLevel = noteOffLevel * (floor / noteOffLevel) ** progress;
+        parameter.setValueAtTime(currentLevel, time);
+      }
+      parameter.exponentialRampToValueAtTime(floor, time + remaining);
     }
 
-    tone(frequency, time, duration, level, type, modifiers, baseFilter, trackId, elapsed = 0) {
-      const release = Math.max(0.04, Math.min(duration * modifiers.release, 3.5));
-      const remaining = release - elapsed;
+    tone(
+      frequency,
+      time,
+      duration,
+      level,
+      type,
+      trackId,
+      elapsed,
+      instrument,
+      track,
+      projectTime,
+      event,
+    ) {
+      const soundingDuration = duration + instrument.release;
+      const remaining = soundingDuration - elapsed;
       if (remaining <= 0.01) return;
       const oscillator = this.context.createOscillator();
-      const filter = this.context.createBiquadFilter();
       const envelope = this.context.createGain();
       oscillator.type = type;
       oscillator.dawAiTrackId = trackId;
       oscillator.dawAiChased = elapsed > 0;
+      oscillator.dawAiBaseFrequency = frequency;
+      oscillator.dawAiEventId = event.id;
+      oscillator.dawAiEventTime = event.time;
+      oscillator.dawAiEventDuration = event.duration;
+      oscillator.dawAiInstrumentAttack = instrument.attack;
+      oscillator.dawAiInstrumentRelease = instrument.release;
       oscillator.frequency.setValueAtTime(frequency, time);
-      filter.type = "lowpass";
-      filter.frequency.value = baseFilter;
-      if (modifiers.dropPhase === "impact" && type === "square") {
-        filter.frequency.setValueAtTime(baseFilter * 0.55, time);
-        filter.frequency.exponentialRampToValueAtTime(
-          baseFilter * 1.4,
-          time + Math.min(0.18, remaining * 0.45),
-        );
-      }
-      if (elapsed > 0) {
-        envelope.gain.setValueAtTime(Math.max(0.0002, level * (remaining / release)), time);
-      } else {
-        envelope.gain.setValueAtTime(0.0001, time);
-        envelope.gain.exponentialRampToValueAtTime(Math.max(0.0002, level), time + 0.018);
-      }
-      envelope.gain.exponentialRampToValueAtTime(0.0001, time + remaining);
-      oscillator.connect(filter);
-      filter.connect(envelope);
+      this.schedulePitchModulation(oscillator.detune, track, time, projectTime, remaining);
+      this.scheduleVoiceEnvelope(
+        envelope.gain,
+        time,
+        instrument.attack,
+        duration,
+        soundingDuration,
+        level,
+        elapsed,
+      );
+      envelope.dawAiVoiceEnvelope = true;
+      envelope.dawAiTrackId = trackId;
+      envelope.dawAiEventId = event.id;
+      oscillator.connect(envelope);
       this.routeVoice(envelope, trackId);
       this.trackSource(oscillator);
       oscillator.start(time);
@@ -776,55 +1033,6 @@
     trackSource(source) {
       this.activeSources.add(source);
       source.addEventListener("ended", () => this.activeSources.delete(source), { once: true });
-    }
-
-    kick(time, level, trackId) {
-      const oscillator = this.context.createOscillator();
-      const envelope = this.context.createGain();
-      oscillator.dawAiTrackId = trackId;
-      oscillator.frequency.setValueAtTime(145, time);
-      oscillator.frequency.exponentialRampToValueAtTime(42, time + 0.16);
-      envelope.gain.setValueAtTime(level, time);
-      envelope.gain.exponentialRampToValueAtTime(0.0001, time + 0.2);
-      oscillator.connect(envelope);
-      this.routeVoice(envelope, trackId);
-      this.trackSource(oscillator);
-      oscillator.start(time);
-      oscillator.stop(time + 0.21);
-    }
-
-    snare(time, level, trackId) {
-      const source = this.context.createBufferSource();
-      const filter = this.context.createBiquadFilter();
-      const envelope = this.context.createGain();
-      source.buffer = this.noiseBuffer;
-      filter.type = "highpass";
-      filter.frequency.value = 1100;
-      envelope.gain.setValueAtTime(level, time);
-      envelope.gain.exponentialRampToValueAtTime(0.0001, time + 0.12);
-      source.connect(filter);
-      filter.connect(envelope);
-      this.routeVoice(envelope, trackId);
-      this.trackSource(source);
-      source.start(time);
-      source.stop(time + 0.13);
-    }
-
-    hat(time, level, trackId) {
-      const source = this.context.createBufferSource();
-      const filter = this.context.createBiquadFilter();
-      const envelope = this.context.createGain();
-      source.buffer = this.noiseBuffer;
-      filter.type = "highpass";
-      filter.frequency.value = 6500;
-      envelope.gain.setValueAtTime(level, time);
-      envelope.gain.exponentialRampToValueAtTime(0.0001, time + 0.045);
-      source.connect(filter);
-      filter.connect(envelope);
-      this.routeVoice(envelope, trackId);
-      this.trackSource(source);
-      source.start(time);
-      source.stop(time + 0.05);
     }
 
     crash(time, level, trackId) {
@@ -987,19 +1195,21 @@
   }
 
   function renderAdvanced() {
+    const uiState = captureAdvancedUiState();
     elements.channelList.innerHTML = state.project.tracks
       .map((track) => {
-        const baselineEffects = track.effects
-          .map(
-            (effect) => `<span class="effect-pill">${escapeHtml(effect.name)} <b>${Math.round(effect.mix * 100)}%</b></span>`,
-          )
-          .join("");
         const regionalEffects = regionalEffectsForTrack(track)
           .map((effect) => {
             return `<span class="effect-pill is-regional">${escapeHtml(effect.name)} <b>${escapeHtml(effect.detail)} &middot; ${effect.start.toFixed(1)}-${effect.end.toFixed(1)}s</b></span>`;
           })
           .join("");
-        const effects = baselineEffects || regionalEffects ? baselineEffects + regionalEffects : '<span class="effect-pill">No effects</span>';
+        const orderedEffects = track.routing.audio
+          .filter((node) => node.startsWith("effect:"))
+          .map((node) => track.effects.find((effect) => effect.id === Number(node.slice(7))))
+          .filter(Boolean);
+        const route = ["Clips", "Instrument", ...orderedEffects.map((effect) => effect.name), "Master"]
+          .map((node) => `<span>${escapeHtml(node)}</span>`)
+          .join('<i aria-hidden="true">→</i>');
         return `<section class="channel-card" style="--track-color:${track.color}">
           <div class="channel-heading">
             <div class="channel-name"><i></i>${escapeHtml(track.name)}</div>
@@ -1009,16 +1219,37 @@
             <input type="range" min="0" max="1.5" step="0.01" value="${track.volume}" data-volume-track="${track.id}" aria-label="${escapeHtml(track.name)} volume">
             <output>${Math.round(track.volume * 100)}%</output>
           </label>
-          <div class="channel-details">
-            <div class="detail-block"><span>Instrument</span><strong>${escapeHtml(track.instrument.engine)}</strong></div>
-            <div class="detail-block"><span>Sound</span><strong>${escapeHtml(track.instrument.waveform)}</strong></div>
-            <div class="detail-block"><span>Attack</span><strong>${escapeHtml(track.instrument.attack)}</strong></div>
-            <div class="detail-block"><span>Release</span><strong>${escapeHtml(track.instrument.release)}</strong></div>
-            <div class="effects-list">${effects}</div>
+          <div class="sound-tool instrument-tool">
+            <div class="tool-heading"><div><span>Instrument</span><strong>${escapeHtml(track.instrument.engine)}</strong></div><code>#${track.instrument.id}</code></div>
+            <div class="tool-controls">
+              <label class="tool-control">Waveform
+                <select data-sound-tool="instrument" data-track-id="${track.id}" data-tool-id="${track.instrument.id}" data-parameter="waveform" data-control-key="${track.id}-instrument-${track.instrument.id}-waveform" aria-label="${escapeHtml(`${track.name} instrument #${track.instrument.id} waveform`)}">
+                  ${selectOptions(["sine", "triangle", "sawtooth", "square"], track.instrument.waveform)}
+                </select>
+              </label>
+              ${soundRange(track, "instrument", track.instrument.id, "instrument", "attack", track.instrument.parameters.attack, 0.001, 2, "s")}
+              ${soundRange(track, "instrument", track.instrument.id, "instrument", "release", track.instrument.parameters.release, 0.02, 5, "s")}
+              ${soundRange(track, "instrument", track.instrument.id, "instrument", "tone", track.instrument.parameters.tone, 0, 1, "%")}
+            </div>
+          </div>
+          <div class="sound-tool effects-tool">
+            <div class="tool-heading"><div><span>Effect chain</span><strong>Processed in this order</strong></div></div>
+            <div class="routing-chain" aria-label="${escapeHtml(track.name)} audio routing">${route}</div>
+            <div class="effect-stack">${orderedEffects.map((effect, index) => renderEffect(track, effect, index, orderedEffects.length)).join("")}</div>
+            <div class="effects-list">${regionalEffects || '<span class="effect-pill">No regional effects</span>'}</div>
+          </div>
+          <div class="sound-tool modulators-tool">
+            <div class="tool-heading"><div><span>Modulators</span><strong>Time-varying control signals</strong></div></div>
+            ${track.modulators.map((modulator) => renderModulator(track, modulator)).join("")}
+          </div>
+          <div class="sound-tool clips-tool">
+            <div class="tool-heading"><div><span>Clips</span><strong>Notes and drum events</strong></div></div>
+            ${track.clips.map((clip) => renderClipEvents(track, clip)).join("")}
           </div>
         </section>`;
       })
       .join("");
+    restoreAdvancedUiState(uiState);
 
     elements.channelList.querySelectorAll("[data-volume-track]").forEach((input) => {
       input.addEventListener("input", () => {
@@ -1033,6 +1264,135 @@
         void changeMix(button.dataset.muteTrack, { muted: String(button.dataset.muted !== "true") }, "mute");
       });
     });
+    elements.channelList.querySelectorAll("[data-sound-tool]").forEach((control) => {
+      validateSoundToolControl(control);
+      if (control.matches('input[type="range"]')) {
+        control.addEventListener("input", () => {
+          validateSoundToolControl(control);
+          const output = control.nextElementSibling;
+          if (output?.matches("output")) output.value = formatSoundValue(control.value, control.dataset.unit);
+        });
+      }
+      control.addEventListener("change", () => {
+        validateSoundToolControl(control);
+        void changeSoundTool(control, control.value);
+      });
+    });
+    elements.channelList.querySelectorAll("[data-sound-value]").forEach((button) => {
+      button.addEventListener("click", () => {
+        void changeSoundTool(button, button.dataset.soundValue);
+      });
+    });
+  }
+
+  function captureAdvancedUiState() {
+    const clips = new Map();
+    for (const editor of elements.channelList.querySelectorAll("[data-clip-key]")) {
+      const events = editor.querySelector(".clip-event-list");
+      clips.set(editor.dataset.clipKey, {
+        open: editor.open,
+        scrollTop: events?.scrollTop ?? 0,
+        scrollLeft: events?.scrollLeft ?? 0,
+      });
+    }
+    return { drawerScrollTop: elements.advancedDrawer.scrollTop, clips };
+  }
+
+  function restoreAdvancedUiState(uiState) {
+    elements.advancedDrawer.scrollTop = uiState.drawerScrollTop;
+    for (const editor of elements.channelList.querySelectorAll("[data-clip-key]")) {
+      const clipState = uiState.clips.get(editor.dataset.clipKey);
+      if (!clipState) continue;
+      editor.open = clipState.open;
+      const events = editor.querySelector(".clip-event-list");
+      if (!events) continue;
+      events.scrollTop = clipState.scrollTop;
+      events.scrollLeft = clipState.scrollLeft;
+    }
+  }
+
+  function soundRange(track, tool, toolId, ownerName, parameter, value, minimum, maximum, unit, clipId = "") {
+    const key = `${track.id}-${tool}-${toolId}-${parameter}`;
+    const clipAttribute = clipId === "" ? "" : ` data-clip-id="${clipId}"`;
+    const owner = tool === "instrument" ? "instrument" : `${ownerName} ${tool}`;
+    const accessibleName = `${track.name} ${owner} #${toolId} ${parameter}`;
+    return `<label class="tool-control">${escapeHtml(parameter)}
+      <span class="range-with-output"><input type="range" min="${minimum}" max="${maximum}" step="any" value="${value}" data-sound-tool="${tool}" data-track-id="${track.id}" data-tool-id="${toolId}" data-parameter="${parameter}" data-unit="${unit}" data-control-key="${key}"${clipAttribute} aria-label="${escapeHtml(accessibleName)}"><output>${formatSoundValue(value, unit)}</output></span>
+    </label>`;
+  }
+
+  function soundToggle(track, tool, toolId, name, enabled) {
+    const action = enabled ? "Disable" : "Enable";
+    const accessibleName = `${action} ${track.name} ${name} ${tool} #${toolId}`;
+    return `<button type="button" aria-label="${escapeHtml(accessibleName)}" aria-pressed="${String(enabled)}" data-sound-tool="${tool}" data-track-id="${track.id}" data-tool-id="${toolId}" data-parameter="enabled" data-sound-value="${String(!enabled)}" data-control-key="${track.id}-${tool}-${toolId}-enabled">${enabled ? "On" : "Off"}</button>`;
+  }
+
+  function renderEffect(track, effect, index, effectCount) {
+    return `<div class="effect-card ${effect.enabled ? "" : "is-disabled"}">
+      <div class="effect-card-heading"><span class="effect-pill"><strong>${escapeHtml(effect.name)}</strong> <b>${formatSoundValue(effect.parameters.mix, "%")}</b></span><code>#${effect.id}</code></div>
+      ${soundRange(track, "effect", effect.id, effect.name, "mix", effect.parameters.mix, 0, 1, "%")}
+      <div class="tool-actions">
+        ${soundToggle(track, "effect", effect.id, effect.name, effect.enabled)}
+        <button type="button" aria-label="${escapeHtml(`Move ${track.name} ${effect.name} effect #${effect.id} earlier`)}" ${index === 0 ? "disabled" : ""} data-sound-tool="routing" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="position" data-sound-value="${Math.max(0, index - 1)}" data-control-key="${track.id}-routing-${effect.id}-up">↑</button>
+        <button type="button" aria-label="${escapeHtml(`Move ${track.name} ${effect.name} effect #${effect.id} later`)}" ${index === effectCount - 1 ? "disabled" : ""} data-sound-tool="routing" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="position" data-sound-value="${Math.min(effectCount - 1, index + 1)}" data-control-key="${track.id}-routing-${effect.id}-down">↓</button>
+      </div>
+    </div>`;
+  }
+
+  function renderModulator(track, modulator) {
+    const targets = track.modulationTargets.map((target) => [target.id, target.label]);
+    return `<div class="modulator-card ${modulator.enabled ? "" : "is-disabled"}">
+      <div class="effect-card-heading"><strong>${escapeHtml(modulator.name)}</strong><code>#${modulator.id}</code></div>
+      <div class="tool-controls">
+        <label class="tool-control">Shape
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="shape" data-control-key="${track.id}-modulator-${modulator.id}-shape" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} shape`)}">${selectOptions(["sine", "triangle", "square", "random", "envelope"], modulator.shape)}</select>
+        </label>
+        <label class="tool-control">Target
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="target" data-control-key="${track.id}-modulator-${modulator.id}-target" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} target`)}">${targets.map(([value, label]) => `<option value="${value}" ${value === modulator.target ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select>
+        </label>
+        ${soundRange(track, "modulator", modulator.id, modulator.name, "rate", modulator.parameters.rate, 0.01, 20, "Hz")}
+        ${soundRange(track, "modulator", modulator.id, modulator.name, "depth", modulator.parameters.depth, 0, 1, "%")}
+      </div>
+      <div class="tool-actions">${soundToggle(track, "modulator", modulator.id, modulator.name, modulator.enabled)}</div>
+    </div>`;
+  }
+
+  function renderClipEvents(track, clip) {
+    const rows = clip.events
+      .map((event) => {
+        const key = `${track.id}-clip-${clip.id}-event-${event.id}`;
+        const accessibleName = `${track.name} ${clip.label} clip #${clip.id} ${event.type} event #${event.id}`;
+        return `<div class="clip-event" data-event-id="${event.id}">
+          <strong>${escapeHtml(event.type)}</strong>
+          <label>Beat<input type="number" min="0" max="${clip.loopBeats}" step="any" value="${event.time}" data-maximum-exclusive="${clip.loopBeats}" data-sound-tool="event" data-track-id="${track.id}" data-tool-id="${event.id}" data-clip-id="${clip.id}" data-parameter="time" data-control-key="${key}-time" aria-label="${escapeHtml(`${accessibleName} beat`)}"></label>
+          <label>Length<input type="number" min="0.0625" max="${clip.loopBeats}" step="any" value="${event.duration}" data-sound-tool="event" data-track-id="${track.id}" data-tool-id="${event.id}" data-clip-id="${clip.id}" data-parameter="duration" data-control-key="${key}-duration" aria-label="${escapeHtml(`${accessibleName} length`)}"></label>
+          <label>Pitch<input type="number" min="0" max="127" step="1" value="${event.pitch}" data-sound-tool="event" data-track-id="${track.id}" data-tool-id="${event.id}" data-clip-id="${clip.id}" data-parameter="pitch" data-control-key="${key}-pitch" aria-label="${escapeHtml(`${accessibleName} pitch`)}"></label>
+          <label>Velocity<input type="number" min="0.01" max="1" step="any" value="${event.velocity}" data-sound-tool="event" data-track-id="${track.id}" data-tool-id="${event.id}" data-clip-id="${clip.id}" data-parameter="velocity" data-control-key="${key}-velocity" aria-label="${escapeHtml(`${accessibleName} velocity`)}"></label>
+        </div>`;
+      })
+      .join("");
+    return `<details class="clip-editor" data-clip-key="${track.id}-${clip.id}" open><summary><span>${escapeHtml(clip.label)}</span><b>${clip.events.length} events · ${clip.loopBeats} beat loop</b></summary><div class="clip-event-list">${rows}</div></details>`;
+  }
+
+  function selectOptions(values, selected) {
+    return values
+      .map((value) => `<option value="${value}" ${value === selected ? "selected" : ""}>${escapeHtml(value)}</option>`)
+      .join("");
+  }
+
+  function formatSoundValue(value, unit) {
+    const number = Number(value);
+    if (unit === "%") return `${Number((number * 100).toFixed(4))}%`;
+    if (unit === "Hz") return `${Number(number.toFixed(6))} Hz`;
+    if (unit === "s") return `${Number(number.toFixed(6))} s`;
+    return String(value);
+  }
+
+  function validateSoundToolControl(control) {
+    const maximum = Number(control.dataset.maximumExclusive);
+    if (!Number.isFinite(maximum)) return;
+    const valid = Number.isFinite(control.valueAsNumber) && control.valueAsNumber < maximum;
+    control.setCustomValidity(valid ? "" : `Enter a value below ${maximum}`);
   }
 
   function regionalEffectsForTrack(track) {
@@ -1087,6 +1447,77 @@
 
   function changeMix(trackId, values, focusControl) {
     return enqueueProjectMutation(() => applyMixChange(trackId, values, focusControl));
+  }
+
+  function changeSoundTool(control, value) {
+    const request = {
+      track_id: control.dataset.trackId,
+      tool: control.dataset.soundTool,
+      tool_id: control.dataset.toolId,
+      parameter: control.dataset.parameter,
+      value: String(value),
+    };
+    if (control.dataset.clipId) request.clip_id = control.dataset.clipId;
+    if (!control.checkValidity()) {
+      renderProject();
+      restoreSoundToolFocus(request, control.dataset.controlKey);
+      showToast("Enter a value within the supported range", true);
+      return Promise.resolve();
+    }
+    return enqueueProjectMutation(() => applySoundToolChange(request, control.dataset.controlKey));
+  }
+
+  function restoreSoundToolFocus(request, focusKey) {
+    const controls = [...elements.channelList.querySelectorAll("[data-control-key]")];
+    const exactControl = controls.find((candidate) => candidate.dataset.controlKey === focusKey);
+    const sameToolControls = controls.filter(
+      (candidate) =>
+        candidate.dataset.trackId === request.track_id &&
+        candidate.dataset.toolId === request.tool_id &&
+        !candidate.disabled,
+    );
+    const fallbackControl =
+      sameToolControls.find((candidate) => candidate.dataset.soundTool === request.tool) ?? sameToolControls[0];
+    const focusControl = exactControl && !exactControl.disabled ? exactControl : fallbackControl;
+    if (!focusControl) return;
+    focusControl.focus({ preventScroll: true });
+    revealEventControl(focusControl);
+  }
+
+  function revealEventControl(control) {
+    const eventList = control.closest(".clip-event-list");
+    if (!eventList) return;
+    const listRect = eventList.getBoundingClientRect();
+    const controlRect = control.getBoundingClientRect();
+    if (controlRect.top < listRect.top) {
+      eventList.scrollTop -= listRect.top - controlRect.top;
+    } else if (controlRect.bottom > listRect.bottom) {
+      eventList.scrollTop += controlRect.bottom - listRect.bottom;
+    }
+    if (controlRect.left < listRect.left) {
+      eventList.scrollLeft -= listRect.left - controlRect.left;
+    } else if (controlRect.right > listRect.right) {
+      eventList.scrollLeft += controlRect.right - listRect.right;
+    }
+  }
+
+  async function applySoundToolChange(request, focusKey) {
+    try {
+      await replaceProject(async () => {
+        state.project = await api("/api/sound-tools", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams(request),
+        });
+        renderProject();
+        restoreSoundToolFocus(request, focusKey);
+      });
+      showToast("Sound tool updated");
+    } catch (error) {
+      renderProject();
+      restoreSoundToolFocus(request, focusKey);
+      showToast(error.message, true);
+    }
   }
 
   async function applyMixChange(trackId, values, focusControl) {
@@ -1294,8 +1725,10 @@
     elements.advancedDrawer.setAttribute("aria-hidden", "false");
     elements.advancedButton.setAttribute("aria-expanded", "true");
     document.body.style.overflow = "hidden";
-    window.requestAnimationFrame(() => elements.advancedDrawer.classList.add("is-open"));
-    window.setTimeout(() => elements.closeAdvanced.focus(), 30);
+    window.requestAnimationFrame(() => {
+      elements.advancedDrawer.classList.add("is-open");
+      elements.closeAdvanced.focus();
+    });
   }
 
   function closeAdvanced() {
@@ -1313,8 +1746,8 @@
 
   function trapAdvancedFocus(event) {
     if (event.key !== "Tab") return;
-    const focusable = [...elements.advancedDrawer.querySelectorAll("button, input, [href], [tabindex]")].filter(
-      (element) => !element.disabled && element.tabIndex >= 0,
+    const focusable = [...elements.advancedDrawer.querySelectorAll("button, input, select, summary, [href], [tabindex]")].filter(
+      isActuallyTabbable,
     );
     if (focusable.length === 0) return;
     const first = focusable[0];
@@ -1327,6 +1760,14 @@
       event.preventDefault();
       first.focus();
     }
+  }
+
+  function isActuallyTabbable(element) {
+    if (element.disabled || element.tabIndex < 0 || element.closest("[inert]")) return false;
+    const closedDisclosure = element.closest("details:not([open])");
+    if (closedDisclosure && element !== closedDisclosure.querySelector("summary")) return false;
+    const style = window.getComputedStyle(element);
+    return style.display !== "none" && style.visibility !== "hidden" && element.getClientRects().length > 0;
   }
 
   function showToast(message, isError = false) {
@@ -1403,7 +1844,10 @@
       if (event.key === "Escape") closeAdvanced();
       trapAdvancedFocus(event);
     }
-    if (event.code === "Space" && !event.target.matches("textarea, input, button")) {
+    const nativeSpaceSelector = "textarea, input, button, select, summary, a[href], [contenteditable='true']";
+    const nativeSpaceControl =
+      event.target.closest?.(nativeSpaceSelector) ?? document.activeElement?.closest?.(nativeSpaceSelector);
+    if (event.code === "Space" && !nativeSpaceControl) {
       event.preventDefault();
       void audio.toggle();
     }

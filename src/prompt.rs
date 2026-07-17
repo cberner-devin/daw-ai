@@ -18,6 +18,24 @@ pub enum Action {
     AddTrack {
         role: TrackRole,
     },
+    Instrument {
+        waveform: &'static str,
+        target: TrackRole,
+    },
+    Modulator {
+        parameter: String,
+        depth: f32,
+        target: TrackRole,
+    },
+    Configure {
+        track_id: u64,
+        target: TrackRole,
+        tool: &'static str,
+        tool_id: u64,
+        clip_id: Option<u64>,
+        parameter: &'static str,
+        value: String,
+    },
     Effect {
         name: &'static str,
         mix: f32,
@@ -67,12 +85,60 @@ impl PromptEngine {
                 "remove", "without", "take out", "take off", "turn off", "disable",
             ],
         );
+        let wants_addition = contains_any(&normalized, &["add", "insert", "bring in"]);
 
         if contains_any(&normalized, &["drop"]) {
             return EditPlan {
                 action: Action::Drop { build: 0.4 },
                 summary: "Built a high-energy drop with a lead, denser drums, and bass movement"
                     .to_owned(),
+            };
+        }
+
+        if contains_any(
+            &normalized,
+            &["lfo", "modulator", "modulation", "vibrato", "tremolo"],
+        ) {
+            if let Some(target) = target {
+                let parameter = if contains_any(&normalized, &["pitch", "vibrato"]) {
+                    "instrument.pitch"
+                } else if contains_any(&normalized, &["volume", "level", "tremolo"]) {
+                    "track.volume"
+                } else {
+                    "instrument.tone"
+                };
+                return EditPlan {
+                    action: Action::Modulator {
+                        parameter: parameter.to_owned(),
+                        depth: 0.2,
+                        target,
+                    },
+                    summary: format!("Added moving modulation to the {}", target.display_name()),
+                };
+            }
+        }
+
+        if let (Some(waveform), Some(target)) = (waveform_name(&normalized), target) {
+            if wants_addition {
+                return EditPlan {
+                    action: Action::Compound {
+                        actions: vec![
+                            Action::AddTrack { role: target },
+                            Action::Instrument { waveform, target },
+                        ],
+                    },
+                    summary: format!(
+                        "Added a new {} part with a {waveform} waveform",
+                        target.display_name()
+                    ),
+                };
+            }
+            return EditPlan {
+                action: Action::Instrument { waveform, target },
+                summary: format!(
+                    "Changed the {} instrument to a {waveform} waveform",
+                    target.display_name()
+                ),
             };
         }
 
@@ -240,7 +306,7 @@ impl PromptEngine {
             };
         }
 
-        if contains_any(&normalized, &["add", "insert", "bring in"]) {
+        if wants_addition {
             if let Some(role) = target {
                 return EditPlan {
                     action: Action::AddTrack { role },
@@ -337,6 +403,20 @@ fn removable_effect_names(prompt: &str) -> Vec<&'static str> {
         names.push("Shimmer");
     }
     names
+}
+
+fn waveform_name(prompt: &str) -> Option<&'static str> {
+    if contains_any(prompt, &["saw", "sawtooth"]) {
+        Some("sawtooth")
+    } else if contains_any(prompt, &["square", "pulse wave"]) {
+        Some("square")
+    } else if contains_any(prompt, &["triangle wave", "triangle waveform"]) {
+        Some("triangle")
+    } else if contains_any(prompt, &["sine", "sine wave"]) {
+        Some("sine")
+    } else {
+        None
+    }
 }
 
 fn creative_fallback(prompt: &str, target: Option<TrackRole>) -> EditPlan {
@@ -520,6 +600,20 @@ mod tests {
                 target: Some(TrackRole::Drums),
             }
         );
+        assert_eq!(
+            PromptEngine::interpret("add a sawtooth lead", 112).action,
+            Action::Compound {
+                actions: vec![
+                    Action::AddTrack {
+                        role: TrackRole::Lead,
+                    },
+                    Action::Instrument {
+                        waveform: "sawtooth",
+                        target: TrackRole::Lead,
+                    },
+                ],
+            }
+        );
     }
 
     #[test]
@@ -536,6 +630,33 @@ mod tests {
             Action::Gain {
                 amount: 1.28,
                 target: None,
+            }
+        );
+    }
+
+    #[test]
+    fn understands_instrument_and_modulator_requests() {
+        assert_eq!(
+            PromptEngine::interpret("use a sawtooth waveform for the bass", 112).action,
+            Action::Instrument {
+                waveform: "sawtooth",
+                target: TrackRole::Bass,
+            }
+        );
+        assert_eq!(
+            PromptEngine::interpret("add vibrato modulation to the lead", 112).action,
+            Action::Modulator {
+                parameter: "instrument.pitch".to_owned(),
+                depth: 0.2,
+                target: TrackRole::Lead,
+            }
+        );
+        assert_eq!(
+            PromptEngine::interpret("add a sawtooth LFO to the bass", 112).action,
+            Action::Modulator {
+                parameter: "instrument.tone".to_owned(),
+                depth: 0.2,
+                target: TrackRole::Bass,
             }
         );
     }

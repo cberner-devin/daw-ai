@@ -15,7 +15,7 @@
         "properties": {
           "kind": {
             "type": "string",
-            "enum": ["gain", "mute", "drop", "add-track", "effect", "remove-effect", "filter", "rhythm", "tempo"]
+            "enum": ["gain", "mute", "drop", "add-track", "instrument", "modulator", "configure", "effect", "remove-effect", "filter", "rhythm", "tempo"]
           },
           "target": {
             "type": "string",
@@ -23,13 +23,44 @@
           },
           "name": {
             "type": "string",
-            "enum": ["None", "Reverb", "Room", "Echo", "Chorus", "Low-pass filter", "Punch compressor", "Shimmer", "Effects"]
+            "anyOf": [
+              {
+                "enum": ["None", "sine", "triangle", "sawtooth", "square", "instrument.attack", "instrument.release", "instrument.tone", "instrument.pitch", "track.volume", "Reverb", "Room", "Echo", "Chorus", "Low-pass filter", "Punch compressor", "Shimmer", "Effects"]
+              },
+              {
+                "pattern": "^effect:[1-9][0-9]*\\.mix$"
+              }
+            ]
           },
           "value": {
             "type": "number"
+          },
+          "trackId": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "tool": {
+            "type": "string",
+            "enum": ["None", "instrument", "effect", "modulator", "event", "routing"]
+          },
+          "toolId": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "clipId": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "parameter": {
+            "type": "string",
+            "enum": ["None", "waveform", "attack", "release", "tone", "mix", "enabled", "shape", "rate", "depth", "target", "time", "duration", "pitch", "velocity", "position"]
+          },
+          "setting": {
+            "type": "string",
+            "maxLength": 64
           }
         },
-        "required": ["kind", "target", "name", "value"],
+        "required": ["kind", "target", "name", "value", "trackId", "tool", "toolId", "clipId", "parameter", "setting"],
         "additionalProperties": false
       }
     }
