@@ -46,6 +46,8 @@
     drawerHideTimer: null,
   };
 
+  let mixChangeQueue = Promise.resolve();
+
   class AudioEngine {
     constructor() {
       this.context = null;
@@ -916,23 +918,38 @@
     }
   }
 
-  async function changeMix(trackId, values, focusControl) {
+  async function preservePlayback(operation) {
     const resumePlayback = audio.isActive;
     audio.stop(true);
     try {
-      state.project = await api("/api/mix", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ track_id: trackId, ...values }),
-      });
-      renderProject();
-      const selector =
-        focusControl === "volume" ? `[data-volume-track="${trackId}"]` : `[data-mute-track="${trackId}"]`;
-      elements.channelList.querySelector(selector)?.focus({ preventScroll: true });
-    } catch (error) {
-      showToast(error.message, true);
+      return await operation();
     } finally {
       if (resumePlayback && !audio.isActive) await audio.start();
+    }
+  }
+
+  function changeMix(trackId, values, focusControl) {
+    const applyChange = () => applyMixChange(trackId, values, focusControl);
+    const queuedChange = mixChangeQueue.then(applyChange, applyChange);
+    mixChangeQueue = queuedChange.catch(() => {});
+    return queuedChange;
+  }
+
+  async function applyMixChange(trackId, values, focusControl) {
+    try {
+      await preservePlayback(async () => {
+        state.project = await api("/api/mix", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ track_id: trackId, ...values }),
+        });
+        renderProject();
+        const selector =
+          focusControl === "volume" ? `[data-volume-track="${trackId}"]` : `[data-mute-track="${trackId}"]`;
+        elements.channelList.querySelector(selector)?.focus({ preventScroll: true });
+      });
+    } catch (error) {
+      showToast(error.message, true);
     }
   }
 
@@ -1040,19 +1057,21 @@
     elements.composeButton.querySelector("span").textContent = "Codex is planning...";
     elements.savedState.textContent = "Waiting for Codex";
     try {
-      audio.stop(true);
-      const result = await api("/api/edits", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          prompt,
-          start: String(state.selectionStart),
-          end: String(state.selectionEnd),
-        }),
+      const result = await preservePlayback(async () => {
+        const response = await api("/api/edits", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            prompt,
+            start: String(state.selectionStart),
+            end: String(state.selectionEnd),
+          }),
+        });
+        state.project = response.project;
+        elements.promptInput.value = "";
+        renderProject();
+        return response;
       });
-      state.project = result.project;
-      elements.promptInput.value = "";
-      renderProject();
       showToast(result.message);
     } catch (error) {
       showToast(error.message, true);

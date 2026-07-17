@@ -307,11 +307,19 @@ async function run() {
       async () => fetch(`http://127.0.0.1:${appPort}/api/health`).then((response) => response.ok),
       "Rust server",
     );
-    const browserWebSocket = await waitFor(async () => {
-      const response = await fetch(`http://127.0.0.1:${debugPort}/json/version`);
-      if (!response.ok) return false;
-      return (await response.json()).webSocketDebuggerUrl;
-    }, "Chrome DevTools endpoint");
+    const browserWebSocket = await waitFor(
+      async () => {
+        const response = await fetch(`http://127.0.0.1:${debugPort}/json/version`);
+        if (!response.ok) return false;
+        return (await response.json()).webSocketDebuggerUrl;
+      },
+      "Chrome DevTools endpoint",
+      30_000,
+    ).catch((error) => {
+      const details = chromeErrors.trim();
+      if (!details) throw error;
+      throw new Error(`${error.message}\nChrome stderr:\n${details}`);
+    });
     cdp = await CdpClient.connect(browserWebSocket);
     const appUrl = `http://127.0.0.1:${appPort}`;
     const appSession = await openPage(cdp, appUrl);
@@ -448,6 +456,25 @@ async function run() {
     await mouse(cdp, appSession, "mouseMoved", lane.left + lane.width * 0.5, lane.y, 1);
     await mouse(cdp, appSession, "mouseReleased", lane.left + lane.width * 0.5, lane.y);
 
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#play-button').classList.contains('is-playing')"),
+      "playback before prompted edit",
+    );
+    const initialPromptPlaybackTime = await evaluate(
+      cdp,
+      appSession,
+      "document.querySelector('#current-time').textContent",
+    );
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `document.querySelector('#current-time').textContent !== ${JSON.stringify(initialPromptPlaybackTime)}`,
+        ),
+      "transport movement before prompted edit",
+    );
     const promptSingleFlight = await evaluate(cdp, appSession, `(() => {
       const originalFetch = window.fetch;
       const deferred = [];
@@ -474,11 +501,12 @@ async function run() {
       return {
         requests: window.__promptRequestCount,
         submitDisabled: document.querySelector('#compose-button').disabled,
+        transportActive: document.querySelector('#play-button').classList.contains('is-playing'),
       };
     })()`);
     assert.deepEqual(
       promptSingleFlight,
-      { requests: 1, submitDisabled: true },
+      { requests: 1, submitDisabled: true, transportActive: false },
       "prompt shortcuts must share one in-flight edit request",
     );
     await evaluate(cdp, appSession, "window.__releasePromptRequests()");
@@ -490,6 +518,21 @@ async function run() {
       await evaluate(cdp, appSession, "document.querySelector('#compose-button').disabled"),
       false,
       "prompt submission must release its lock after completion",
+    );
+    const promptedEditResumeTime = await evaluate(
+      cdp,
+      appSession,
+      "document.querySelector('#current-time').textContent",
+    );
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `document.querySelector('#play-button').classList.contains('is-playing') &&
+            document.querySelector('#current-time').textContent !== ${JSON.stringify(promptedEditResumeTime)}`,
+        ),
+      "playback restoration after prompted edit",
     );
     await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
     await waitFor(
@@ -576,17 +619,76 @@ async function run() {
       "transport movement before mixer change",
     );
     const playbackTimeBeforeMix = await evaluate(cdp, appSession, "document.querySelector('#current-time').textContent");
-    const originalVersion = compoundProject.version + 1;
+    const projectBeforeMix = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const originalFetch = window.fetch;
+      const deferred = [];
+      window.__mixRequestCount = 0;
+      window.fetch = function fetch(resource, options) {
+        if (resource !== '/api/mix') return originalFetch(resource, options);
+        window.__mixRequestCount += 1;
+        return new Promise((resolve, reject) => deferred.push({ resource, options, resolve, reject }));
+      };
+      window.__releaseNextMixRequest = () => {
+        const request = deferred.shift();
+        if (!request) return false;
+        originalFetch(request.resource, request.options).then(request.resolve, request.reject);
+        return true;
+      };
+      window.__restoreFetchAfterMix = () => {
+        window.fetch = originalFetch;
+      };
+    })()`);
     await evaluate(cdp, appSession, "document.querySelector('[data-volume-track]').focus()");
     await pressKey(cdp, appSession, "ArrowRight", "ArrowRight", 39);
+    await evaluate(cdp, appSession, `(() => {
+      const input = document.querySelector('[data-volume-track="2"]');
+      input.value = String(Number(input.value) + 0.01);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(
+      async () => evaluate(cdp, appSession, "window.__mixRequestCount === 1"),
+      "first serialized mixer request",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "window.__mixRequestCount"),
+      1,
+      "a second mixer change must wait for the first response",
+    );
+    await evaluate(cdp, appSession, "window.__releaseNextMixRequest()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "window.__mixRequestCount === 2"),
+      "second serialized mixer request",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      window.__restoreFetchAfterMix();
+      window.__releaseNextMixRequest();
+    })()`);
     await waitFor(async () => {
       const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-      return project.version > originalVersion && Math.abs(project.tracks[0].volume - 0.83) < 0.001;
-    }, "mixer change");
+      return (
+        project.version >= projectBeforeMix.version + 2 &&
+        Math.abs(project.tracks[0].volume - 0.83) < 0.001 &&
+        Math.abs(project.tracks[1].volume - 0.75) < 0.001
+      );
+    }, "serialized mixer changes");
     assert.equal(
       await evaluate(cdp, appSession, "document.activeElement.dataset.volumeTrack"),
-      "1",
-      "mixer updates must restore focus to the adjusted control",
+      "2",
+      "serialized mixer updates must restore focus to the latest adjusted control",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `({
+        first: document.querySelector('[data-volume-track="1"]').value,
+        second: document.querySelector('[data-volume-track="2"]').value,
+      })`),
+      { first: "0.83", second: "0.75" },
+      "the final mixer render must include every queued update",
     );
     await waitFor(
       async () =>
