@@ -1,0 +1,39 @@
+{
+  "type": "object",
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["gain", "mute", "drop", "add-track", "effect", "remove-effect", "filter", "rhythm", "tempo"]
+          },
+          "target": {
+            "type": "string",
+            "enum": ["all", "drums", "bass", "chords", "lead", "texture"]
+          },
+          "name": {
+            "type": "string",
+            "enum": ["None", "Reverb", "Room", "Echo", "Chorus", "Low-pass filter", "Punch compressor", "Shimmer", "Effects"]
+          },
+          "value": {
+            "type": "number"
+          }
+        },
+        "required": ["kind", "target", "name", "value"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["summary", "actions"],
+  "additionalProperties": false
+}

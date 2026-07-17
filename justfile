@@ -1,23 +1,22 @@
-run port="8000": pre
-  uv run python ./manage.py migrate --settings daw_ai.settings.dev
-  uv run python ./manage.py runserver 127.0.0.1:{{port}} --settings daw_ai.settings.dev
+run port="8888":
+  cargo run -- --port {{port}}
 
-pre: sync
-  uv run ruff check .
-  uv run mypy .
+pre:
+  cargo fmt --check
+  cargo clippy --all-targets --all-features -- -D warnings
+  node --check web/app.js
+  node --check qa/browser.test.js
 
 test: pre
-  uv run python -Wa ./manage.py test --settings daw_ai.settings.dev
+  cargo test --all-targets --all-features
+  cargo build
+  node qa/browser.test.js
 
-coverage: pre
-  uv run coverage run ./manage.py test --settings daw_ai.settings.dev
-  uv run coverage report
-  uv run coverage xml
-  uv run coverage html
+qa-browser-setup:
+  node qa/browser.test.js --check-browser
+
+msrv-test:
+  cargo +1.85.1 test --all-targets --all-features
 
 format:
-  uv run ruff format .
-  uv run ruff check --select I --fix
-
-sync:
-  uv sync --all-groups
+  cargo fmt
