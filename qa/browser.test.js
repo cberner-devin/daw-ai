@@ -351,6 +351,35 @@ async function run() {
       appSession,
     );
     await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 1 }, appSession);
+    await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+      "mobile advanced drawer",
+    );
+    const mobileAdvancedBounds = await evaluate(cdp, appSession, `(() => {
+      const drawer = document.querySelector('#advanced-drawer');
+      const drawerRect = drawer.getBoundingClientRect();
+      const controls = [...drawer.querySelectorAll('.range-with-output, .clip-event')];
+      return {
+        bodyWidth: document.body.scrollWidth,
+        viewportWidth: document.documentElement.clientWidth,
+        drawerClientWidth: drawer.clientWidth,
+        drawerScrollWidth: drawer.scrollWidth,
+        drawerRight: drawerRect.right,
+        widestControlRight: Math.max(...controls.map((control) => control.getBoundingClientRect().right)),
+      };
+    })()`);
+    assert.ok(
+      mobileAdvancedBounds.bodyWidth <= mobileAdvancedBounds.viewportWidth &&
+        mobileAdvancedBounds.drawerScrollWidth <= mobileAdvancedBounds.drawerClientWidth &&
+        mobileAdvancedBounds.widestControlRight <= mobileAdvancedBounds.drawerRight,
+      `Advanced controls must fit a 390px viewport (${JSON.stringify(mobileAdvancedBounds)})`,
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').hidden"),
+      "mobile advanced drawer close",
+    );
     await evaluate(cdp, appSession, "document.querySelector('#timeline-scroll').scrollLeft = 0");
     const mobileLane = await evaluate(cdp, appSession, `(() => {
       const rect = document.querySelector('.track-lane').getBoundingClientRect();
@@ -409,6 +438,42 @@ async function run() {
       "mobile selection mode must return gesture ownership to panning",
     );
     await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: false }, appSession);
+    await cdp.send(
+      "Emulation.setDeviceMetricsOverride",
+      { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false },
+      appSession,
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+      "desktop advanced drawer",
+    );
+    const desktopAdvancedBounds = await evaluate(cdp, appSession, `(() => {
+      const drawer = document.querySelector('#advanced-drawer');
+      const channels = drawer.querySelector('.channel-list');
+      const eventLists = [...drawer.querySelectorAll('.clip-event-list')];
+      return {
+        drawerClientWidth: drawer.clientWidth,
+        drawerScrollWidth: drawer.scrollWidth,
+        channelsClientWidth: channels.clientWidth,
+        channelsScrollWidth: channels.scrollWidth,
+        widestEventOverflow: Math.max(
+          0,
+          ...eventLists.map((list) => list.scrollWidth - list.clientWidth),
+        ),
+      };
+    })()`);
+    assert.ok(
+      desktopAdvancedBounds.drawerScrollWidth <= desktopAdvancedBounds.drawerClientWidth &&
+        desktopAdvancedBounds.channelsScrollWidth <= desktopAdvancedBounds.channelsClientWidth &&
+        desktopAdvancedBounds.widestEventOverflow <= 0,
+      `Advanced controls must not overflow at 1440x900 (${JSON.stringify(desktopAdvancedBounds)})`,
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').hidden"),
+      "desktop advanced drawer close",
+    );
     await cdp.send(
       "Emulation.setDeviceMetricsOverride",
       { width: 1600, height: 1000, deviceScaleFactor: 1, mobile: false },
@@ -674,6 +739,430 @@ async function run() {
       "close-advanced",
       "focus must wrap within the modal drawer",
     );
+    const summarySpace = await evaluate(cdp, appSession, `(() => {
+      const finalClip = [...document.querySelectorAll('.clip-editor')].at(-1);
+      finalClip.open = true;
+      const summary = finalClip.querySelector('summary');
+      summary.focus();
+      const allowed = summary.dispatchEvent(
+        new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true, cancelable: true }),
+      );
+      return {
+        allowed,
+        focused: document.activeElement === summary,
+        playing: document.querySelector('#play-button').classList.contains('is-playing'),
+      };
+    })()`);
+    assert.deepEqual(
+      summarySpace,
+      { allowed: true, focused: true, playing: false },
+      `Space on a clip summary must remain native and transport-neutral (${JSON.stringify(summarySpace)})`,
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(() => {
+        const select = document.querySelector('[data-sound-tool="instrument"][data-parameter="waveform"]');
+        select.focus();
+        const allowed = select.dispatchEvent(
+          new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true, cancelable: true }),
+        );
+        return {
+          allowed,
+          playing: document.querySelector('#play-button').classList.contains('is-playing'),
+        };
+      })()`),
+      { allowed: true, playing: false },
+      "Space on a select must remain available to the native control",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const finalClip = [...document.querySelectorAll('.clip-editor')].at(-1);
+      finalClip.open = false;
+      finalClip.querySelector('summary').focus();
+    })()`);
+    await pressTab(cdp, appSession);
+    assert.equal(
+      await evaluate(cdp, appSession, "document.activeElement.id"),
+      "close-advanced",
+      "collapsed clip controls must not escape the modal focus order",
+    );
+    await evaluate(cdp, appSession, "[...document.querySelectorAll('.clip-editor')].at(-1).open = true");
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `({
+        instruments: document.querySelectorAll('.instrument-tool').length,
+        effects: document.querySelectorAll('.effects-tool').length,
+        modulators: document.querySelectorAll('.modulator-card').length,
+        routes: document.querySelectorAll('.routing-chain').length,
+        events: document.querySelectorAll('.clip-event').length,
+      })`),
+      { instruments: 3, effects: 3, modulators: 3, routes: 3, events: 22 },
+      "Advanced must expose every sound tool and the demo clip events",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `[
+        ...document.querySelectorAll(
+          '[data-parameter="enabled"]:is([data-sound-tool="effect"], [data-sound-tool="modulator"])',
+        ),
+      ].map((button) => ({ name: button.getAttribute('aria-label'), pressed: button.getAttribute('aria-pressed') }))`),
+      [
+        { name: "Disable Pulse Kit Punch compressor effect #110", pressed: "true" },
+        { name: "Disable Pulse Kit Pulse envelope modulator #150", pressed: "true" },
+        { name: "Disable Soft Current Low-pass filter effect #210", pressed: "true" },
+        { name: "Disable Soft Current Bass movement modulator #250", pressed: "true" },
+        { name: "Disable Glass Chords Chorus effect #310", pressed: "true" },
+        { name: "Disable Glass Chords Room effect #311", pressed: "true" },
+        { name: "Disable Glass Chords Slow bloom modulator #350", pressed: "true" },
+      ],
+      "sound-tool toggles must expose contextual names and pressed state",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(() => {
+        const controls = [...document.querySelectorAll(
+          '[data-sound-tool]:is(input, select, button)',
+        )];
+        const names = controls.map((control) => control.getAttribute('aria-label'));
+        return {
+          allNamed: names.every(Boolean),
+          allUnique: new Set(names).size === names.length,
+          chordMixes: [...document.querySelectorAll(
+            '[data-sound-tool="effect"][data-track-id="3"][data-parameter="mix"]',
+          )].map((control) => control.getAttribute('aria-label')),
+          chordRouting: [...document.querySelectorAll(
+            '[data-sound-tool="routing"][data-track-id="3"]',
+          )].map((control) => control.getAttribute('aria-label')),
+          firstEvent: [...document.querySelectorAll(
+            '[data-sound-tool="event"][data-track-id="1"][data-tool-id="1101"]',
+          )].map((control) => control.getAttribute('aria-label')),
+        };
+      })()`),
+      {
+        allNamed: true,
+        allUnique: true,
+        chordMixes: [
+          "Glass Chords Chorus effect #310 mix",
+          "Glass Chords Room effect #311 mix",
+        ],
+        chordRouting: [
+          "Move Glass Chords Chorus effect #310 earlier",
+          "Move Glass Chords Chorus effect #310 later",
+          "Move Glass Chords Room effect #311 earlier",
+          "Move Glass Chords Room effect #311 later",
+        ],
+        firstEvent: [
+          "Pulse Kit Pocket beat clip #11 kick event #1101 beat",
+          "Pulse Kit Pocket beat clip #11 kick event #1101 length",
+          "Pulse Kit Pocket beat clip #11 kick event #1101 pitch",
+          "Pulse Kit Pocket beat clip #11 kick event #1101 velocity",
+        ],
+      },
+      "every repeated sound-tool control must have a unique contextual name",
+    );
+    await evaluate(
+      cdp,
+      appSession,
+      "document.querySelector('[data-sound-tool=\"effect\"][data-tool-id=\"210\"][data-parameter=\"enabled\"]').click()",
+    );
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return !project.tracks[1].effects[0].enabled;
+    }, "disabled low-pass effect");
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(() => {
+        const button = document.querySelector(
+          '[data-sound-tool="effect"][data-tool-id="210"][data-parameter="enabled"]',
+        );
+        return {
+          name: button.getAttribute('aria-label'),
+          pressed: button.getAttribute('aria-pressed'),
+          text: button.textContent,
+        };
+      })()`),
+      { name: "Enable Soft Current Low-pass filter effect #210", pressed: "false", text: "Off" },
+      "a disabled sound tool must expose its updated action and state",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[1].effects[0].enabled;
+    }, "disabled low-pass effect undo");
+    const projectBeforePreciseTools = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const update = (selector, value) => {
+        const control = document.querySelector(selector);
+        control.value = value;
+        control.dispatchEvent(new Event('change', { bubbles: true }));
+      };
+      update('[data-sound-tool="instrument"][data-track-id="2"][data-parameter="release"]', '0.025');
+      update('[data-sound-tool="effect"][data-track-id="3"][data-tool-id="310"][data-parameter="mix"]', '0.005');
+    })()`);
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.version === projectBeforePreciseTools.version + 2 &&
+        project.tracks[1].instrument.parameters.release === 0.025 &&
+        project.tracks[2].effects[0].parameters.mix === 0.005;
+    }, "precise sound-tool values");
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(() => {
+        const release = document.querySelector(
+          '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="release"]',
+        );
+        const mix = document.querySelector(
+          '[data-sound-tool="effect"][data-track-id="3"][data-tool-id="310"][data-parameter="mix"]',
+        );
+        return {
+          release: { value: release.value, step: release.step, output: release.nextElementSibling.value },
+          mix: {
+            value: mix.value,
+            step: mix.step,
+            output: mix.nextElementSibling.value,
+            heading: mix.closest('.effect-card').querySelector('.effect-pill b').textContent,
+          },
+        };
+      })()`),
+      {
+        release: { value: "0.025", step: "any", output: "0.025 s" },
+        mix: { value: "0.005", step: "any", output: "0.5%", heading: "0.5%" },
+      },
+      "authoritative floats must render without range sanitization or display rounding",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[2].effects[0].parameters.mix === 0.28;
+    }, "precise effect mix undo");
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[1].instrument.parameters.release === 0.18;
+    }, "precise release undo");
+    await evaluate(
+      cdp,
+      appSession,
+      "document.querySelector('[data-sound-tool=\"routing\"][data-track-id=\"3\"][data-tool-id=\"311\"][data-sound-value=\"0\"]').click()",
+    );
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[2].routing.audio[2] === "effect:311";
+    }, "advanced effect reorder");
+    assert.equal(
+      await evaluate(cdp, appSession, "document.activeElement.dataset.controlKey"),
+      "3-routing-311-down",
+      "a reordered endpoint effect must focus its remaining enabled direction",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[2].routing.audio[2] === "effect:310";
+    }, "advanced effect reorder undo");
+    const soundProjectBefore = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const select = document.querySelector('[data-sound-tool="instrument"][data-track-id="2"][data-parameter="waveform"]');
+      select.value = 'sawtooth';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.version === soundProjectBefore.version + 1 && project.tracks[1].instrument.waveform === "sawtooth";
+    }, "advanced instrument update");
+    assert.equal(
+      await evaluate(cdp, appSession, "document.activeElement.dataset.controlKey"),
+      "2-instrument-201-waveform",
+      "sound-tool updates must restore focus to their control",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[1].instrument.waveform === "square";
+    }, "advanced instrument undo");
+    const projectBeforeClipUiMutation = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const drumClip = document.querySelector('[data-clip-key="1-11"]');
+      const bassClip = document.querySelector('[data-clip-key="2-12"]');
+      const eventList = drumClip.querySelector('.clip-event-list');
+      bassClip.open = false;
+      eventList.scrollTop = eventList.scrollHeight;
+      window.__clipScrollBeforeMutation = eventList.scrollTop;
+      const input = document.querySelector(
+        '[data-sound-tool="event"][data-track-id="1"][data-tool-id="1112"][data-parameter="velocity"]',
+      );
+      input.value = '0.41';
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.version === projectBeforeClipUiMutation.version + 1 &&
+        project.tracks[0].clips[0].events.at(-1).velocity === 0.41;
+    }, "scrolled clip event mutation");
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(() => {
+        const drumClip = document.querySelector('[data-clip-key="1-11"]');
+        const eventList = drumClip.querySelector('.clip-event-list');
+        const focused = document.activeElement;
+        const listRect = eventList.getBoundingClientRect();
+        const focusedRect = focused.getBoundingClientRect();
+        return {
+          collapsed: !document.querySelector('[data-clip-key="2-12"]').open,
+          scrollTop: eventList.scrollTop,
+          expectedScrollTop: window.__clipScrollBeforeMutation,
+          focusKey: focused.dataset.controlKey,
+          focusVisible: focusedRect.top >= listRect.top && focusedRect.bottom <= listRect.bottom,
+        };
+      })()`),
+      {
+        collapsed: true,
+        scrollTop: await evaluate(cdp, appSession, "window.__clipScrollBeforeMutation"),
+        expectedScrollTop: await evaluate(cdp, appSession, "window.__clipScrollBeforeMutation"),
+        focusKey: "1-clip-11-event-1112-velocity",
+        focusVisible: true,
+      },
+      "clip disclosure, nested scroll, and focused event state must survive authoritative rerenders",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[0].clips[0].events.at(-1).velocity === 0.42;
+    }, "scrolled clip event undo");
+    await evaluate(cdp, appSession, `(() => {
+      document.querySelector('[data-clip-key="2-12"]').open = true;
+      document.querySelector('[data-clip-key="1-11"] .clip-event-list').scrollTop = 0;
+    })()`);
+    const projectBeforeEventReorder = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const input = document.querySelector(
+        '[data-sound-tool="event"][data-track-id="1"][data-tool-id="1101"][data-parameter="time"]',
+      );
+      input.value = '3.999';
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.version === projectBeforeEventReorder.version + 1 &&
+        project.tracks[0].clips[0].events.at(-1).id === 1101 &&
+        project.tracks[0].clips[0].events.at(-1).time === 3.999;
+    }, "event onset reorder");
+    const reorderedEventFocus = await evaluate(cdp, appSession, `(() => {
+      const eventList = document.querySelector('[data-clip-key="1-11"] .clip-event-list');
+      const focused = document.activeElement;
+      const listRect = eventList.getBoundingClientRect();
+      const focusedRect = focused.getBoundingClientRect();
+      return {
+        key: focused.dataset.controlKey,
+        scrollTop: eventList.scrollTop,
+        visible: focusedRect.top >= listRect.top && focusedRect.bottom <= listRect.bottom,
+        value: focused.value,
+        maximum: focused.max,
+        valid: focused.checkValidity(),
+      };
+    })()`);
+    assert.ok(
+      reorderedEventFocus.key === "1-clip-11-event-1101-time" &&
+        reorderedEventFocus.scrollTop > 0 && reorderedEventFocus.visible &&
+        reorderedEventFocus.value === "3.999" && reorderedEventFocus.maximum === "4" &&
+        reorderedEventFocus.valid,
+      `a reordered event must reveal its restored focus (${JSON.stringify(reorderedEventFocus)})`,
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(() => {
+        const originalFetch = window.fetch;
+        let requests = 0;
+        window.fetch = function fetch(resource, options) {
+          if (resource === '/api/sound-tools') requests += 1;
+          return originalFetch(resource, options);
+        };
+        const input = document.querySelector(
+          '[data-sound-tool="event"][data-track-id="1"][data-tool-id="1101"][data-parameter="time"]',
+        );
+        input.value = '4';
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        window.fetch = originalFetch;
+        const restored = document.querySelector(
+          '[data-sound-tool="event"][data-track-id="1"][data-tool-id="1101"][data-parameter="time"]',
+        );
+        return { requests, value: restored.value, maximum: restored.max, valid: restored.checkValidity() };
+      })()`),
+      { requests: 0, value: "3.999", maximum: "4", valid: true },
+      "the event-time endpoint must be represented but rejected as an exclusive bound",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[0].clips[0].events[0].id === 1101 && project.tracks[0].clips[0].events[0].time === 0;
+    }, "event onset reorder undo");
+    await evaluate(
+      cdp,
+      appSession,
+      "document.querySelector('[data-clip-key=\"1-11\"] .clip-event-list').scrollTop = 0",
+    );
+    const projectBeforeRejectedSoundTool = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(() => {
+        const originalFetch = window.fetch;
+        let requests = 0;
+        window.fetch = function fetch(resource, options) {
+          if (resource === '/api/sound-tools') requests += 1;
+          return originalFetch(resource, options);
+        };
+        const input = document.querySelector('[data-sound-tool="event"][data-track-id="2"][data-tool-id="1201"][data-parameter="pitch"]');
+        input.value = '40.5';
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        window.fetch = originalFetch;
+        const restored = document.querySelector('[data-sound-tool="event"][data-track-id="2"][data-tool-id="1201"][data-parameter="pitch"]');
+        return { requests, value: restored.value, valid: restored.checkValidity() };
+      })()`),
+      { requests: 0, value: "33", valid: true },
+      "fractional MIDI controls must fail client validation without submitting",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const originalFetch = window.fetch;
+      window.fetch = function fetch(resource, options) {
+        if (resource !== '/api/sound-tools') return originalFetch(resource, options);
+        window.fetch = originalFetch;
+        return Promise.resolve(new Response(JSON.stringify({ error: 'Rejected sound-tool regression' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      };
+      const input = document.querySelector('[data-sound-tool="event"][data-track-id="2"][data-tool-id="1201"][data-parameter="pitch"]');
+      input.value = '40';
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `document.querySelector('#toast').textContent === 'Rejected sound-tool regression' &&
+            document.querySelector('[data-sound-tool="event"][data-track-id="2"][data-tool-id="1201"][data-parameter="pitch"]').value === '33'`,
+        ),
+      "authoritative sound-tool value after rejection",
+    );
+    assert.equal(
+      await evaluate(
+        cdp,
+        appSession,
+        "fetch('/api/project').then((response) => response.json()).then((project) => project.version)",
+      ),
+      projectBeforeRejectedSoundTool.version,
+      "rejected sound-tool edits must not change the project",
+    );
 
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await waitFor(
@@ -874,6 +1363,7 @@ async function run() {
       window.__audioCloseCount = 0;
       window.__gainNodes = [];
       window.__oscillators = [];
+      window.__biquadFilters = [];
       window.__delayNodes = [];
       window.__convolverCount = 0;
       window.__reverbBuffers = [];
@@ -884,7 +1374,11 @@ async function run() {
       const originalCreateBufferSource = AudioContext.prototype.createBufferSource;
       const originalGain = AudioContext.prototype.createGain;
       const originalOscillator = AudioContext.prototype.createOscillator;
+      const originalBiquadFilter = AudioContext.prototype.createBiquadFilter;
       const originalOscillatorStart = OscillatorNode.prototype.start;
+      const originalOscillatorStop = OscillatorNode.prototype.stop;
+      const originalSetValueAtTime = AudioParam.prototype.setValueAtTime;
+      const originalExponentialRamp = AudioParam.prototype.exponentialRampToValueAtTime;
       const originalDelay = AudioContext.prototype.createDelay;
       const originalConvolver = AudioContext.prototype.createConvolver;
       const originalSetInterval = window.setInterval.bind(window);
@@ -924,9 +1418,28 @@ async function run() {
         window.__oscillators.push(node);
         return node;
       };
+      AudioContext.prototype.createBiquadFilter = function createBiquadFilter(...arguments_) {
+        const node = originalBiquadFilter.apply(this, arguments_);
+        window.__biquadFilters.push(node);
+        return node;
+      };
+      AudioParam.prototype.setValueAtTime = function setValueAtTime(value, time) {
+        this.dawAiSetValues ||= [];
+        this.dawAiSetValues.push({ value, time });
+        return originalSetValueAtTime.call(this, value, time);
+      };
+      AudioParam.prototype.exponentialRampToValueAtTime = function exponentialRampToValueAtTime(value, time) {
+        this.dawAiExponentialRamps ||= [];
+        this.dawAiExponentialRamps.push({ value, time });
+        return originalExponentialRamp.call(this, value, time);
+      };
       OscillatorNode.prototype.start = function start(when = 0) {
         this.dawAiStartTime = when;
         return originalOscillatorStart.call(this, when);
+      };
+      OscillatorNode.prototype.stop = function stop(when = 0) {
+        this.dawAiStopTime = when;
+        return originalOscillatorStop.call(this, when);
       };
       AudioContext.prototype.createDelay = function createDelay(...arguments_) {
         const node = originalDelay.apply(this, arguments_);
@@ -937,6 +1450,777 @@ async function run() {
         window.__convolverCount += 1;
         return originalConvolver.apply(this, arguments_);
       };
+    })()`);
+
+    await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+      "advanced drawer for exact event timing",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const control = document.querySelector(
+        '[data-sound-tool="effect"][data-track-id="2"][data-tool-id="210"][data-parameter="mix"]',
+      );
+      control.value = '0.01';
+      control.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[1].effects[0].parameters.mix === 0.01;
+    }, "one-percent low-pass mix");
+    await evaluate(cdp, appSession, `(() => {
+      document.querySelector('#close-advanced').click();
+      window.__biquadFilters = [];
+      document.querySelector('#rewind-button').click();
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "window.__biquadFilters.some((node) => node.dawAiAutomation === 'effect-filter' && node.dawAiTrackId === 2 && node.frequency.dawAiSetValues?.length)",
+        ),
+      "one-percent low-pass playback",
+    );
+    assert.ok(
+      await evaluate(cdp, appSession, `(() => {
+        const filter = window.__biquadFilters.find(
+          (node) => node.dawAiAutomation === 'effect-filter' && node.dawAiTrackId === 2,
+        );
+        return filter.frequency.dawAiSetValues.every((entry) => entry.value > 19000 && entry.value < 20000);
+      })()`),
+      "the first low-pass mix step must remain close to the dry cutoff",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[1].effects[0].parameters.mix === 0.46;
+    }, "one-percent low-pass undo");
+    await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () =>
+        evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+      "advanced drawer after low-pass playback",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').hidden"),
+      "advanced drawer before bright filter edit",
+    );
+    await mouse(cdp, appSession, "mousePressed", lane.left, lane.y, 1);
+    await mouse(cdp, appSession, "mouseMoved", lane.left + lane.width * (4 / 32), lane.y, 1);
+    await mouse(cdp, appSession, "mouseReleased", lane.left + lane.width * (4 / 32), lane.y);
+    await submitPrompt(cdp, appSession, "make the bass bright", 1);
+    const brightFilterProject = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    assert.deepEqual(
+      brightFilterProject.edits[0].action,
+      { type: "filter", value: 0.3, target: "bass" },
+      "the brightness regression must exercise a positive filter offset",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      window.__biquadFilters = [];
+      document.querySelector('#rewind-button').click();
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "window.__biquadFilters.some((node) => node.dawAiAutomation === 'tone' && node.dawAiTrackId === 2 && node.frequency.dawAiSetValues?.length > 100)",
+        ),
+      "positive bass filter automation",
+    );
+    const brightFilterDirection = await evaluate(cdp, appSession, `(() => {
+      const valueAt = (entries, time) => entries.reduce((closest, entry) =>
+        Math.abs(entry.time - time) < Math.abs(closest.time - time) ? entry : closest
+      ).value;
+      const tone = window.__biquadFilters.find(
+        (node) => node.dawAiAutomation === 'tone' && node.dawAiTrackId === 2,
+      ).frequency.dawAiSetValues;
+      const effect = window.__biquadFilters.find(
+        (node) => node.dawAiAutomation === 'effect-filter' && node.dawAiTrackId === 2,
+      ).frequency.dawAiSetValues;
+      const start = Math.min(...tone.map((entry) => entry.time));
+      return {
+        brightTone: valueAt(tone, start),
+        neutralTone: valueAt(tone, start + 4),
+        brightEffect: valueAt(effect, start),
+        neutralEffect: valueAt(effect, start + 4),
+      };
+    })()`);
+    assert.ok(
+      brightFilterDirection.brightTone > brightFilterDirection.neutralTone * 1.25 &&
+        Math.abs(brightFilterDirection.brightEffect - brightFilterDirection.neutralEffect) < 0.01,
+      `a positive filter edit must open the authoritative tone stage (${JSON.stringify(brightFilterDirection)})`,
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 0"),
+      "positive bass filter undo",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+      "advanced drawer after positive filter playback",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const update = (parameter, value) => {
+        const input = document.querySelector(
+          '[data-sound-tool="event"][data-track-id="2"][data-tool-id="1201"][data-parameter="' + parameter + '"]',
+        );
+        input.value = value;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      };
+      update('time', '3.9');
+      update('pitch', '80');
+      update('duration', '4');
+      const release = document.querySelector(
+        '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="release"]',
+      );
+      release.value = '5';
+      release.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      const event = project.tracks[1].clips[0].events.find((candidate) => candidate.id === 1201);
+      return event.time === 3.9 && event.pitch === 80 && event.duration === 4 &&
+        project.tracks[1].instrument.parameters.release === 5;
+    }, "exact event timing update");
+    await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
+    await evaluate(cdp, appSession, `(() => {
+      window.__gainNodes = [];
+      window.__oscillators = [];
+      document.querySelector('#rewind-button').click();
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "window.__oscillators.some((node) => node.dawAiTrackId === 2 && node.dawAiEventId === 1201)",
+        ),
+      "exactly timed bass event playback",
+    );
+    const exactEventPlayback = await evaluate(cdp, appSession, `(() => {
+      const oscillator = window.__oscillators.find((node) => node.dawAiTrackId === 2 && node.dawAiEventId === 1201);
+      const beatOne = window.__oscillators.find((node) => node.dawAiTrackId === 2 && node.dawAiEventId === 1202);
+      const envelope = window.__gainNodes.find((node) => node.dawAiVoiceEnvelope && node.dawAiEventId === 1201);
+      const ramps = envelope.gain.dawAiExponentialRamps;
+      const peak = ramps.find((entry) => entry.value > 0.001);
+      const release = ramps[ramps.length - 1];
+      const hold = envelope.gain.dawAiSetValues.find(
+        (entry) => entry.time > peak.time && Math.abs(entry.value - peak.value) < 0.000001,
+      );
+      return {
+        offsetFromBeatOne: oscillator.dawAiStartTime - beatOne.dawAiStartTime,
+        holdAfterAttack: hold.time - peak.time,
+        releaseAfterHold: release.time - hold.time,
+        scheduledDuration: oscillator.dawAiStopTime - oscillator.dawAiStartTime - 0.03,
+      };
+    })()`);
+    const beatDuration = 60 / 112;
+    assert.ok(
+      Math.abs(exactEventPlayback.offsetFromBeatOne - 2.9 * beatDuration) < 0.01,
+      `event beat 3.9 must retain its exact offset from beat 1 (${JSON.stringify(exactEventPlayback)})`,
+    );
+    assert.ok(
+      Math.abs(exactEventPlayback.holdAfterAttack - (4 * beatDuration - 0.008)) < 0.01 &&
+        Math.abs(exactEventPlayback.releaseAfterHold - 5) < 0.01 &&
+        Math.abs(exactEventPlayback.scheduledDuration - (4 * beatDuration + 5)) < 0.01,
+      `pitched envelopes must honor the full configured release (${JSON.stringify(exactEventPlayback)})`,
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    for (const [condition, label] of [
+      ["project.tracks[1].instrument.parameters.release === 0.18", "exact event release undo"],
+      ["event.duration === 0.7", "exact event duration undo"],
+      ["event.pitch === 33", "exact event pitch undo"],
+      ["event.time === 0", "exact event timing undo"],
+    ]) {
+      await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+      await waitFor(
+        async () =>
+          evaluate(
+            cdp,
+            appSession,
+            `fetch('/api/project').then((response) => response.json()).then((project) => {
+              const event = project.tracks[1].clips[0].events.find((candidate) => candidate.id === 1201);
+              return ${condition};
+            })`,
+          ),
+        label,
+      );
+    }
+
+    await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+      "advanced drawer for attack chase",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const attack = document.querySelector(
+        '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="attack"]',
+      );
+      attack.value = '2';
+      attack.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[1].clips[0].events[0].duration === 0.7 &&
+        project.tracks[1].instrument.parameters.attack === 2;
+    }, "short note with long attack configuration");
+    await evaluate(cdp, appSession, `(() => {
+      document.querySelector('#close-advanced').click();
+      window.__gainNodes = [];
+      window.__oscillators = [];
+      document.querySelector('#rewind-button').click();
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "window.__oscillators.some((node) => node.dawAiTrackId === 2 && node.dawAiEventId === 1201)",
+        ),
+      "short bass note with long attack",
+    );
+    const shortLongAttack = await evaluate(cdp, appSession, `(() => {
+      const oscillator = window.__oscillators.find(
+        (node) => node.dawAiTrackId === 2 && node.dawAiEventId === 1201,
+      );
+      const envelope = window.__gainNodes.find(
+        (node) => node.dawAiVoiceEnvelope && node.dawAiTrackId === 2 && node.dawAiEventId === 1201,
+      );
+      const [noteOff, release] = envelope.gain.dawAiExponentialRamps;
+      return {
+        attack: oscillator.dawAiInstrumentAttack,
+        noteDuration: noteOff.time - oscillator.dawAiStartTime,
+        noteOffLevel: noteOff.value,
+        releaseDuration: release.time - noteOff.time,
+      };
+    })()`);
+    assert.ok(
+      shortLongAttack.attack === 2 &&
+        Math.abs(shortLongAttack.noteDuration - 0.7 * beatDuration) < 0.01 &&
+        shortLongAttack.noteOffLevel > 0.0001 && shortLongAttack.noteOffLevel < 0.001 &&
+        Math.abs(shortLongAttack.releaseDuration - 0.18) < 0.01,
+      `a short note must release from its partial attack level (${JSON.stringify(shortLongAttack)})`,
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+      "advanced drawer for attack chase duration",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const duration = document.querySelector(
+        '[data-sound-tool="event"][data-track-id="2"][data-tool-id="1201"][data-parameter="duration"]',
+      );
+      duration.value = '4';
+      duration.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[1].clips[0].events[0].duration === 4 &&
+        project.tracks[1].instrument.parameters.attack === 2;
+    }, "long attack chase configuration");
+    await evaluate(cdp, appSession, `(() => {
+      document.querySelector('#close-advanced').click();
+      document.querySelector('#rewind-button').click();
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "Number(document.querySelector('#current-time').textContent.split(':')[1]) >= 0.3",
+        ),
+      "playback inside the configured attack",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      document.querySelector('#play-button').click();
+      window.__gainNodes = [];
+      window.__oscillators = [];
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "window.__oscillators.some((node) => node.dawAiTrackId === 2 && node.dawAiEventId === 1201 && node.dawAiChased)",
+        ),
+      "bass voice chased during attack",
+    );
+    const chasedAttack = await evaluate(cdp, appSession, `(() => {
+      const envelope = window.__gainNodes.find(
+        (node) => node.dawAiVoiceEnvelope && node.dawAiTrackId === 2 && node.dawAiEventId === 1201,
+      );
+      return {
+        current: envelope.gain.dawAiSetValues[0].value,
+        peak: Math.max(...envelope.gain.dawAiExponentialRamps.map((entry) => entry.value)),
+      };
+    })()`);
+    assert.ok(
+      chasedAttack.current > 0.0001 && chasedAttack.current < chasedAttack.peak * 0.5,
+      `a chased attack must resume below its eventual peak (${JSON.stringify(chasedAttack)})`,
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    for (const [condition, label] of [
+      ["project.tracks[1].clips[0].events[0].duration === 0.7", "attack chase duration undo"],
+      ["project.tracks[1].instrument.parameters.attack === 0.008", "attack chase undo"],
+    ]) {
+      await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+      await waitFor(
+        async () =>
+          evaluate(
+            cdp,
+            appSession,
+            `fetch('/api/project').then((response) => response.json()).then((project) => ${condition})`,
+          ),
+        label,
+      );
+    }
+
+    await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+      "advanced drawer for drum controls",
+    );
+    const beforeDrumTools = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const update = (selector, value) => {
+        const control = document.querySelector(selector);
+        control.value = value;
+        control.dispatchEvent(new Event('change', { bubbles: true }));
+      };
+      update('[data-sound-tool="instrument"][data-track-id="1"][data-parameter="waveform"]', 'sawtooth');
+      update('[data-sound-tool="instrument"][data-track-id="1"][data-parameter="attack"]', '2');
+      update('[data-sound-tool="instrument"][data-track-id="1"][data-parameter="release"]', '5');
+      update('[data-sound-tool="event"][data-track-id="1"][data-tool-id="1101"][data-parameter="duration"]', '0.0625');
+      update('[data-sound-tool="event"][data-track-id="1"][data-tool-id="1101"][data-parameter="pitch"]', '48');
+    })()`);
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      const drums = project.tracks[0];
+      const event = drums.clips[0].events[0];
+      return project.version === beforeDrumTools.version + 5 && drums.instrument.waveform === "sawtooth" &&
+        drums.instrument.parameters.attack === 2 && drums.instrument.parameters.release === 5 &&
+        event.duration === 0.0625 && event.pitch === 48;
+    }, "drum sound-tool updates");
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(() => {
+        const input = document.querySelector('[data-sound-tool="event"][data-track-id="1"][data-tool-id="1101"][data-parameter="duration"]');
+        return { value: input.value, valid: input.checkValidity() };
+      })()`),
+      { value: "0.0625", valid: true },
+      "a sixteenth-of-a-beat duration must round-trip as a valid control value",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const input = document.querySelector('[data-sound-tool="event"][data-track-id="1"][data-tool-id="1101"][data-parameter="duration"]');
+      input.value = '4';
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.version === beforeDrumTools.version + 6 && project.tracks[0].clips[0].events[0].duration === 4;
+    }, "maximum drum duration update");
+    await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
+    await evaluate(cdp, appSession, `(() => {
+      window.__gainNodes = [];
+      window.__oscillators = [];
+      document.querySelector('#rewind-button').click();
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "window.__oscillators.some((node) => node.dawAiTrackId === 1 && node.dawAiEventPitch === 48)",
+        ),
+      "configured drum event playback",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(() => {
+        const node = window.__oscillators.find((candidate) => candidate.dawAiTrackId === 1 && candidate.dawAiEventPitch === 48);
+        return {
+          type: node.type,
+          duration: node.dawAiEventDuration,
+          attack: node.dawAiInstrumentAttack,
+          release: node.dawAiInstrumentRelease,
+        };
+      })()`),
+      { type: "sawtooth", duration: 4, attack: 2, release: 5 },
+      "drum playback must consume event and instrument parameters",
+    );
+    assert.ok(
+      await evaluate(cdp, appSession, `(() => {
+        const node = window.__oscillators.find(
+          (candidate) => candidate.dawAiTrackId === 1 && candidate.dawAiEventPitch === 48,
+        );
+        const envelope = window.__gainNodes.find(
+          (candidate) => candidate.dawAiVoiceEnvelope && candidate.dawAiVoiceKind === 'tonal' &&
+            candidate.dawAiTrackId === 1 && candidate.dawAiEventId === 1101,
+        );
+        const attackRamp = envelope.gain.dawAiExponentialRamps[0];
+        return Math.abs((attackRamp.time - node.dawAiStartTime) - 2) < 0.01;
+      })()`),
+      "drum playback must retain the configured attack duration",
+    );
+    assert.ok(
+      await evaluate(cdp, appSession, `(() => {
+        const node = window.__oscillators.find((candidate) => candidate.dawAiTrackId === 1 && candidate.dawAiEventPitch === 48);
+        return Math.abs((node.dawAiStopTime - node.dawAiStartTime - 0.01) - (4 * 60 / 112 + 5)) < 0.01;
+      })()`),
+      "drum playback must honor the full configured release",
+    );
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "Number(document.querySelector('#current-time').textContent.split(':')[1]) >= 0.1",
+        ),
+      "playback inside the long drum voices",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      document.querySelector('#play-button').click();
+      window.__oscillators = [];
+      window.__bufferSources = [];
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `window.__oscillators.some(
+            (node) => node.dawAiTrackId === 1 && node.dawAiEventPitch === 48 && node.dawAiChased,
+          ) && window.__bufferSources.some((source) => source.dawAiTrackId === 1 && source.dawAiChased)`,
+        ),
+      "long drum voices chased after resume",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    for (const [condition, label] of [
+      ["project.tracks[0].clips[0].events[0].duration === 0.0625", "maximum drum duration undo"],
+      ["project.tracks[0].clips[0].events[0].pitch === 36", "drum pitch undo"],
+      ["project.tracks[0].clips[0].events[0].duration === 0.25", "drum duration undo"],
+      ["project.tracks[0].instrument.parameters.release === 0.18", "drum release undo"],
+      ["project.tracks[0].instrument.parameters.attack === 0.002", "drum attack undo"],
+      ["project.tracks[0].instrument.waveform === 'sine'", "drum waveform undo"],
+    ]) {
+      await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+      await waitFor(
+        async () =>
+          evaluate(
+            cdp,
+            appSession,
+            `fetch('/api/project').then((response) => response.json()).then((project) => ${condition})`,
+          ),
+        label,
+      );
+    }
+
+    await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+      "advanced drawer for modulation rate",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(async () => {
+        const currentProject = await fetch('/api/project').then((response) => response.json());
+        const projectTrack = currentProject.tracks.find((track) => track.id === 2);
+        const control = document.querySelector('[data-sound-tool="modulator"][data-track-id="2"][data-parameter="target"]');
+        return {
+          published: projectTrack.modulationTargets.map((target) => target.id),
+          rendered: [...control.options].map((option) => option.value),
+        };
+      })()`),
+      {
+        published: [
+          "instrument.attack",
+          "instrument.release",
+          "instrument.tone",
+          "instrument.pitch",
+          "track.volume",
+          "effect:210.mix",
+        ],
+        rendered: [
+          "instrument.attack",
+          "instrument.release",
+          "instrument.tone",
+          "instrument.pitch",
+          "track.volume",
+          "effect:210.mix",
+        ],
+      },
+      "Advanced must render the backend's complete modulation-target contract",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const control = document.querySelector('[data-sound-tool="modulator"][data-track-id="2"][data-parameter="rate"]');
+      control.value = '20';
+      control.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[1].modulators[0].parameters.rate === 20;
+    }, "20 Hz tone modulation update");
+    await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
+    await evaluate(cdp, appSession, `(() => {
+      window.__biquadFilters = [];
+      document.querySelector('#rewind-button').click();
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "window.__biquadFilters.some((node) => node.dawAiAutomation === 'tone' && node.dawAiTrackId === 2 && node.frequency.dawAiSetValues?.length > 100)",
+        ),
+      "high-rate tone modulation automation",
+    );
+    const toneAutomation = await evaluate(cdp, appSession, `(() => {
+      const node = window.__biquadFilters.find((candidate) => candidate.dawAiAutomation === 'tone' && candidate.dawAiTrackId === 2);
+      const times = [...new Set(node.frequency.dawAiSetValues.map((entry) => entry.time))].sort((left, right) => left - right);
+      return {
+        gap: Math.max(...times.slice(1).map((time, index) => time - times[index])),
+        lowPasses: window.__biquadFilters.filter((candidate) => candidate.type === 'lowpass').length,
+      };
+    })()`);
+    assert.ok(
+      toneAutomation.gap <= 0.0063 && toneAutomation.lowPasses === 6,
+      `tone modulation must use only the six authoritative track stages (${JSON.stringify(toneAutomation)})`,
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+
+    await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+      "advanced drawer for pitch modulation",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const control = document.querySelector('[data-sound-tool="modulator"][data-track-id="2"][data-parameter="target"]');
+      control.value = 'instrument.pitch';
+      control.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[1].modulators[0].target === "instrument.pitch";
+    }, "pitch modulation target update");
+    await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
+    await evaluate(cdp, appSession, `(() => {
+      window.__oscillators = [];
+      document.querySelector('#rewind-button').click();
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "window.__oscillators.some((node) => node.dawAiTrackId === 2 && node.detune.dawAiSetValues?.length > 20)",
+        ),
+      "continuous pitch modulation automation",
+    );
+    const pitchAutomation = await evaluate(cdp, appSession, `(() => {
+      const node = window.__oscillators.find((candidate) => candidate.dawAiTrackId === 2 && candidate.detune.dawAiSetValues?.length > 20);
+      const values = node.detune.dawAiSetValues;
+      return { count: values.length, spread: Math.max(...values.map((entry) => entry.value)) - Math.min(...values.map((entry) => entry.value)) };
+    })()`);
+    assert.ok(pitchAutomation.count > 20 && pitchAutomation.spread > 1, "vibrato must vary continuously within a note");
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+
+    await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+      "advanced drawer for envelope modulation",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const update = (parameter, value) => {
+        const control = document.querySelector('[data-sound-tool="modulator"][data-track-id="2"][data-parameter="' + parameter + '"]');
+        control.value = value;
+        control.dispatchEvent(new Event('change', { bubbles: true }));
+      };
+      update('shape', 'square');
+      update('target', 'instrument.attack');
+    })()`);
+    await waitFor(async () => {
+      const current = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return current.tracks[1].modulators[0].shape === "square" &&
+        current.tracks[1].modulators[0].target === "instrument.attack";
+    }, "attack modulation routing");
+    await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
+    await evaluate(cdp, appSession, `(() => {
+      window.__oscillators = [];
+      document.querySelector('#rewind-button').click();
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "window.__oscillators.some((node) => node.dawAiTrackId === 2 && node.dawAiEventId === 1201)",
+        ),
+      "attack-modulated note",
+    );
+    assert.ok(
+      await evaluate(
+        cdp,
+        appSession,
+        "window.__oscillators.find((node) => node.dawAiTrackId === 2 && node.dawAiEventId === 1201).dawAiInstrumentAttack > 0.09",
+      ),
+      "instrument attack modulation must reach note playback",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+
+    await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+      "advanced drawer for release modulation",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const control = document.querySelector('[data-sound-tool="modulator"][data-track-id="2"][data-parameter="target"]');
+      control.value = 'instrument.release';
+      control.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => {
+      const current = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return current.tracks[1].modulators[0].target === "instrument.release";
+    }, "release modulation routing");
+    await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
+    await evaluate(cdp, appSession, `(() => {
+      window.__oscillators = [];
+      document.querySelector('#rewind-button').click();
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "window.__oscillators.some((node) => node.dawAiTrackId === 2 && node.dawAiEventId === 1201)",
+        ),
+      "release-modulated note",
+    );
+    assert.ok(
+      await evaluate(
+        cdp,
+        appSession,
+        "window.__oscillators.find((node) => node.dawAiTrackId === 2 && node.dawAiEventId === 1201).dawAiInstrumentRelease > 0.5",
+      ),
+      "instrument release modulation must reach note playback",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+
+    for (const [target, label] of [
+      ["track.volume", "volume modulation routing"],
+      ["effect:210.mix", "effect modulation routing"],
+    ]) {
+      await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+      await waitFor(
+        async () =>
+          evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+        `advanced drawer for ${label}`,
+      );
+      await evaluate(cdp, appSession, `(() => {
+        const control = document.querySelector('[data-sound-tool="modulator"][data-track-id="2"][data-parameter="target"]');
+        control.value = ${JSON.stringify(target)};
+        control.dispatchEvent(new Event('change', { bubbles: true }));
+      })()`);
+      await waitFor(async () => {
+        const current = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+        return current.tracks[1].modulators[0].target === target;
+      }, label);
+      await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
+      await evaluate(cdp, appSession, `(() => {
+        window.__gainNodes = [];
+        window.__biquadFilters = [];
+        document.querySelector('#rewind-button').click();
+        document.querySelector('#play-button').click();
+      })()`);
+      if (target === "track.volume") {
+        await waitFor(
+          async () =>
+            evaluate(
+              cdp,
+              appSession,
+              "window.__gainNodes.some((node) => node.dawAiAutomation === 'level' && node.dawAiTrackId === 2 && node.gain.dawAiSetValues?.length)",
+            ),
+          "volume-modulated track automation",
+        );
+        assert.ok(
+          await evaluate(cdp, appSession, `(() => {
+            const gate = window.__gainNodes.find((node) => node.dawAiAutomation === 'level' && node.dawAiTrackId === 2);
+            return gate.gain.dawAiSetValues[0].value > 0.85;
+          })()`),
+          "track volume modulation must reach channel automation",
+        );
+      } else {
+        await waitFor(
+          async () =>
+            evaluate(
+              cdp,
+              appSession,
+              "window.__biquadFilters.some((node) => node.dawAiAutomation === 'effect-filter' && node.dawAiTrackId === 2 && node.frequency.dawAiSetValues?.length)",
+            ),
+          "effect-modulated filter automation",
+        );
+        assert.ok(
+          await evaluate(cdp, appSession, `(() => {
+            const filter = window.__biquadFilters.find((node) => node.dawAiAutomation === 'effect-filter' && node.dawAiTrackId === 2);
+            const values = filter.frequency.dawAiSetValues.map((entry) => entry.value);
+            return Math.max(...values) < 10000 && Math.max(...values) - Math.min(...values) > 1000;
+          })()`),
+          "effect mix modulation must reach effect playback",
+        );
+      }
+      await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    }
+
+    for (const [condition, label] of [
+      ["modulator.target === 'track.volume'", "effect target undo"],
+      ["modulator.target === 'instrument.release'", "volume target undo"],
+      ["modulator.target === 'instrument.attack'", "release target undo"],
+      ["modulator.target === 'instrument.pitch'", "attack target undo"],
+      ["modulator.shape === 'sine'", "modulator shape undo"],
+      ["modulator.target === 'instrument.tone'", "pitch target undo"],
+      ["modulator.parameters.rate === 0.25", "modulation rate undo"],
+    ]) {
+      await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+      await waitFor(
+        async () =>
+          evaluate(
+            cdp,
+            appSession,
+            `fetch('/api/project').then((response) => response.json()).then((current) => {
+              const modulator = current.tracks[1].modulators[0];
+              return ${condition};
+            })`,
+          ),
+        label,
+      );
+    }
+    await evaluate(cdp, appSession, `(() => {
+      window.__audioCloseCount = 0;
+      window.__reverbBuffers = [];
+      window.__noiseBuffers = [];
     })()`);
 
     const delayedStart = await evaluate(cdp, appSession, `(async () => {
@@ -1018,6 +2302,37 @@ async function run() {
     await mouse(cdp, appSession, "mousePressed", lane.left, lane.y, 1);
     await mouse(cdp, appSession, "mouseMoved", lane.left + lane.width * (4 / 32), lane.y, 1);
     await mouse(cdp, appSession, "mouseReleased", lane.left + lane.width * (4 / 32), lane.y);
+    await submitPrompt(cdp, appSession, "add a sawtooth lead", 1);
+    const sawtoothLeadProject = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    assert.deepEqual(
+      sawtoothLeadProject.edits[0].action,
+      {
+        type: "compound",
+        actions: [
+          { type: "add-track", target: "lead" },
+          { type: "instrument", name: "sawtooth", value: 0, target: "lead" },
+        ],
+      },
+      "a waveform-qualified add prompt must create and then configure the requested track",
+    );
+    assert.equal(
+      sawtoothLeadProject.tracks.find((track) => track.role === "lead").instrument.waveform,
+      "sawtooth",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "fetch('/api/project').then((response) => response.json()).then((project) => project.edits.length === 0 && !project.tracks.some((track) => track.role === 'lead'))",
+        ),
+      "sawtooth lead prompt undo",
+    );
     await submitPrompt(cdp, appSession, "add a lead", 1);
     await waitFor(
       async () => evaluate(cdp, appSession, "!document.querySelector('#compose-button').disabled"),
@@ -1175,6 +2490,194 @@ async function run() {
       "existing lead undo",
     );
     await evaluate(cdp, appSession, `window.__audioCloseCount = ${audioCloseCountBeforeDrop}`);
+
+    await mouse(cdp, appSession, "mousePressed", lane.left, lane.y, 1);
+    await mouse(cdp, appSession, "mouseMoved", lane.left + lane.width * (4 / 32), lane.y, 1);
+    await mouse(cdp, appSession, "mouseReleased", lane.left + lane.width * (4 / 32), lane.y);
+    await submitPrompt(cdp, appSession, "add a lead", 1);
+    await mouse(cdp, appSession, "mousePressed", lane.left + lane.width * (1 / 32), lane.y, 1);
+    await mouse(cdp, appSession, "mouseMoved", lane.left + lane.width * (3 / 32), lane.y, 1);
+    await mouse(cdp, appSession, "mouseReleased", lane.left + lane.width * (3 / 32), lane.y);
+    await submitPrompt(cdp, appSession, "insert a sick drop here", 2);
+    const splitClipProject = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    const splitLead = splitClipProject.tracks.find((track) => track.role === "lead");
+    const retainedSplitClips = splitLead.clips.filter((clip) => clip.label === "AI variation");
+    assert.equal(
+      retainedSplitClips.length,
+      2,
+      `inner region replacement must retain both clip sides (${JSON.stringify(splitLead.clips)})`,
+    );
+    const [splitLeft, splitRight] = retainedSplitClips;
+    const splitDropClip = splitLead.clips.find((clip) => clip.label === "Drop hook");
+    const precedingClipEvent = splitDropClip.events.find((event) => event.time === 2);
+    assert.ok(
+      splitLeft.id !== splitRight.id && splitLeft.events[0].id === splitRight.events[0].id,
+      "region replacement must expose the duplicate event-ID focus scenario",
+    );
+    const splitEventId = splitRight.events[0].id;
+    await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+      "advanced drawer for split clip focus",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const input = document.querySelector(
+        '[data-sound-tool="event"][data-track-id="${splitLead.id}"][data-clip-id="${splitRight.id}"][data-tool-id="${splitEventId}"][data-parameter="pitch"]',
+      );
+      input.value = '80';
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => {
+      const current = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      const lead = current.tracks.find((track) => track.id === splitLead.id);
+      return lead.clips.find((clip) => clip.id === splitRight.id).events[0].pitch === 80;
+    }, "right split clip event update");
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `({
+        clipId: document.activeElement.dataset.clipId,
+        key: document.activeElement.dataset.controlKey,
+      })`),
+      {
+        clipId: String(splitRight.id),
+        key: `${splitLead.id}-clip-${splitRight.id}-event-${splitEventId}-pitch`,
+      },
+      "event focus must return to the edited owning clip",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const update = (parameter, value) => {
+        const control = document.querySelector(
+          '[data-sound-tool="modulator"][data-track-id="${splitLead.id}"][data-parameter="' + parameter + '"]',
+        );
+        control.value = value;
+        control.dispatchEvent(new Event('change', { bubbles: true }));
+      };
+      update('shape', 'square');
+      update('rate', '0.75');
+      update('depth', '1');
+      update('target', 'instrument.attack');
+    })()`);
+    await waitFor(async () => {
+      const current = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      const lead = current.tracks.find((track) => track.id === splitLead.id);
+      const modulator = lead.modulators[0];
+      return modulator.shape === "square" && modulator.parameters.rate === 0.75 &&
+        modulator.parameters.depth === 1 && modulator.target === "instrument.attack";
+    }, "split lead attack modulation configuration");
+    await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
+    await mouse(cdp, appSession, "mousePressed", lane.left + lane.width * (3.25 / 32), lane.y, 1);
+    await mouse(cdp, appSession, "mouseReleased", lane.left + lane.width * (3.25 / 32), lane.y);
+    await evaluate(cdp, appSession, `(() => {
+      window.__gainNodes = [];
+      window.__oscillators = [];
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `window.__oscillators.some(
+            (node) => node.dawAiTrackId === ${splitLead.id} &&
+              node.dawAiEventId === ${precedingClipEvent.id} && node.dawAiChased,
+          )`,
+        ),
+      "preceding clip voice chased during its onset attack",
+    );
+    const crossClipAttack = await evaluate(cdp, appSession, `(() => {
+      const oscillator = window.__oscillators.find(
+        (node) => node.dawAiTrackId === ${splitLead.id} && node.dawAiEventId === ${precedingClipEvent.id},
+      );
+      const envelope = window.__gainNodes.find(
+        (node) => node.dawAiVoiceEnvelope && node.dawAiTrackId === ${splitLead.id} &&
+          node.dawAiEventId === ${precedingClipEvent.id},
+      );
+      return {
+        attack: oscillator.dawAiInstrumentAttack,
+        currentLevel: envelope.gain.dawAiSetValues[0].value,
+        peakLevel: Math.max(...envelope.gain.dawAiExponentialRamps.map((entry) => entry.value)),
+      };
+    })()`);
+    assert.ok(
+      crossClipAttack.attack > 0.5 && crossClipAttack.currentLevel < crossClipAttack.peakLevel * 0.9,
+      `a cross-clip chase must retain onset-sampled attack state (${JSON.stringify(crossClipAttack)})`,
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    await mouse(cdp, appSession, "mousePressed", lane.left + lane.width * (3.5 / 32), lane.y, 1);
+    await mouse(cdp, appSession, "mouseReleased", lane.left + lane.width * (3.5 / 32), lane.y);
+    await evaluate(cdp, appSession, `(() => {
+      window.__gainNodes = [];
+      window.__oscillators = [];
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `window.__oscillators.some(
+            (node) => node.dawAiTrackId === ${splitLead.id} &&
+              node.dawAiEventId === ${precedingClipEvent.id} && node.dawAiChased,
+          )`,
+        ),
+      "preceding clip release tail chase",
+    );
+    assert.ok(
+      await evaluate(cdp, appSession, `(() => {
+        const oscillator = window.__oscillators.find(
+          (node) => node.dawAiTrackId === ${splitLead.id} && node.dawAiEventId === ${precedingClipEvent.id},
+        );
+        return oscillator.dawAiStopTime > oscillator.dawAiStartTime;
+      })()`),
+      "a release tail from the preceding clip must remain sounding after resume",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    await evaluate(cdp, appSession, `window.__audioCloseCount = ${audioCloseCountBeforeDrop}`);
+    for (const [condition, label] of [
+      ["modulator.target === 'instrument.pitch'", "split lead attack target undo"],
+      ["modulator.parameters.depth === 0.08", "split lead modulation depth undo"],
+      ["modulator.parameters.rate === 5", "split lead modulation rate undo"],
+      ["modulator.shape === 'sine'", "split lead modulation shape undo"],
+    ]) {
+      await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+      await waitFor(
+        async () =>
+          evaluate(
+            cdp,
+            appSession,
+            `fetch('/api/project').then((response) => response.json()).then((project) => {
+              const lead = project.tracks.find((track) => track.id === ${splitLead.id});
+              const modulator = lead.modulators[0];
+              return ${condition};
+            })`,
+          ),
+        label,
+      );
+    }
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => {
+      const current = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      const lead = current.tracks.find((track) => track.id === splitLead.id);
+      return lead.clips.find((clip) => clip.id === splitRight.id).events[0].pitch === 69;
+    }, "split clip event undo");
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 1"),
+      "split drop undo",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          "document.querySelectorAll('.edit-item').length === 0 && document.querySelectorAll('.track-row').length === 3",
+        ),
+      "split lead undo",
+    );
 
     await mouse(cdp, appSession, "mousePressed", lane.left + lane.width * (0.25 / 32), lane.y, 1);
     await mouse(cdp, appSession, "mouseMoved", lane.left + lane.width * (0.5 / 32), lane.y, 1);
@@ -1449,12 +2952,36 @@ async function run() {
     const bassTrackId = allEffectsProject.tracks.find((track) => track.role === "bass").id;
     await evaluate(cdp, appSession, `(() => {
       window.__gainNodes = [];
+      window.__biquadFilters = [];
       document.querySelector('#play-button').click();
     })()`);
     const bassFilterBypass = `window.__gainNodes.find((node) => node.dawAiAutomation === 'filter-bypass' && node.dawAiTrackId === ${bassTrackId})`;
+    const bassToneFilter = `window.__biquadFilters.find((node) => node.dawAiAutomation === 'tone' && node.dawAiTrackId === ${bassTrackId})`;
+    const bassEffectFilter = `window.__biquadFilters.find((node) => node.dawAiAutomation === 'effect-filter' && node.dawAiTrackId === ${bassTrackId})`;
     await waitFor(
-      async () => evaluate(cdp, appSession, `Boolean(${bassFilterBypass}) && ${bassFilterBypass}.gain.value === 1`),
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `Boolean(${bassFilterBypass}) && ${bassFilterBypass}.gain.value === 1 &&
+            Boolean(${bassToneFilter}) && Boolean(${bassEffectFilter}) &&
+            ${bassToneFilter}.frequency.dawAiSetValues?.length > 20`,
+        ),
       "generic effect removal to bypass the bass channel filter",
+    );
+    const toneDuringEffectRemoval = await evaluate(cdp, appSession, `(() => {
+      const tone = ${bassToneFilter};
+      const effect = ${bassEffectFilter};
+      const bypass = ${bassFilterBypass};
+      const values = tone.frequency.dawAiSetValues.map((entry) => entry.value);
+      return {
+        independentStage: bypass.dawAiBypassedStage === effect && bypass.dawAiBypassedStage !== tone,
+        spread: Math.max(...values) - Math.min(...values),
+      };
+    })()`);
+    assert.ok(
+      toneDuringEffectRemoval.independentStage && toneDuringEffectRemoval.spread > 1,
+      `instrument tone must remain independently modulated while effects are bypassed (${JSON.stringify(toneDuringEffectRemoval)})`,
     );
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
@@ -1471,8 +2998,23 @@ async function run() {
       async () => evaluate(cdp, appSession, "document.querySelectorAll('.track-row').length === 5"),
       "pitched rhythm test tracks",
     );
+    await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
+      "advanced drawer for authoritative rhythm pitch",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const input = document.querySelector('[data-sound-tool="event"][data-track-id="2"][data-tool-id="1201"][data-parameter="pitch"]');
+      input.value = '80';
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[1].clips[0].events[0].pitch === 80;
+    }, "authoritative bass event pitch update");
+    await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
     await submitPrompt(cdp, appSession, "make the chords busy", 3);
-    await submitPrompt(cdp, appSession, "make the bass sparse", 4);
+    await submitPrompt(cdp, appSession, "make the bass busy", 4);
     await submitPrompt(cdp, appSession, "make the lead sparse", 5);
     await submitPrompt(cdp, appSession, "make the texture busy", 6);
     const rhythmProject = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
@@ -1489,7 +3031,7 @@ async function run() {
           appSession,
           `(() => {
             const count = (id) => window.__oscillators.filter((node) => node.dawAiTrackId === id).length;
-            return count(${roleIds.chords}) >= 9 && count(${roleIds.bass}) >= 3 &&
+            return count(${roleIds.chords}) >= 13 && count(${roleIds.bass}) >= 5 &&
               count(${roleIds.lead}) >= 3 && count(${roleIds.texture}) >= 6;
           })()`,
         ),
@@ -1502,7 +3044,7 @@ async function run() {
           .map((node) => node.dawAiStartTime.toFixed(4)))]
           .map(Number)
           .sort((left, right) => left - right);
-        return starts[2] - starts[1];
+        return starts.at(-1) - starts.at(-2);
       };
       return {
         chords: gap(${roleIds.chords}),
@@ -1517,8 +3059,8 @@ async function run() {
       `busy chords must double their cadence (observed ${rhythmGaps.chords})`,
     );
     assert.ok(
-      Math.abs(rhythmGaps.bass - sixteenth * 8) < 0.02,
-      `sparse bass must halve its cadence (observed ${rhythmGaps.bass})`,
+      Math.abs(rhythmGaps.bass - sixteenth * 2) < 0.02,
+      `busy bass must double its graph-event cadence (observed ${rhythmGaps.bass})`,
     );
     assert.ok(
       Math.abs(rhythmGaps.lead - sixteenth * 8) < 0.02,
@@ -1527,6 +3069,15 @@ async function run() {
     assert.ok(
       Math.abs(rhythmGaps.texture - sixteenth * 8) < 0.02,
       `busy texture must double its cadence (observed ${rhythmGaps.texture})`,
+    );
+    assert.equal(
+      await evaluate(
+        cdp,
+        appSession,
+        `window.__oscillators.some((node) => node.dawAiTrackId === ${roleIds.bass} && Math.abs(node.dawAiBaseFrequency - 830.6094) < 0.1)`,
+      ),
+      true,
+      "rhythm density must preserve the edited MIDI 80 bass event",
     );
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
 
@@ -1538,12 +3089,23 @@ async function run() {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: 'start=1&end=2&prompt=hostile+edit'
     }).then(() => true).catch(() => false)`);
+    await evaluate(cdp, attackerSession, `fetch('${appUrl}/api/sound-tools', {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth'
+    }).then(() => true).catch(() => false)`);
     const afterAttack = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
     assert.equal(afterAttack.edits.some((edit) => edit.prompt === "hostile edit"), false);
+    assert.equal(
+      afterAttack.tracks.find((track) => track.id === 2).instrument.waveform,
+      "square",
+      "cross-origin sound-tool mutations must be rejected",
+    );
     assert.equal(consoleErrors.length, 0, "application emitted browser console errors");
 
     console.log(
-      "Browser workflows passed: mobile page/timeline panning, keyboard selection, serialized transport, voice chase, structured drops, regional effects/filtering, short clips, targeted rhythm, prompt single-flight/undo, mixer focus/transport, modal, cross-origin guard",
+      "Browser workflows passed: mobile layout/panning, keyboard selection, serialized transport, exact event/envelope playback, voice chase, structured drops, regional effects/filtering, short clips, targeted rhythm, complete modulation routing, advanced sound tools, prompt single-flight/undo, mixer focus/transport, modal, cross-origin guard",
     );
   } finally {
     if (attacker) await new Promise((resolve) => attacker.close(resolve));

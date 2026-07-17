@@ -47,9 +47,9 @@ cargo run -- --port 8888
 1. Drag over any part of the arrangement to set the edit region. On touch devices, swipe to pan normally or tap **Select region** before dragging a selection.
 2. Enter a request such as `increase the volume`, `add a bass`, `make the chords warm and spacious`, or `insert a sick drop here`.
 3. Press **Make change**, then use the transport to hear the result.
-4. Open **Advanced** to inspect the generated instruments and effects or adjust track levels and mute states.
+4. Open **Advanced** to edit clip notes/drums, synth envelopes and waveforms, ordered effect chains, modulators, routing, levels, and mute states.
 
-Codex receives the selected range, current project JSON, and the checked-in synth contract under `codex/`. It returns a schema-constrained plan covering arrangement, instrument, level, effect, tempo, tone, and rhythmic-density changes. Undo and reset are available throughout the session.
+Codex receives the selected range, current project JSON, and the checked-in synth contract under `codex/`. The JSON is a stable sound graph: clips own beat-relative events; instruments, effects, and modulators expose numeric parameters; and routing names the audio/control connections. Codex returns a schema-constrained plan covering arrangement, instrument, modulation, level, effect, tempo, tone, and rhythmic-density changes. Direct Advanced edits use the same graph and are undoable alongside prompted edits.
 
 ## Development
 

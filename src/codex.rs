@@ -231,6 +231,31 @@ fn action_from_json(value: &JsonValue) -> Result<Action, PlannerError> {
         "add-track" => target
             .map(|role| Action::AddTrack { role })
             .ok_or_else(|| invalid("add-track requires a role target")),
+        "instrument" if value == 0.0 => Ok(Action::Instrument {
+            waveform: waveform_name(name)?,
+            target: target.ok_or_else(|| invalid("instrument requires a role target"))?,
+        }),
+        "modulator" if (0.0..=1.0).contains(&value) => Ok(Action::Modulator {
+            parameter: modulator_parameter(name)?,
+            depth: value as f32,
+            target: target.ok_or_else(|| invalid("modulator requires a role target"))?,
+        }),
+        "configure" if name == "None" && value == 0.0 => {
+            let setting = string_field(object, "setting")?;
+            if setting.is_empty() || setting.chars().count() > 64 {
+                return Err(invalid("configure setting length is invalid"));
+            }
+            let clip_id = integer_field(object, "clipId")?;
+            Ok(Action::Configure {
+                track_id: integer_field(object, "trackId")?,
+                target: target.ok_or_else(|| invalid("configure requires a role target"))?,
+                tool: sound_tool_name(string_field(object, "tool")?)?,
+                tool_id: integer_field(object, "toolId")?,
+                clip_id: (clip_id != 0).then_some(clip_id),
+                parameter: sound_parameter_name(string_field(object, "parameter")?)?,
+                value: setting.to_owned(),
+            })
+        }
         "effect" if (0.0..=1.0).contains(&value) => Ok(Action::Effect {
             name: effect_name(name, false)?,
             mix: value as f32,
@@ -281,6 +306,65 @@ fn effect_name(name: &str, allow_all: bool) -> Result<&'static str, PlannerError
     }
 }
 
+fn waveform_name(name: &str) -> Result<&'static str, PlannerError> {
+    match name {
+        "sine" => Ok("sine"),
+        "triangle" => Ok("triangle"),
+        "sawtooth" => Ok("sawtooth"),
+        "square" => Ok("square"),
+        _ => Err(invalid("unknown instrument waveform")),
+    }
+}
+
+fn modulator_parameter(name: &str) -> Result<String, PlannerError> {
+    match name {
+        "instrument.attack" | "instrument.release" | "instrument.tone" | "instrument.pitch"
+        | "track.volume" => Ok(name.to_owned()),
+        _ if effect_modulation_target(name).is_some() => Ok(name.to_owned()),
+        _ => Err(invalid("unknown modulation target")),
+    }
+}
+
+fn effect_modulation_target(name: &str) -> Option<u64> {
+    name.strip_prefix("effect:")?
+        .strip_suffix(".mix")?
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+}
+
+fn sound_tool_name(name: &str) -> Result<&'static str, PlannerError> {
+    match name {
+        "instrument" => Ok("instrument"),
+        "effect" => Ok("effect"),
+        "modulator" => Ok("modulator"),
+        "event" => Ok("event"),
+        "routing" => Ok("routing"),
+        _ => Err(invalid("unknown configurable sound tool")),
+    }
+}
+
+fn sound_parameter_name(name: &str) -> Result<&'static str, PlannerError> {
+    match name {
+        "waveform" => Ok("waveform"),
+        "attack" => Ok("attack"),
+        "release" => Ok("release"),
+        "tone" => Ok("tone"),
+        "mix" => Ok("mix"),
+        "enabled" => Ok("enabled"),
+        "shape" => Ok("shape"),
+        "rate" => Ok("rate"),
+        "depth" => Ok("depth"),
+        "target" => Ok("target"),
+        "time" => Ok("time"),
+        "duration" => Ok("duration"),
+        "pitch" => Ok("pitch"),
+        "velocity" => Ok("velocity"),
+        "position" => Ok("position"),
+        _ => Err(invalid("unknown sound-tool parameter")),
+    }
+}
+
 fn string_field<'a>(
     object: &'a HashMap<String, JsonValue>,
     name: &str,
@@ -297,6 +381,17 @@ fn number_field(object: &HashMap<String, JsonValue>, name: &str) -> Result<f64, 
         .and_then(JsonValue::as_number)
         .filter(|number| number.is_finite())
         .ok_or_else(|| invalid(&format!("{name} must be a finite number")))
+}
+
+fn integer_field(object: &HashMap<String, JsonValue>, name: &str) -> Result<u64, PlannerError> {
+    let value = number_field(object, name)?;
+    if value.fract() == 0.0 && (0.0..=9_007_199_254_740_991.0).contains(&value) {
+        Ok(value as u64)
+    } else {
+        Err(invalid(&format!(
+            "{name} must be a non-negative safe integer"
+        )))
+    }
 }
 
 fn invalid(message: &str) -> PlannerError {
@@ -644,6 +739,85 @@ mod tests {
             "actions":[{"kind":"tempo","target":"all","name":"None","value":999}]
         }"#;
         assert!(plan_from_json(invalid).is_err());
+    }
+
+    #[test]
+    fn parses_sound_tool_actions() {
+        let plan = plan_from_json(
+            r#"{
+                "summary":"Changed the bass source and added movement",
+                "actions":[
+                    {"kind":"instrument","target":"bass","name":"sawtooth","value":0},
+                    {"kind":"modulator","target":"bass","name":"instrument.tone","value":0.25}
+                ]
+            }"#,
+        )
+        .expect("valid sound tool plan");
+        assert_eq!(
+            plan.action,
+            Action::Compound {
+                actions: vec![
+                    Action::Instrument {
+                        waveform: "sawtooth",
+                        target: TrackRole::Bass,
+                    },
+                    Action::Modulator {
+                        parameter: "instrument.tone".to_owned(),
+                        depth: 0.25,
+                        target: TrackRole::Bass,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_any_published_modulation_target() {
+        let plan = plan_from_json(
+            r#"{
+                "summary":"Route movement to the bass filter mix",
+                "actions":[{
+                    "kind":"modulator","target":"bass","name":"effect:210.mix","value":0.25,
+                    "trackId":0,"tool":"None","toolId":0,"clipId":0,"parameter":"None","setting":""
+                }]
+            }"#,
+        )
+        .expect("valid stable-ID modulation target");
+        assert_eq!(
+            plan.action,
+            Action::Modulator {
+                parameter: "effect:210.mix".to_owned(),
+                depth: 0.25,
+                target: TrackRole::Bass,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_stable_id_sound_tool_configuration() {
+        let plan = plan_from_json(
+            r#"{
+                "summary":"Shortened the selected bass event",
+                "actions":[{
+                    "kind":"configure","target":"bass","name":"None","value":0,
+                    "trackId":2,"tool":"event","toolId":1201,"clipId":12,
+                    "parameter":"duration","setting":"0.0625"
+                }]
+            }"#,
+        )
+        .expect("valid configuration action");
+        assert_eq!(
+            plan.action,
+            Action::Configure {
+                track_id: 2,
+                target: TrackRole::Bass,
+                tool: "event",
+                tool_id: 1201,
+                clip_id: Some(12),
+                parameter: "duration",
+                value: "0.0625".to_owned(),
+            }
+        );
     }
 
     #[test]
