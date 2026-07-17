@@ -30,6 +30,8 @@ Routing: Instruments, effects, and modulators can be connected into a signal cha
 ### Implementation
 
 The interface should be a local webserver with no authentication required. It should run on port 8888 by default.
+It should support reverse proxy deployments without any configuration of the hostname by the user.
+
 The backend is written in Rust. The client code should be responsive and the UI should work on mobile or a desktop
 browser.
 
