@@ -1666,24 +1666,7 @@ fn write_signal_edge(
 }
 
 pub(crate) fn json_string(value: &str) -> String {
-    let mut output = String::with_capacity(value.len() + 2);
-    output.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            character if character.is_control() => {
-                write!(output, "\\u{:04x}", u32::from(character))
-                    .expect("writing to a string cannot fail");
-            }
-            character => output.push(character),
-        }
-    }
-    output.push('"');
-    output
+    serde_json::to_string(value).expect("strings must serialize to JSON")
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use crate::json::{JsonParser, JsonValue};
+use serde_json::{Map, Value as JsonValue};
+
 use crate::model::{
     Clip, ClipEvent, Edit, Effect, Instrument, MAX_PROMPT_CHARACTERS, Modulator, Project,
     ProjectFileError, Routing, Track, TrackRole,
@@ -14,12 +15,11 @@ const MAX_EVENTS_PER_CLIP: usize = 2_048;
 const MAX_EDITS: usize = 10_000;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
-type Object = HashMap<String, JsonValue>;
+type Object = Map<String, JsonValue>;
 
 pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
-    let value = JsonParser::new(source)
-        .parse()
-        .map_err(|error| invalid(format!("invalid JSON: {error}")))?;
+    let value =
+        serde_json::from_str(source).map_err(|error| invalid(format!("invalid JSON: {error}")))?;
     let root = object(&value, "sound graph")?;
     let name = limited_string(root, "name", 1, 160)?;
     let bpm = integer(root, "bpm")?;
@@ -272,9 +272,9 @@ fn parse_effect_order(
             "routing audio chain must include clips, instrument, every effect, and master",
         ));
     }
-    if audio[0].as_string() != Some("clips")
-        || audio[1].as_string() != Some(format!("instrument:{instrument_id}").as_str())
-        || audio.last().and_then(JsonValue::as_string) != Some("master")
+    if audio[0].as_str() != Some("clips")
+        || audio[1].as_str() != Some(format!("instrument:{instrument_id}").as_str())
+        || audio.last().and_then(JsonValue::as_str) != Some("master")
     {
         return Err(invalid("routing audio chain has invalid endpoints"));
     }
@@ -287,7 +287,7 @@ fn parse_effect_order(
         .iter()
         .map(|value| {
             let id = value
-                .as_string()
+                .as_str()
                 .and_then(|value| value.strip_prefix("effect:"))
                 .and_then(|value| value.parse::<u64>().ok())
                 .ok_or_else(|| invalid("routing effect entry is invalid"))?;
@@ -771,12 +771,13 @@ fn field<'a>(object: &'a Object, name: &str) -> Result<&'a JsonValue, ProjectFil
 fn array<'a>(object: &'a Object, name: &str) -> Result<&'a [JsonValue], ProjectFileError> {
     field(object, name)?
         .as_array()
+        .map(Vec::as_slice)
         .ok_or_else(|| invalid(format!("{name} must be an array")))
 }
 
 fn string<'a>(object: &'a Object, name: &str) -> Result<&'a str, ProjectFileError> {
     field(object, name)?
-        .as_string()
+        .as_str()
         .ok_or_else(|| invalid(format!("{name} must be a string")))
 }
 
@@ -804,7 +805,7 @@ fn boolean(object: &Object, name: &str) -> Result<bool, ProjectFileError> {
 
 fn finite_number(object: &Object, name: &str) -> Result<f32, ProjectFileError> {
     let value = field(object, name)?
-        .as_number()
+        .as_f64()
         .filter(|value| value.is_finite())
         .ok_or_else(|| invalid(format!("{name} must be a finite number")))?;
     if value < f64::from(f32::MIN) || value > f64::from(f32::MAX) {
@@ -831,7 +832,7 @@ fn relative_range(object: &Object, name: &str) -> Result<f32, ProjectFileError> 
 
 fn integer(object: &Object, name: &str) -> Result<u64, ProjectFileError> {
     let value = field(object, name)?
-        .as_number()
+        .as_f64()
         .filter(|value| value.is_finite())
         .ok_or_else(|| invalid(format!("{name} must be a number")))?;
     if value.fract() != 0.0 || !(0.0..=MAX_SAFE_INTEGER as f64).contains(&value) {
