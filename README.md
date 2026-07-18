@@ -2,7 +2,7 @@
 
 DAW-AI is a local, prompt-driven music studio for making music without learning a traditional DAW. Select a region of the timeline, describe the change in everyday language, and hear the arrangement update immediately.
 
-The project is a dependency-free Rust server with a responsive browser client. Audio is synthesized with the Web Audio API, so the included session is playable without samples. Prompted edits are planned by the locally installed Codex CLI using your existing Codex authentication.
+The project is a small Rust server with a responsive browser client. Audio is synthesized with the Web Audio API, so the included session is playable without samples. Prompted edits are planned by the locally installed Codex CLI using your existing Codex authentication.
 
 ## Run it
 
@@ -64,3 +64,7 @@ just test
 ```
 
 The server binds only to `127.0.0.1`, requires no web authentication, and embeds the client assets in the executable. Its same-origin API lives under `/api`. Server warnings and errors go to stderr; handled and unhandled browser errors are forwarded to the same log with bounded messages. Reverse proxies can publish any hostname without DAW-AI configuration by keeping the upstream `Host` loopback-only and sending the public authority as `X-Forwarded-Host`. If a proxy preserves the public `Host`, set `DAW_AI_TRUSTED_HOSTS` to a comma-separated allowlist such as `studio.example,preview.example:8443`; entries without a port accept that hostname on any port. Arbitrary public hosts remain rejected to preserve DNS-rebinding protection. The test suite injects the deterministic demo planner with `DAW_AI_PROMPT_ENGINE=demo` and an isolated project path, so CI never needs Codex credentials or model usage.
+
+### Dependency policy
+
+Third-party packages are reserved for complex, standards-sensitive boundaries where they materially improve correctness and maintenance. `serde_json` is the only direct package dependency; it handles JSON parsing and string escaping for Codex, MCP, and persisted project data. Domain-specific sound-graph validation and serialization remain in the project, while the narrow HTTP server, form decoder, temporary-file handling, CLI parser, and browser harness continue to use platform APIs.

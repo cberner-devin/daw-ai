@@ -3,8 +3,9 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde_json::Value as JsonValue;
+
 use crate::codex::{EDIT_SCHEMA, plan_from_json};
-use crate::json::{JsonParser, JsonValue};
 use crate::model::{Project, StudioError, json_string};
 use crate::prompt::{Action, EditPlan};
 use crate::storage::{ProjectStore, replace_text_file};
@@ -125,7 +126,7 @@ fn run(reader: impl BufRead, mut writer: impl Write, session_path: &Path) -> io:
 }
 
 fn handle_message(source: &str, session_path: &Path) -> Option<String> {
-    let value = match JsonParser::new(source).parse() {
+    let value = match serde_json::from_str::<JsonValue>(source) {
         Ok(value) => value,
         Err(error) => {
             return Some(json_rpc_error(
@@ -138,8 +139,8 @@ fn handle_message(source: &str, session_path: &Path) -> Option<String> {
     let Some(request) = value.as_object() else {
         return Some(json_rpc_error("null", -32600, "request must be an object"));
     };
-    let id = request.get("id").map(JsonValue::to_json);
-    let method = request.get("method").and_then(JsonValue::as_string);
+    let id = request.get("id").map(ToString::to_string);
+    let method = request.get("method").and_then(JsonValue::as_str);
     let Some(method) = method else {
         return id.map(|id| json_rpc_error(&id, -32600, "method must be a string"));
     };
@@ -157,7 +158,7 @@ fn initialize_response(id: &str, params: Option<&JsonValue>) -> String {
     let protocol = params
         .and_then(JsonValue::as_object)
         .and_then(|params| params.get("protocolVersion"))
-        .and_then(JsonValue::as_string)
+        .and_then(JsonValue::as_str)
         .unwrap_or("2025-06-18");
     json_rpc_result(
         id,
@@ -177,10 +178,9 @@ fn initialize_response(id: &str, params: Option<&JsonValue>) -> String {
 }
 
 fn tools_response(id: &str) -> String {
-    let schema = JsonParser::new(EDIT_SCHEMA)
-        .parse()
+    let schema = serde_json::from_str::<JsonValue>(EDIT_SCHEMA)
         .expect("embedded edit schema is valid JSON")
-        .to_json();
+        .to_string();
     let result = format!(
         concat!(
             "{{\"tools\":[{{\"name\":{},\"description\":{},\"inputSchema\":{},",
@@ -204,7 +204,7 @@ fn call_tool_response(id: &str, params: Option<&JsonValue>, session_path: &Path)
         .and_then(|params| {
             let name = params
                 .get("name")
-                .and_then(JsonValue::as_string)
+                .and_then(JsonValue::as_str)
                 .ok_or_else(|| "tool name is required".to_owned())?;
             if name != MCP_TOOL_NAME {
                 return Err(format!("unknown tool: {name}"));
@@ -212,7 +212,7 @@ fn call_tool_response(id: &str, params: Option<&JsonValue>, session_path: &Path)
             let arguments = params
                 .get("arguments")
                 .ok_or_else(|| "tool arguments are required".to_owned())?;
-            apply_graph_edits(session_path, &arguments.to_json())
+            apply_graph_edits(session_path, &arguments.to_string())
         });
     let (is_error, text) = match result {
         Ok(message) => (false, message),
@@ -270,8 +270,7 @@ fn apply_graph_edits(session_path: &Path, source: &str) -> Result<String, String
 fn read_request(session_path: &Path) -> Result<(f32, f32, String), String> {
     let source = fs::read_to_string(session_path.join(REQUEST_FILE))
         .map_err(|error| format!("could not read edit request: {error}"))?;
-    let value = JsonParser::new(&source)
-        .parse()
+    let value = serde_json::from_str::<JsonValue>(&source)
         .map_err(|error| format!("edit request is invalid: {error}"))?;
     let request = value
         .as_object()
@@ -279,14 +278,14 @@ fn read_request(session_path: &Path) -> Result<(f32, f32, String), String> {
     let number = |name: &str| {
         request
             .get(name)
-            .and_then(JsonValue::as_number)
+            .and_then(JsonValue::as_f64)
             .filter(|value| value.is_finite())
             .map(|value| value as f32)
             .ok_or_else(|| format!("edit request {name} must be a finite number"))
     };
     let prompt = request
         .get("prompt")
-        .and_then(JsonValue::as_string)
+        .and_then(JsonValue::as_str)
         .ok_or_else(|| "edit request prompt must be a string".to_owned())?
         .to_owned();
     Ok((number("start")?, number("end")?, prompt))
@@ -309,13 +308,12 @@ fn read_plans(session_path: &Path) -> Result<Vec<EditPlan>, String> {
 }
 
 fn append_operation(session_path: &Path, source: &str) -> Result<(), String> {
-    let value = JsonParser::new(source)
-        .parse()
+    let value = serde_json::from_str::<JsonValue>(source)
         .map_err(|error| format!("could not record invalid tool arguments: {error}"))?;
     let path = session_path.join(OPERATIONS_FILE);
     let mut operations = fs::read_to_string(&path)
         .map_err(|error| format!("could not read edit operations: {error}"))?;
-    operations.push_str(&value.to_json());
+    operations.push_str(&value.to_string());
     operations.push('\n');
     if operations.len() as u64 > MAX_OPERATIONS_BYTES {
         return Err("edit operations exceeded the session limit".to_owned());

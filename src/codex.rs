@@ -1,12 +1,12 @@
-use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde_json::{Map, Value as JsonValue};
+
 use crate::codex_mcp::{EditSession, MCP_SESSION_ENV, MCP_TOOL_NAME};
-use crate::json::{JsonParser, JsonValue};
 use crate::model::{Project, TrackRole, json_string};
 use crate::prompt::{Action, EditPlan, MidiNote};
 
@@ -15,6 +15,7 @@ const STUDIO_CONTRACT: &str = include_str!("../codex/STUDIO.md");
 const CODEX_MODEL: &str = "gpt-5.6-sol";
 const CODEX_REASONING: &str = "model_reasoning_effort=\"high\"";
 const CODEX_TIMEOUT: Duration = Duration::from_secs(90);
+type Object = Map<String, JsonValue>;
 
 #[derive(Debug)]
 pub enum PlannerError {
@@ -221,9 +222,8 @@ fn read_stream(mut stream: impl Read) -> Result<Vec<u8>, PlannerError> {
 }
 
 pub(crate) fn plan_from_json(source: &str) -> Result<EditPlan, PlannerError> {
-    let value = JsonParser::new(source)
-        .parse()
-        .map_err(|error| invalid(&error.to_string()))?;
+    let value: JsonValue =
+        serde_json::from_str(source).map_err(|error| invalid(&error.to_string()))?;
     let object = value
         .as_object()
         .ok_or_else(|| invalid("top-level response must be an object"))?;
@@ -347,10 +347,7 @@ fn action_from_json(value: &JsonValue) -> Result<Action, PlannerError> {
     }
 }
 
-fn midi_notes_field(
-    object: &HashMap<String, JsonValue>,
-    loop_beats: f64,
-) -> Result<Vec<MidiNote>, PlannerError> {
+fn midi_notes_field(object: &Object, loop_beats: f64) -> Result<Vec<MidiNote>, PlannerError> {
     let events = object
         .get("events")
         .and_then(JsonValue::as_array)
@@ -489,25 +486,22 @@ fn sound_parameter_name(name: &str) -> Result<&'static str, PlannerError> {
     }
 }
 
-fn string_field<'a>(
-    object: &'a HashMap<String, JsonValue>,
-    name: &str,
-) -> Result<&'a str, PlannerError> {
+fn string_field<'a>(object: &'a Object, name: &str) -> Result<&'a str, PlannerError> {
     object
         .get(name)
-        .and_then(JsonValue::as_string)
+        .and_then(JsonValue::as_str)
         .ok_or_else(|| invalid(&format!("{name} must be a string")))
 }
 
-fn number_field(object: &HashMap<String, JsonValue>, name: &str) -> Result<f64, PlannerError> {
+fn number_field(object: &Object, name: &str) -> Result<f64, PlannerError> {
     object
         .get(name)
-        .and_then(JsonValue::as_number)
+        .and_then(JsonValue::as_f64)
         .filter(|number| number.is_finite())
         .ok_or_else(|| invalid(&format!("{name} must be a finite number")))
 }
 
-fn integer_field(object: &HashMap<String, JsonValue>, name: &str) -> Result<u64, PlannerError> {
+fn integer_field(object: &Object, name: &str) -> Result<u64, PlannerError> {
     let value = number_field(object, name)?;
     if value.fract() == 0.0 && (0.0..=9_007_199_254_740_991.0).contains(&value) {
         Ok(value as u64)
