@@ -48,6 +48,11 @@ The AI should first form a musical plan based on the user’s request, the selec
 and then produce the corresponding sound-graph changes. The system instructions should include concrete examples and
 concise guidance connecting musical concepts to the available sound tools.
 
+### Error logs
+
+The backend server logs errors and warnings to stderr. If the client code encounters an error it sends
+it to the backend server to be included in the logs.
+
 ### Vetoed Implementations
 
 The implementation MUST NOT hardcode niche sound tools such as a dubstep "drop" tool. All the tools should
@@ -65,4 +70,7 @@ The AI used should be the local Codex agent with the 5.6-Sol model on High reaso
 process that the user must complete.
 
 Since Codex is best at writing code and config files, the internal synth and other tools that DAW-AI uses should
-be represented a way that is friendly for Codex.
+be represented a way that is friendly for Codex:
+* The sound graph should be stored in a file on disk that Codex can edit directly
+* Additionally, tools should be provided that are registered with Codex and that make the
+  modifications to the sound graph and return useful error messages to Codex.
