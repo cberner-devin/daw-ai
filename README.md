@@ -20,7 +20,7 @@ codex login
 codex login status
 ```
 
-Codex also offers standalone installers; see the linked official CLI documentation when Node.js is not available. DAW-AI invokes `codex exec` in an ephemeral, read-only sandbox and validates its structured edit plan before changing the project.
+Codex also offers standalone installers; see the linked official CLI documentation when Node.js is not available. DAW-AI invokes `codex exec` with GPT-5.6 Sol at high reasoning in an ephemeral, read-only sandbox and validates its structured edit plan before changing the project.
 
 Start the studio on the charter's default port:
 
@@ -45,11 +45,11 @@ cargo run -- --port 8888
 ## Studio workflow
 
 1. Drag over any part of the arrangement to set the edit region. On touch devices, swipe to pan normally or tap **Select region** before dragging a selection.
-2. Enter a request such as `increase the volume`, `add a bass`, `make the chords warm and spacious`, or `insert a sick drop here`.
+2. Enter a request such as `increase the volume`, `add a bass`, `make the chords warm and spacious`, or `turn this section into a dubstep drop`.
 3. Press **Make change**, then use the transport to hear the result.
 4. Open **Advanced** to edit clip notes/drums, synth envelopes and waveforms, ordered effect chains, modulators, routing, levels, and mute states.
 
-Codex receives the selected range, current project JSON, and the checked-in synth contract under `codex/`. The JSON is a stable sound graph: clips own beat-relative events; instruments, effects, and modulators expose numeric parameters; and routing names the audio/control connections. Codex returns a schema-constrained plan covering arrangement, instrument, modulation, level, effect, tempo, tone, and rhythmic-density changes. Direct Advanced edits use the same graph and are undoable alongside prompted edits.
+Codex receives the selected range, current project JSON, and the checked-in synth contract under `codex/`. The JSON is a stable sound graph: MIDI clips own beat-relative notes; instruments, effects, and modulators expose numeric parameters; and routing publishes explicitly typed MIDI, audio, and control edges. Codex first states a musical plan, then returns schema-constrained graph operations that can write exact note timing, duration, pitch, and velocity as well as arrangement, instrument, modulation, level, effect, tempo, tone, and rhythmic-density changes. Direct Advanced edits use the same graph and are undoable alongside prompted edits.
 
 ## Development
 

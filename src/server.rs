@@ -163,7 +163,7 @@ impl Router {
         project: &crate::model::Project,
     ) -> Result<EditPlan, String> {
         match self.planner {
-            Planner::Demo => Ok(PromptEngine::interpret(prompt, project.bpm)),
+            Planner::Demo => Ok(PromptEngine::interpret_project(prompt, project)),
             Planner::Codex => CodexPlanner::interpret(prompt, start, end, project)
                 .map_err(|error| error.to_string()),
         }

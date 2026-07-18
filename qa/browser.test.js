@@ -797,6 +797,19 @@ async function run() {
       "Advanced must expose every sound tool and the demo clip events",
     );
     assert.deepEqual(
+      await evaluate(cdp, appSession, `fetch('/api/project')
+        .then((response) => response.json())
+        .then((project) => {
+        const chain = document.querySelector('.routing-chain');
+        return {
+          labels: [...chain.querySelectorAll('i b')].map((label) => label.textContent),
+          types: project.tracks[0].routing.edges.map((edge) => edge.type),
+        };
+      })`),
+      { labels: ["MIDI", "AUDIO", "AUDIO"], types: ["midi", "audio", "audio", "control"] },
+      "Advanced and project routing must expose compatible edge types",
+    );
+    assert.deepEqual(
       await evaluate(cdp, appSession, `[
         ...document.querySelectorAll(
           '[data-parameter="enabled"]:is([data-sound-tool="effect"], [data-sound-tool="modulator"])',
@@ -847,10 +860,10 @@ async function run() {
           "Move Glass Chords Room effect #311 later",
         ],
         firstEvent: [
-          "Pulse Kit Pocket beat clip #11 kick event #1101 beat",
-          "Pulse Kit Pocket beat clip #11 kick event #1101 length",
-          "Pulse Kit Pocket beat clip #11 kick event #1101 pitch",
-          "Pulse Kit Pocket beat clip #11 kick event #1101 velocity",
+          "Pulse Kit Pocket beat clip #11 note event #1101 beat",
+          "Pulse Kit Pocket beat clip #11 note event #1101 length",
+          "Pulse Kit Pocket beat clip #11 note event #1101 pitch",
+          "Pulse Kit Pocket beat clip #11 note event #1101 velocity",
         ],
       },
       "every repeated sound-tool control must have a unique contextual name",
@@ -2295,9 +2308,9 @@ async function run() {
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await waitFor(
       async () => evaluate(cdp, appSession, "!document.querySelector('#play-button').classList.contains('is-playing')"),
-      "pause before drop workflow",
+      "pause before genre composition workflow",
     );
-    const audioCloseCountBeforeDrop = await evaluate(cdp, appSession, "window.__audioCloseCount");
+    const audioCloseCountBeforeGenreEdit = await evaluate(cdp, appSession, "window.__audioCloseCount");
 
     await mouse(cdp, appSession, "mousePressed", lane.left, lane.y, 1);
     await mouse(cdp, appSession, "mouseMoved", lane.left + lane.width * (4 / 32), lane.y, 1);
@@ -2333,48 +2346,72 @@ async function run() {
         ),
       "sawtooth lead prompt undo",
     );
-    await submitPrompt(cdp, appSession, "add a lead", 1);
+    await submitPrompt(cdp, appSession, "turn this section into a dubstep drop", 1);
     await waitFor(
       async () => evaluate(cdp, appSession, "!document.querySelector('#compose-button').disabled"),
-      "lead before drop completion",
+      "first genre composition completion",
     );
-    const leadBeforeDrop = await evaluate(
-      cdp,
-      appSession,
-      "fetch('/api/project').then((response) => response.json()).then((project) => project.tracks.find((track) => track.role === 'lead'))",
+    const genreProject = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+    const genreActions = genreProject.edits[0].action.actions;
+    assert.deepEqual(
+      genreActions.map((action) => action.type),
+      ["midi-clip", "midi-clip", "instrument", "configure", "configure", "configure", "effect", "gain"],
+      "a genre request must be built from generic sound-graph operations",
+    );
+    assert.equal(genreProject.tracks.length, 3, "composing a dubstep section must not inject a canned lead track");
+    const genreDrums = genreProject.tracks.find((track) => track.role === "drums");
+    const genreBass = genreProject.tracks.find((track) => track.role === "bass");
+    const drumMidi = genreDrums.clips.find((clip) => clip.label === "Half-time drums");
+    const bassMidi = genreBass.clips.find((clip) => clip.label === "Syncopated bass");
+    assert.deepEqual(
+      [drumMidi.start, drumMidi.end, bassMidi.start, bassMidi.end],
+      [0, 4, 0, 4],
+      "the authored MIDI clips must cover the selected section",
+    );
+    assert.ok(
+      drumMidi.events.every((event) => event.type === "note") &&
+        drumMidi.events.some((event) => event.pitch === 36) &&
+        drumMidi.events.some((event) => event.pitch === 38) &&
+        drumMidi.events.some((event) => event.pitch === 41) &&
+        drumMidi.events.some((event) => event.pitch === 49),
+      "drums must be represented as explicit General MIDI notes",
     );
     assert.deepEqual(
-      leadBeforeDrop.clips.map((clip) => [clip.label, clip.start, clip.end]),
-      [["AI variation", 0, 4]],
-      "the regression must begin with lead material covering the drop region",
+      bassMidi.events.map((event) => event.pitch),
+      [29, 29, 32, 29, 27, 29, 36],
+      "the bass MIDI must contain the planned low syncopated phrase",
     );
-
-    await submitPrompt(cdp, appSession, "insert a sick drop here", 2);
-    await waitFor(
-      async () => evaluate(cdp, appSession, "!document.querySelector('#compose-button').disabled"),
-      "first drop completion",
-    );
-    const dropProject = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-    const dropLead = dropProject.tracks.find((track) => track.role === "lead");
-    assert.deepEqual(dropProject.edits[1].action, { type: "drop", value: 0.4, target: "all" });
+    const wobble = genreBass.modulators.at(-1);
     assert.deepEqual(
-      dropLead.clips.map((clip) => [clip.label, clip.start, clip.end]),
-      [["Drop hook", 1.6, 4]],
-      "the drop must replace overlapping lead material and begin its hook at impact",
+      [genreBass.instrument.waveform, wobble.shape, wobble.parameters.rate, wobble.parameters.depth, wobble.target],
+      ["sawtooth", "square", 2, 0.72, "instrument.tone"],
+      "the bass instrument and modulation must realize the sound-design portion of the plan",
     );
+    assert.equal(genreBass.modulators.length, 1, "genre composition must reuse the bass modulator");
 
-    await submitPrompt(cdp, appSession, "make the drop hit harder", 3);
+    await submitPrompt(cdp, appSession, "make the drop hit harder", 2);
     await waitFor(
       async () => evaluate(cdp, appSession, "!document.querySelector('#compose-button').disabled"),
-      "drop refinement completion",
+      "genre refinement completion",
     );
-    const refinedDrop = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-    assert.equal(refinedDrop.tracks.length, 4, "refining a drop must reuse its lead track");
+    const refinedGenre = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+    assert.equal(refinedGenre.tracks.length, 3, "refining a genre section must reuse the sound graph");
     assert.equal(
-      refinedDrop.tracks.find((track) => track.role === "lead").clips.length,
+      refinedGenre.tracks.find((track) => track.role === "bass").modulators.length,
       1,
-      "refining the same drop must not duplicate its hook",
+      "refining a genre section must not stack identical bass modulators",
     );
+    assert.equal(
+      refinedGenre.tracks
+        .find((track) => track.role === "bass")
+        .clips.filter((clip) => clip.label === "Syncopated bass").length,
+      1,
+      "refining the same section must replace, not duplicate, its bass MIDI",
+    );
+    const refinedBassOnsetId = refinedGenre.tracks
+      .find((track) => track.role === "bass")
+      .clips.find((clip) => clip.label === "Syncopated bass")
+      .events[0].id;
 
     await evaluate(cdp, appSession, `(() => {
       window.__gainNodes = [];
@@ -2385,99 +2422,30 @@ async function run() {
     })()`);
     await waitFor(
       async () => evaluate(cdp, appSession, "document.querySelector('#play-button').classList.contains('is-playing')"),
-      "drop playback",
-    );
-    assert.equal(
-      await evaluate(
-        cdp,
-        appSession,
-        `window.__oscillators.some((node) => node.dawAiTrackId === ${dropLead.id})`,
-      ),
-      false,
-      "the impact lead must remain silent during the build",
+      "generic MIDI composition playback",
     );
     await waitFor(
       async () =>
         evaluate(
           cdp,
           appSession,
-          "Number(document.querySelector('#current-time').textContent.split(':')[1]) >= 1.3",
+          `window.__oscillators.some(
+            (node) => node.dawAiTrackId === ${genreBass.id} && node.dawAiEventId === ${refinedBassOnsetId},
+          ) && window.__oscillators.some(
+            (node) => node.dawAiTrackId === ${genreDrums.id} && node.dawAiEventPitch === 36,
+          ) && window.__oscillators.some(
+            (node) => node.dawAiTrackId === ${genreDrums.id} && node.dawAiDrumType === "tom",
+          ) && window.__oscillators.some(
+            (node) => node.dawAiTrackId === ${genreDrums.id} && node.dawAiDrumType === "cymbal",
+          )`,
         ),
-      "drop pre-impact gap",
-    );
-    assert.equal(
-      await evaluate(
-        cdp,
-        appSession,
-        `window.__gainNodes
-          .filter((node) => node.dawAiAutomation === 'level' && [1, 2, 3].includes(node.dawAiTrackId))
-          .every((node) => node.gain.value === 0)`,
-      ),
-      true,
-      "the arrangement must cut to silence immediately before impact",
-    );
-    await waitFor(
-      async () =>
-        evaluate(
-          cdp,
-          appSession,
-          `window.__oscillators.some((node) => node.dawAiTrackId === ${dropLead.id})`,
-      ),
-      "drop impact lead",
-    );
-    await waitFor(
-      async () =>
-        evaluate(
-          cdp,
-          appSession,
-          `window.__gainNodes.find(
-            (node) => node.dawAiAutomation === 'level' && node.dawAiTrackId === 1,
-          ).gain.value > ${refinedDrop.tracks[0].volume * 1.1} &&
-          window.__gainNodes.find(
-            (node) => node.dawAiAutomation === 'level' && node.dawAiTrackId === 2,
-          ).gain.value > ${refinedDrop.tracks[1].volume * 1.1}`,
-        ),
-      "drop impact level lift",
-    );
-    const impactLevels = await evaluate(cdp, appSession, `({
-      drums: window.__gainNodes.find((node) => node.dawAiAutomation === 'level' && node.dawAiTrackId === 1).gain.value,
-      bass: window.__gainNodes.find((node) => node.dawAiAutomation === 'level' && node.dawAiTrackId === 2).gain.value,
-    })`);
-    assert.ok(impactLevels.drums > refinedDrop.tracks[0].volume * 1.1, "drop impact must lift the drums");
-    assert.ok(impactLevels.bass > refinedDrop.tracks[1].volume * 1.1, "drop impact must lift the bass");
-    await waitFor(
-      async () =>
-        evaluate(
-          cdp,
-          appSession,
-          "Number(document.querySelector('#current-time').textContent.split(':')[1]) >= 1.9",
-        ),
-      "drop impact one-shot window",
-    );
-    assert.equal(
-      await evaluate(
-        cdp,
-        appSession,
-        "window.__bufferSources.filter((source) => source.dawAiImpactCrash).length",
-      ),
-      1,
-      "a drop must schedule exactly one impact crash",
+      "authored bass and grouped General MIDI drum playback",
     );
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
     await waitFor(
-      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 2"),
-      "drop refinement undo",
-    );
-    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
-    await waitFor(
-      async () =>
-        evaluate(
-          cdp,
-          appSession,
-          "document.querySelectorAll('.edit-item').length === 1 && document.querySelectorAll('.track-row').length === 4",
-        ),
-      "drop creation undo",
+      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 1"),
+      "genre refinement undo",
     );
     await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
     await waitFor(
@@ -2487,9 +2455,9 @@ async function run() {
           appSession,
           "document.querySelectorAll('.edit-item').length === 0 && document.querySelectorAll('.track-row').length === 3",
         ),
-      "existing lead undo",
+      "genre composition undo",
     );
-    await evaluate(cdp, appSession, `window.__audioCloseCount = ${audioCloseCountBeforeDrop}`);
+    await evaluate(cdp, appSession, `window.__audioCloseCount = ${audioCloseCountBeforeGenreEdit}`);
 
     await mouse(cdp, appSession, "mousePressed", lane.left, lane.y, 1);
     await mouse(cdp, appSession, "mouseMoved", lane.left + lane.width * (4 / 32), lane.y, 1);
@@ -2498,7 +2466,7 @@ async function run() {
     await mouse(cdp, appSession, "mousePressed", lane.left + lane.width * (1 / 32), lane.y, 1);
     await mouse(cdp, appSession, "mouseMoved", lane.left + lane.width * (3 / 32), lane.y, 1);
     await mouse(cdp, appSession, "mouseReleased", lane.left + lane.width * (3 / 32), lane.y);
-    await submitPrompt(cdp, appSession, "insert a sick drop here", 2);
+    await submitPrompt(cdp, appSession, "rewrite the lead MIDI clip", 2);
     const splitClipProject = await evaluate(
       cdp,
       appSession,
@@ -2512,13 +2480,79 @@ async function run() {
       `inner region replacement must retain both clip sides (${JSON.stringify(splitLead.clips)})`,
     );
     const [splitLeft, splitRight] = retainedSplitClips;
-    const splitDropClip = splitLead.clips.find((clip) => clip.label === "Drop hook");
-    const precedingClipEvent = splitDropClip.events.find((event) => event.time === 2);
+    const replacementMidiClip = splitLead.clips.find((clip) => clip.label === "AI MIDI clip");
+    const precedingClipEvent = replacementMidiClip.events.find((event) => event.time === 3);
+    assert.equal(
+      splitRight.sourceStart,
+      splitLeft.sourceStart,
+      "both retained sides must share the original clip's source phase",
+    );
+    assert.equal(
+      replacementMidiClip.sourceStart,
+      replacementMidiClip.start,
+      "new MIDI material must begin a new source phase",
+    );
+    assert.ok(
+      splitRight.sourceStart < splitRight.start,
+      "the retained right side must keep a phase anchor before its visible start",
+    );
     assert.ok(
       splitLeft.id !== splitRight.id && splitLeft.events[0].id === splitRight.events[0].id,
       "region replacement must expose the duplicate event-ID focus scenario",
     );
     const splitEventId = splitRight.events[0].id;
+    const splitBeatDuration = 60 / splitClipProject.bpm;
+    const splitLoopDuration = splitRight.loopBeats * splitBeatDuration;
+    const expectedPhaseEvent = splitRight.events
+      .map((event) => {
+        const eventOffset = event.time * splitBeatDuration;
+        const cycle = Math.max(
+          0,
+          Math.ceil((splitRight.start - splitRight.sourceStart - eventOffset - 0.000001) / splitLoopDuration),
+        );
+        return {
+          event,
+          onset: splitRight.sourceStart + cycle * splitLoopDuration + eventOffset,
+        };
+      })
+      .filter((occurrence) => occurrence.onset >= splitRight.start - 0.000001 && occurrence.onset < splitRight.end)
+      .sort((left, right) => left.onset - right.onset)[0];
+    const rightEventIds = splitRight.events.map((event) => event.id);
+    const phaseStartSteps = Math.round(splitRight.start / 0.25);
+    await evaluate(cdp, appSession, `(() => {
+      const lane = document.querySelector('.track-lane');
+      lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true, cancelable: true }));
+      for (let index = 0; index < ${phaseStartSteps}; index += 1) {
+        lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
+      }
+      window.__oscillators = [];
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `window.__oscillators.some(
+            (node) => node.dawAiTrackId === ${splitLead.id} &&
+              ${JSON.stringify(rightEventIds)}.includes(node.dawAiEventId) && !node.dawAiChased,
+          )`,
+        ),
+      "retained right-side MIDI phase playback",
+    );
+    assert.equal(
+      await evaluate(
+        cdp,
+        appSession,
+        `window.__oscillators.find(
+          (node) => node.dawAiTrackId === ${splitLead.id} &&
+            ${JSON.stringify(rightEventIds)}.includes(node.dawAiEventId) && !node.dawAiChased,
+        ).dawAiEventId`,
+      ),
+      expectedPhaseEvent.event.id,
+      `the retained right side must continue with its source-phase onset at ${expectedPhaseEvent.onset}`,
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
     await waitFor(
       async () => evaluate(cdp, appSession, "document.querySelector('#advanced-drawer').classList.contains('is-open')"),
@@ -2556,7 +2590,7 @@ async function run() {
         control.dispatchEvent(new Event('change', { bubbles: true }));
       };
       update('shape', 'square');
-      update('rate', '0.75');
+      update('rate', '0.5');
       update('depth', '1');
       update('target', 'instrument.attack');
     })()`);
@@ -2564,7 +2598,7 @@ async function run() {
       const current = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
       const lead = current.tracks.find((track) => track.id === splitLead.id);
       const modulator = lead.modulators[0];
-      return modulator.shape === "square" && modulator.parameters.rate === 0.75 &&
+      return modulator.shape === "square" && modulator.parameters.rate === 0.5 &&
         modulator.parameters.depth === 1 && modulator.target === "instrument.attack";
     }, "split lead attack modulation configuration");
     await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
@@ -2598,16 +2632,16 @@ async function run() {
       return {
         attack: oscillator.dawAiInstrumentAttack,
         currentLevel: envelope.gain.dawAiSetValues[0].value,
-        peakLevel: Math.max(...envelope.gain.dawAiExponentialRamps.map((entry) => entry.value)),
+        tailLevel: envelope.gain.dawAiExponentialRamps.at(-1).value,
       };
     })()`);
     assert.ok(
-      crossClipAttack.attack > 0.5 && crossClipAttack.currentLevel < crossClipAttack.peakLevel * 0.9,
+      crossClipAttack.attack > 0.5 && crossClipAttack.currentLevel > crossClipAttack.tailLevel,
       `a cross-clip chase must retain onset-sampled attack state (${JSON.stringify(crossClipAttack)})`,
     );
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
-    await mouse(cdp, appSession, "mousePressed", lane.left + lane.width * (3.5 / 32), lane.y, 1);
-    await mouse(cdp, appSession, "mouseReleased", lane.left + lane.width * (3.5 / 32), lane.y);
+    await mouse(cdp, appSession, "mousePressed", lane.left + lane.width * (3.3 / 32), lane.y, 1);
+    await mouse(cdp, appSession, "mouseReleased", lane.left + lane.width * (3.3 / 32), lane.y);
     await evaluate(cdp, appSession, `(() => {
       window.__gainNodes = [];
       window.__oscillators = [];
@@ -2635,7 +2669,7 @@ async function run() {
       "a release tail from the preceding clip must remain sounding after resume",
     );
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
-    await evaluate(cdp, appSession, `window.__audioCloseCount = ${audioCloseCountBeforeDrop}`);
+    await evaluate(cdp, appSession, `window.__audioCloseCount = ${audioCloseCountBeforeGenreEdit}`);
     for (const [condition, label] of [
       ["modulator.target === 'instrument.pitch'", "split lead attack target undo"],
       ["modulator.parameters.depth === 0.08", "split lead modulation depth undo"],
@@ -2666,7 +2700,7 @@ async function run() {
     await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
     await waitFor(
       async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 1"),
-      "split drop undo",
+      "split MIDI replacement undo",
     );
     await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
     await waitFor(
@@ -2746,17 +2780,26 @@ async function run() {
       document.querySelector('#play-button').click();
     })()`);
     const chordGate = `window.__gainNodes.find((node) => node.dawAiAutomation === 'level' && node.dawAiTrackId === ${chordTrack.id})`;
-    await waitFor(
-      async () => evaluate(cdp, appSession, `Boolean(${chordGate}) && ${chordGate}.gain.value > 0.5`),
-      "audible chord channel gate",
+    const chordAudibleBeforeMute = await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `Boolean(${chordGate}) && ${chordGate}.gain.dawAiSetValues?.some((entry) => entry.value === 0)`,
+        ),
+      "scheduled chord channel mute",
     );
+    assert.ok(chordAudibleBeforeMute, "the regional mute must be scheduled on the chord channel");
+    const chordGateValues = await evaluate(
+      cdp,
+      appSession,
+      `${chordGate}.gain.dawAiSetValues.map((entry) => entry.value)`,
+    );
+    const firstMutedChordValue = chordGateValues.indexOf(0);
     assert.ok(
-      await evaluate(cdp, appSession, `${chordGate}.gain.value > 0.5`),
-      "the chord voice must be audible before the regional mute",
-    );
-    await waitFor(
-      async () => evaluate(cdp, appSession, `${chordGate}.gain.value === 0`),
-      "active chord voice to mute at the edit boundary",
+      chordGateValues.slice(0, firstMutedChordValue).some((value) => value > 0.5) &&
+        chordGateValues.slice(firstMutedChordValue + 1).some((value) => value > 0.5),
+      "the chord channel must be audible before and after the regional mute",
     );
     assert.equal(
       await evaluate(
@@ -2766,10 +2809,6 @@ async function run() {
       ),
       true,
       "the boundary gate must affect a chord voice that started before the edit",
-    );
-    await waitFor(
-      async () => evaluate(cdp, appSession, `${chordGate}.gain.value > 0.5`),
-      "chord channel to reopen after the edit boundary",
     );
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
@@ -3105,7 +3144,7 @@ async function run() {
     assert.equal(consoleErrors.length, 0, "application emitted browser console errors");
 
     console.log(
-      "Browser workflows passed: mobile layout/panning, keyboard selection, serialized transport, exact event/envelope playback, voice chase, structured drops, regional effects/filtering, short clips, targeted rhythm, complete modulation routing, advanced sound tools, prompt single-flight/undo, mixer focus/transport, modal, cross-origin guard",
+      "Browser workflows passed: mobile layout/panning, keyboard selection, serialized transport, exact event/envelope playback, voice chase, AI-authored MIDI composition, regional effects/filtering, short clips, targeted rhythm, complete modulation routing, advanced sound tools, prompt single-flight/undo, mixer focus/transport, modal, cross-origin guard",
     );
   } finally {
     if (attacker) await new Promise((resolve) => attacker.close(resolve));
