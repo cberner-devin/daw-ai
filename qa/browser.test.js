@@ -2355,7 +2355,7 @@ async function run() {
     const genreActions = genreProject.edits[0].action.actions;
     assert.deepEqual(
       genreActions.map((action) => action.type),
-      ["add-track", "midi-clip", "midi-clip", "instrument", "modulator", "effect", "gain"],
+      ["midi-clip", "add-track", "midi-clip", "midi-clip", "instrument", "modulator", "effect", "gain"],
       "a genre request must be built from generic sound-graph operations",
     );
     assert.equal(genreProject.tracks.length, 4, "regional sound design must use one dedicated generic bass track");
@@ -2403,6 +2403,12 @@ async function run() {
       "square",
       "regional sound design must not alter the original bass outside the selection",
     );
+    const originalBassRest = originalGenreBass.clips.find((clip) => clip.label === "Bass rest");
+    assert.deepEqual(
+      [originalBassRest.start, originalBassRest.end, originalBassRest.events.length],
+      [0, 4, 0],
+      "the dedicated drop bass must replace rather than layer over the original bass MIDI",
+    );
 
     await submitPrompt(cdp, appSession, "make the drop hit harder", 2);
     await waitFor(
@@ -2449,6 +2455,8 @@ async function run() {
           appSession,
           `window.__oscillators.some(
             (node) => node.dawAiTrackId === ${genreBass.id} && node.dawAiEventId === ${refinedBassOnsetId},
+          ) && !window.__oscillators.some(
+            (node) => node.dawAiTrackId === ${originalGenreBass.id}
           ) && window.__oscillators.some(
             (node) => node.dawAiTrackId === ${genreDrums.id} && node.dawAiEventPitch === 36,
           ) && window.__oscillators.some(

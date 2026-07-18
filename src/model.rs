@@ -986,7 +986,6 @@ impl Studio {
             || relative_end <= relative_start
             || !loop_beats.is_finite()
             || !(0.25..=16.0).contains(&loop_beats)
-            || notes.is_empty()
             || notes.len() > 32
             || notes.iter().any(|note| {
                 !note.time.is_finite()
@@ -1969,6 +1968,20 @@ mod tests {
         assert_eq!(
             original_bass.modulators[0].shape,
             original_bass_modulator.shape
+        );
+        let bass_rest = original_bass
+            .clips
+            .iter()
+            .find(|clip| clip.label == "Bass rest")
+            .expect("old bass is cleared in the drop region");
+        assert_eq!((bass_rest.start, bass_rest.end), (8.0, 16.0));
+        assert!(bass_rest.events.is_empty());
+        assert!(
+            original_bass
+                .clips
+                .iter()
+                .filter(|clip| clip.start < 16.0 && clip.end > 8.0)
+                .all(|clip| clip.events.is_empty())
         );
 
         let bass = studio

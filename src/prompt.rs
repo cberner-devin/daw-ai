@@ -414,6 +414,17 @@ fn electronic_drop_plan(context: Option<PromptContext<'_>>) -> EditPlan {
     let drop_bass = context.and_then(drop_bass_for_selection);
     let mut actions = Vec::new();
     if context.is_some() && drop_bass.is_none() {
+        if let Some(track_id) = context.and_then(latest_bass_track_id) {
+            actions.push(Action::MidiClip {
+                track_id,
+                target: TrackRole::Bass,
+                label: "Bass rest".to_owned(),
+                start: 0.0,
+                end: 1.0,
+                loop_beats: 4.0,
+                notes: Vec::new(),
+            });
+        }
         actions.push(Action::AddTrack {
             role: TrackRole::Bass,
         });
@@ -543,6 +554,16 @@ fn electronic_drop_plan(context: Option<PromptContext<'_>>) -> EditPlan {
         summary: "Recomposed the selection with half-time drums and syncopated modulated bass"
             .to_owned(),
     }
+}
+
+fn latest_bass_track_id(context: PromptContext<'_>) -> Option<u64> {
+    context
+        .project
+        .tracks
+        .iter()
+        .rev()
+        .find(|track| track.role == TrackRole::Bass)
+        .map(|track| track.id)
 }
 
 fn drop_bass_for_selection(context: PromptContext<'_>) -> Option<DropBass> {
