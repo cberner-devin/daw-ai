@@ -2366,6 +2366,11 @@ async function run() {
     const originalGenreBass = genreProject.tracks.find(
       (track) => track.role === "bass" && track.id !== genreBass.id,
     );
+    assert.deepEqual(
+      [genreActions[0].trackId, genreActions[2].trackId],
+      [originalGenreBass.id, genreDrums.id],
+      "drop MIDI edits must target role tracks with material in the selection",
+    );
     const drumMidi = genreDrums.clips.find((clip) => clip.label === "Half-time drums");
     const bassMidi = genreBass.clips.find((clip) => clip.label === "Syncopated bass");
     assert.deepEqual(

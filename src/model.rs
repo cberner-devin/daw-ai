@@ -2099,6 +2099,103 @@ mod tests {
     }
 
     #[test]
+    fn genre_plan_targets_role_tracks_with_material_in_the_selection() {
+        let mut studio = Studio::new();
+        let original_bass_id = studio.project().tracks[1].id;
+        let original_drums_id = studio.project().tracks[0].id;
+        studio
+            .apply_prompt(20.0, 24.0, "add a bass")
+            .expect("later bass part");
+        studio
+            .apply_prompt(20.0, 24.0, "add drums")
+            .expect("later drum part");
+        let later_bass_id = studio
+            .project()
+            .tracks
+            .iter()
+            .rfind(|track| track.role == TrackRole::Bass)
+            .expect("later bass")
+            .id;
+        let later_drums_id = studio
+            .project()
+            .tracks
+            .iter()
+            .rfind(|track| track.role == TrackRole::Drums)
+            .expect("later drums")
+            .id;
+
+        studio
+            .apply_prompt(8.0, 16.0, "insert a dubstep drop here")
+            .expect("drop over the original parts");
+
+        let track = |id| {
+            studio
+                .project()
+                .tracks
+                .iter()
+                .find(|track| track.id == id)
+                .expect("track by ID")
+        };
+        assert!(
+            track(original_bass_id)
+                .clips
+                .iter()
+                .any(|clip| clip.label == "Bass rest" && clip.events.is_empty())
+        );
+        assert!(
+            !track(later_bass_id)
+                .clips
+                .iter()
+                .any(|clip| clip.label == "Bass rest")
+        );
+        assert!(
+            track(original_drums_id)
+                .clips
+                .iter()
+                .any(|clip| clip.label == "Half-time drums")
+        );
+        assert!(
+            !track(later_drums_id)
+                .clips
+                .iter()
+                .any(|clip| clip.label == "Half-time drums")
+        );
+    }
+
+    #[test]
+    fn midi_removal_clears_instead_of_recomposing_the_selection() {
+        let mut studio = Studio::new();
+        let bass_id = studio.project().tracks[1].id;
+        let summary = studio
+            .apply_prompt(8.0, 16.0, "remove the bass MIDI clip")
+            .expect("clear bass MIDI");
+
+        assert!(summary.contains("Cleared"));
+        let bass = studio
+            .project()
+            .tracks
+            .iter()
+            .find(|track| track.id == bass_id)
+            .expect("original bass");
+        let rest = bass
+            .clips
+            .iter()
+            .find(|clip| clip.label == "AI MIDI rest")
+            .expect("silent replacement");
+        assert_eq!((rest.start, rest.end), (8.0, 16.0));
+        assert!(rest.events.is_empty());
+        assert!(matches!(
+            &studio.project().edits[0].action,
+            Action::MidiClip {
+                track_id,
+                target: TrackRole::Bass,
+                notes,
+                ..
+            } if *track_id == bass_id && notes.is_empty()
+        ));
+    }
+
+    #[test]
     fn midi_prompt_creates_a_missing_role_before_writing_notes() {
         let mut studio = Studio::new();
         studio
