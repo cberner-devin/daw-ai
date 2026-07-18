@@ -9,10 +9,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::model::{Project, TrackRole};
-use crate::prompt::{Action, EditPlan};
+use crate::prompt::{Action, EditPlan, MidiNote};
 
 const EDIT_SCHEMA: &str = include_str!("../codex/edit-plan.schema.json");
 const STUDIO_CONTRACT: &str = include_str!("../codex/STUDIO.md");
+const CODEX_MODEL: &str = "gpt-5.6-sol";
+const CODEX_REASONING: &str = "model_reasoning_effort=\"high\"";
 const CODEX_TIMEOUT: Duration = Duration::from_secs(90);
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -55,24 +57,15 @@ impl CodexPlanner {
         project: &Project,
     ) -> Result<EditPlan, PlannerError> {
         let schema = TempSchema::create()?;
-        let task = format!(
-            concat!(
-                "You are the planning engine inside DAW-AI. Do not edit files or run tools. ",
-                "Return only a synth edit matching the provided JSON schema.\n\n",
-                "{contract}\n\nCurrent project JSON:\n{project}\n\n",
-                "Selected region: {start:.3} to {end:.3} seconds.\n",
-                "User request: {prompt}\n"
-            ),
-            contract = STUDIO_CONTRACT,
-            project = project.to_json(),
-            start = start,
-            end = end,
-            prompt = prompt,
-        );
+        let task = planner_task(prompt, start, end, project);
         let current_directory = std::env::current_dir().map_err(PlannerError::Io)?;
         let mut child = Command::new("codex")
             .arg("exec")
             .arg("--ephemeral")
+            .arg("--model")
+            .arg(CODEX_MODEL)
+            .arg("--config")
+            .arg(CODEX_REASONING)
             .arg("--skip-git-repo-check")
             .arg("--sandbox")
             .arg("read-only")
@@ -82,8 +75,7 @@ impl CodexPlanner {
             .arg("never")
             .arg("--cd")
             .arg(current_directory)
-            .arg(task)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -95,6 +87,9 @@ impl CodexPlanner {
                 }
             })?;
 
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let stdin_writer =
+            thread::spawn(move || stdin.write_all(task.as_bytes()).map_err(PlannerError::Io));
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let stdout_reader = thread::spawn(move || read_stream(stdout));
@@ -107,6 +102,7 @@ impl CodexPlanner {
             if started.elapsed() >= CODEX_TIMEOUT {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = stdin_writer.join();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 return Err(PlannerError::TimedOut);
@@ -119,13 +115,34 @@ impl CodexPlanner {
         let _stderr = stderr_reader
             .join()
             .map_err(|_| PlannerError::InvalidOutput("stderr reader stopped".to_owned()))??;
+        let stdin_result = stdin_writer
+            .join()
+            .map_err(|_| PlannerError::InvalidOutput("stdin writer stopped".to_owned()))?;
         if !status.success() {
             return Err(PlannerError::Failed);
         }
+        stdin_result?;
         let output = String::from_utf8(output)
             .map_err(|_| PlannerError::InvalidOutput("response was not UTF-8".to_owned()))?;
         plan_from_json(&output)
     }
+}
+
+fn planner_task(prompt: &str, start: f32, end: f32, project: &Project) -> String {
+    format!(
+        concat!(
+            "You are the planning engine inside DAW-AI. Do not edit files or run tools. ",
+            "Return only a synth edit matching the provided JSON schema.\n\n",
+            "{contract}\n\nCurrent project JSON:\n{project}\n\n",
+            "Selected region: {start:.3} to {end:.3} seconds.\n",
+            "User request: {prompt}\n"
+        ),
+        contract = STUDIO_CONTRACT,
+        project = project.planner_json(),
+        start = start,
+        end = end,
+        prompt = prompt,
+    )
 }
 
 fn read_stream(mut stream: impl Read) -> Result<Vec<u8>, PlannerError> {
@@ -192,12 +209,16 @@ fn plan_from_json(source: &str) -> Result<EditPlan, PlannerError> {
     if summary.is_empty() || summary.chars().count() > 160 {
         return Err(invalid("summary length is invalid"));
     }
+    let musical_plan = string_field(object, "musicalPlan")?.trim();
+    if musical_plan.is_empty() || musical_plan.chars().count() > 300 {
+        return Err(invalid("musical plan length is invalid"));
+    }
     let actions = object
         .get("actions")
         .and_then(JsonValue::as_array)
         .ok_or_else(|| invalid("actions must be an array"))?;
-    if actions.is_empty() || actions.len() > 4 {
-        return Err(invalid("one to four actions are required"));
+    if actions.is_empty() || actions.len() > 8 {
+        return Err(invalid("one to eight actions are required"));
     }
     let mut parsed = actions
         .iter()
@@ -226,9 +247,30 @@ fn action_from_json(value: &JsonValue) -> Result<Action, PlannerError> {
             target,
         }),
         "mute" => Ok(Action::Mute { target }),
-        "drop" if target.is_none() && (0.25..=0.6).contains(&value) => Ok(Action::Drop {
-            build: value as f32,
-        }),
+        "midi-clip" if name == "MIDI Clip" => {
+            let target = target.ok_or_else(|| invalid("midi-clip requires a role target"))?;
+            let label = string_field(object, "setting")?.trim();
+            let start = number_field(object, "start")?;
+            let end = number_field(object, "end")?;
+            if label.is_empty()
+                || label.chars().count() > 64
+                || !(0.0..1.0).contains(&start)
+                || !(0.0..=1.0).contains(&end)
+                || end <= start
+                || !(0.25..=16.0).contains(&value)
+            {
+                return Err(invalid("midi-clip fields are invalid"));
+            }
+            Ok(Action::MidiClip {
+                track_id: integer_field(object, "trackId")?,
+                target,
+                label: label.to_owned(),
+                start: start as f32,
+                end: end as f32,
+                loop_beats: value as f32,
+                notes: midi_notes_field(object, value)?,
+            })
+        }
         "add-track" => target
             .map(|role| Action::AddTrack { role })
             .ok_or_else(|| invalid("add-track requires a role target")),
@@ -238,6 +280,8 @@ fn action_from_json(value: &JsonValue) -> Result<Action, PlannerError> {
         }),
         "modulator" if (0.0..=1.0).contains(&value) => Ok(Action::Modulator {
             parameter: modulator_parameter(name)?,
+            shape: modulator_shape(string_field(object, "setting")?)?,
+            rate: modulator_rate(number_field(object, "rate")?)?,
             depth: value as f32,
             target: target.ok_or_else(|| invalid("modulator requires a role target"))?,
         }),
@@ -279,6 +323,44 @@ fn action_from_json(value: &JsonValue) -> Result<Action, PlannerError> {
         }
         _ => Err(invalid("action fields are inconsistent or out of range")),
     }
+}
+
+fn midi_notes_field(
+    object: &HashMap<String, JsonValue>,
+    loop_beats: f64,
+) -> Result<Vec<MidiNote>, PlannerError> {
+    let events = object
+        .get("events")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| invalid("midi-clip events must be an array"))?;
+    if events.is_empty() || events.len() > 32 {
+        return Err(invalid("midi-clip requires one to 32 notes"));
+    }
+    events
+        .iter()
+        .map(|event| {
+            let event = event
+                .as_object()
+                .ok_or_else(|| invalid("each MIDI note must be an object"))?;
+            let time = number_field(event, "time")?;
+            let duration = number_field(event, "duration")?;
+            let pitch = integer_field(event, "pitch")?;
+            let velocity = number_field(event, "velocity")?;
+            if !(0.0..loop_beats).contains(&time)
+                || !(0.0625..=loop_beats).contains(&duration)
+                || pitch > 127
+                || !(0.01..=1.0).contains(&velocity)
+            {
+                return Err(invalid("MIDI note fields are out of range"));
+            }
+            Ok(MidiNote {
+                time: time as f32,
+                duration: duration as f32,
+                pitch: pitch as u8,
+                velocity: velocity as f32,
+            })
+        })
+        .collect()
 }
 
 fn role_from_name(name: &str) -> Result<Option<TrackRole>, PlannerError> {
@@ -323,6 +405,25 @@ fn modulator_parameter(name: &str) -> Result<String, PlannerError> {
         | "track.volume" => Ok(name.to_owned()),
         _ if effect_modulation_target(name).is_some() => Ok(name.to_owned()),
         _ => Err(invalid("unknown modulation target")),
+    }
+}
+
+fn modulator_shape(name: &str) -> Result<&'static str, PlannerError> {
+    match name {
+        "sine" => Ok("sine"),
+        "triangle" => Ok("triangle"),
+        "square" => Ok("square"),
+        "random" => Ok("random"),
+        "envelope" => Ok("envelope"),
+        _ => Err(invalid("unknown modulator shape")),
+    }
+}
+
+fn modulator_rate(value: f64) -> Result<f32, PlannerError> {
+    if (0.01..=20.0).contains(&value) {
+        Ok(value as f32)
+    } else {
+        Err(invalid("modulator rate is out of range"))
     }
 }
 
@@ -687,6 +788,7 @@ mod tests {
         let plan = plan_from_json(
             r#"{
                 "summary":"Warmed the chords and added space",
+                "musicalPlan":"Darken the chord timbre and add a long ambient tail.",
                 "actions":[
                     {"kind":"filter","target":"chords","name":"None","value":-0.3},
                     {"kind":"effect","target":"chords","name":"Reverb","value":0.42}
@@ -713,30 +815,60 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_drop_build_fraction() {
+    fn parses_an_explicit_midi_clip() {
         let plan = plan_from_json(
             r#"{
-                "summary":"Built tension and landed a heavy drop",
-                "actions":[
-                    {"kind":"drop","target":"all","name":"None","value":0.4}
-                ]
+                "summary":"Wrote a syncopated bass phrase",
+                "musicalPlan":"Replace the selected bass with a low, syncopated two-beat MIDI loop.",
+                "actions":[{
+                    "kind":"midi-clip","target":"bass","name":"MIDI Clip","value":2,
+                    "trackId":2,"tool":"None","toolId":0,"clipId":0,"parameter":"None",
+                    "setting":"Syncopated bass","start":0,"end":1,"rate":0,
+                    "events":[
+                        {"time":0,"duration":0.5,"pitch":29,"velocity":1},
+                        {"time":1.25,"duration":0.5,"pitch":32,"velocity":0.85}
+                    ]
+                }]
             }"#,
         )
-        .expect("valid drop plan");
-        assert_eq!(plan.action, Action::Drop { build: 0.4 });
+        .expect("valid MIDI clip plan");
+        let Action::MidiClip {
+            track_id,
+            target,
+            loop_beats,
+            notes,
+            ..
+        } = plan.action
+        else {
+            panic!("expected MIDI clip");
+        };
+        assert_eq!(track_id, 2);
+        assert_eq!(target, TrackRole::Bass);
+        assert_eq!(loop_beats, 2.0);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[1].pitch, 32);
+    }
 
-        for value in [0.0, 0.8] {
-            let invalid = format!(
-                r#"{{"summary":"Bad drop","actions":[{{"kind":"drop","target":"all","name":"None","value":{value}}}]}}"#
-            );
-            assert!(plan_from_json(&invalid).is_err());
-        }
+    #[test]
+    fn rejects_midi_note_duration_longer_than_its_loop() {
+        let invalid = r#"{
+            "summary":"Wrote a short bass loop",
+            "musicalPlan":"Replace the selection with a quarter-beat bass loop.",
+            "actions":[{
+                "kind":"midi-clip","target":"bass","name":"MIDI Clip","value":0.25,
+                "trackId":2,"tool":"None","toolId":0,"clipId":0,"parameter":"None",
+                "setting":"Short bass loop","start":0,"end":1,"rate":0,
+                "events":[{"time":0,"duration":16,"pitch":29,"velocity":1}]
+            }]
+        }"#;
+        assert!(plan_from_json(invalid).is_err());
     }
 
     #[test]
     fn rejects_invalid_structured_edits() {
         let invalid = r#"{
             "summary":"Unsafe tempo",
+            "musicalPlan":"Raise the tempo beyond the supported range.",
             "actions":[{"kind":"tempo","target":"all","name":"None","value":999}]
         }"#;
         assert!(plan_from_json(invalid).is_err());
@@ -747,9 +879,10 @@ mod tests {
         let plan = plan_from_json(
             r#"{
                 "summary":"Changed the bass source and added movement",
+                "musicalPlan":"Use a bright bass oscillator and square-wave tone modulation.",
                 "actions":[
                     {"kind":"instrument","target":"bass","name":"sawtooth","value":0},
-                    {"kind":"modulator","target":"bass","name":"instrument.tone","value":0.25}
+                    {"kind":"modulator","target":"bass","name":"instrument.tone","value":0.25,"setting":"square","rate":2}
                 ]
             }"#,
         )
@@ -764,6 +897,8 @@ mod tests {
                     },
                     Action::Modulator {
                         parameter: "instrument.tone".to_owned(),
+                        shape: "square",
+                        rate: 2.0,
                         depth: 0.25,
                         target: TrackRole::Bass,
                     },
@@ -777,9 +912,10 @@ mod tests {
         let plan = plan_from_json(
             r#"{
                 "summary":"Route movement to the bass filter mix",
+                "musicalPlan":"Add slow sine movement to the existing bass filter mix.",
                 "actions":[{
                     "kind":"modulator","target":"bass","name":"effect:210.mix","value":0.25,
-                    "trackId":0,"tool":"None","toolId":0,"clipId":0,"parameter":"None","setting":""
+                    "trackId":0,"tool":"None","toolId":0,"clipId":0,"parameter":"None","setting":"sine","rate":0.5
                 }]
             }"#,
         )
@@ -788,6 +924,8 @@ mod tests {
             plan.action,
             Action::Modulator {
                 parameter: "effect:210.mix".to_owned(),
+                shape: "sine",
+                rate: 0.5,
                 depth: 0.25,
                 target: TrackRole::Bass,
             }
@@ -799,6 +937,7 @@ mod tests {
         let plan = plan_from_json(
             r#"{
                 "summary":"Shortened the selected bass event",
+                "musicalPlan":"Tighten the first bass note while preserving its pitch and velocity.",
                 "actions":[{
                     "kind":"configure","target":"bass","name":"None","value":0,
                     "trackId":2,"tool":"event","toolId":1201,"clipId":12,
@@ -825,6 +964,7 @@ mod tests {
     fn decodes_json_surrogate_pairs_and_rejects_unpaired_surrogates() {
         let valid = r#"{
             "summary":"Added sparkle \uD83C\uDFB6",
+            "musicalPlan":"Open the chord tone slightly.",
             "actions":[{"kind":"filter","target":"chords","name":"None","value":0.2}]
         }"#;
         assert_eq!(
@@ -834,7 +974,7 @@ mod tests {
 
         for summary in [r#""Bad \uD83C text""#, r#""Bad \uDFB6 text""#] {
             let invalid = format!(
-                r#"{{"summary":{summary},"actions":[{{"kind":"filter","target":"chords","name":"None","value":0.2}}]}}"#
+                r#"{{"summary":{summary},"musicalPlan":"Open the chord tone slightly.","actions":[{{"kind":"filter","target":"chords","name":"None","value":0.2}}]}}"#
             );
             assert!(plan_from_json(&invalid).is_err());
         }

@@ -1,4 +1,12 @@
-use crate::model::TrackRole;
+use crate::model::{Project, TrackRole};
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MidiNote {
+    pub time: f32,
+    pub duration: f32,
+    pub pitch: u8,
+    pub velocity: f32,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
@@ -12,8 +20,14 @@ pub enum Action {
     Mute {
         target: Option<TrackRole>,
     },
-    Drop {
-        build: f32,
+    MidiClip {
+        track_id: u64,
+        target: TrackRole,
+        label: String,
+        start: f32,
+        end: f32,
+        loop_beats: f32,
+        notes: Vec<MidiNote>,
     },
     AddTrack {
         role: TrackRole,
@@ -24,6 +38,8 @@ pub enum Action {
     },
     Modulator {
         parameter: String,
+        shape: &'static str,
+        rate: f32,
         depth: f32,
         target: TrackRole,
     },
@@ -69,6 +85,31 @@ pub struct PromptEngine;
 impl PromptEngine {
     #[must_use]
     pub fn interpret(prompt: &str, current_bpm: u16) -> EditPlan {
+        Self::interpret_with_context(prompt, current_bpm, None)
+    }
+
+    #[must_use]
+    pub fn interpret_project(prompt: &str, project: &Project) -> EditPlan {
+        let bass_modulator = project
+            .tracks
+            .iter()
+            .rev()
+            .find(|track| track.role == TrackRole::Bass)
+            .and_then(|track| {
+                track
+                    .modulators
+                    .iter()
+                    .find(|modulator| modulator.target == "instrument.tone")
+                    .map(|modulator| (track.id, modulator.id))
+            });
+        Self::interpret_with_context(prompt, project.bpm, bass_modulator)
+    }
+
+    fn interpret_with_context(
+        prompt: &str,
+        current_bpm: u16,
+        bass_modulator: Option<(u64, u64)>,
+    ) -> EditPlan {
         let normalized = prompt.trim().to_lowercase();
         let target = detect_role(&normalized);
         let target_name = target.map_or("the mix", TrackRole::display_name);
@@ -87,12 +128,23 @@ impl PromptEngine {
         );
         let wants_addition = contains_any(&normalized, &["add", "insert", "bring in"]);
 
-        if contains_any(&normalized, &["drop"]) {
-            return EditPlan {
-                action: Action::Drop { build: 0.4 },
-                summary: "Built a high-energy drop with a lead, denser drums, and bass movement"
-                    .to_owned(),
-            };
+        if contains_any(&normalized, &["drop", "dubstep"]) {
+            return electronic_drop_plan(bass_modulator);
+        }
+
+        if contains_any(
+            &normalized,
+            &["midi clip", "rewrite the notes", "recompose the notes"],
+        ) {
+            if let Some(target) = target {
+                return EditPlan {
+                    action: midi_clip_for_role(target, "AI MIDI clip", 0.0, 1.0),
+                    summary: format!(
+                        "Recomposed the {} as an explicit MIDI clip",
+                        target.display_name()
+                    ),
+                };
+            }
         }
 
         if contains_any(
@@ -110,6 +162,12 @@ impl PromptEngine {
                 return EditPlan {
                     action: Action::Modulator {
                         parameter: parameter.to_owned(),
+                        shape: "sine",
+                        rate: if parameter == "instrument.pitch" {
+                            5.0
+                        } else {
+                            0.5
+                        },
                         depth: 0.2,
                         target,
                     },
@@ -319,6 +377,164 @@ impl PromptEngine {
     }
 }
 
+fn electronic_drop_plan(bass_modulator: Option<(u64, u64)>) -> EditPlan {
+    let mut actions = vec![
+        Action::MidiClip {
+            track_id: 0,
+            target: TrackRole::Drums,
+            label: "Half-time drums".to_owned(),
+            start: 0.0,
+            end: 1.0,
+            loop_beats: 4.0,
+            notes: midi_notes(&[
+                (0.0, 0.25, 36, 1.0),
+                (0.0, 0.25, 41, 0.58),
+                (0.0, 0.5, 49, 0.72),
+                (0.0, 0.125, 42, 0.55),
+                (0.5, 0.125, 42, 0.48),
+                (1.0, 0.125, 42, 0.58),
+                (1.5, 0.125, 42, 0.5),
+                (2.0, 0.25, 38, 0.95),
+                (2.0, 0.125, 42, 0.62),
+                (2.5, 0.125, 42, 0.5),
+                (3.0, 0.25, 36, 0.88),
+                (3.0, 0.125, 42, 0.6),
+                (3.5, 0.125, 42, 0.52),
+                (3.75, 0.125, 42, 0.46),
+            ]),
+        },
+        Action::MidiClip {
+            track_id: 0,
+            target: TrackRole::Bass,
+            label: "Syncopated bass".to_owned(),
+            start: 0.0,
+            end: 1.0,
+            loop_beats: 4.0,
+            notes: midi_notes(&[
+                (0.0, 0.75, 29, 1.0),
+                (0.75, 0.25, 29, 0.82),
+                (1.25, 0.5, 32, 0.9),
+                (2.0, 0.25, 29, 0.96),
+                (2.5, 0.5, 27, 0.88),
+                (3.25, 0.25, 29, 0.92),
+                (3.75, 0.25, 36, 0.8),
+            ]),
+        },
+        Action::Instrument {
+            waveform: "sawtooth",
+            target: TrackRole::Bass,
+        },
+    ];
+    if let Some((track_id, tool_id)) = bass_modulator {
+        actions.extend([
+            Action::Configure {
+                track_id,
+                target: TrackRole::Bass,
+                tool: "modulator",
+                tool_id,
+                clip_id: None,
+                parameter: "shape",
+                value: "square".to_owned(),
+            },
+            Action::Configure {
+                track_id,
+                target: TrackRole::Bass,
+                tool: "modulator",
+                tool_id,
+                clip_id: None,
+                parameter: "rate",
+                value: "2".to_owned(),
+            },
+            Action::Configure {
+                track_id,
+                target: TrackRole::Bass,
+                tool: "modulator",
+                tool_id,
+                clip_id: None,
+                parameter: "depth",
+                value: "0.72".to_owned(),
+            },
+        ]);
+    } else {
+        actions.push(Action::Modulator {
+            parameter: "instrument.tone".to_owned(),
+            shape: "square",
+            rate: 2.0,
+            depth: 0.72,
+            target: TrackRole::Bass,
+        });
+    }
+    actions.extend([
+        Action::Effect {
+            name: "Punch compressor",
+            mix: 0.68,
+            target: Some(TrackRole::Bass),
+        },
+        Action::Gain {
+            amount: 0.58,
+            target: Some(TrackRole::Chords),
+        },
+    ]);
+    EditPlan {
+        action: Action::Compound { actions },
+        summary: "Recomposed the selection with half-time drums and syncopated modulated bass"
+            .to_owned(),
+    }
+}
+
+fn midi_clip_for_role(role: TrackRole, label: &str, start: f32, end: f32) -> Action {
+    let notes = match role {
+        TrackRole::Drums => midi_notes(&[
+            (0.0, 0.25, 36, 0.92),
+            (1.0, 0.25, 38, 0.78),
+            (2.0, 0.25, 36, 0.88),
+            (3.0, 0.25, 38, 0.78),
+        ]),
+        TrackRole::Bass => midi_notes(&[
+            (0.0, 0.7, 33, 0.82),
+            (1.0, 0.7, 33, 0.72),
+            (2.0, 0.7, 36, 0.78),
+            (3.0, 0.7, 31, 0.74),
+        ]),
+        TrackRole::Chords => midi_notes(&[
+            (0.0, 1.85, 57, 0.62),
+            (0.0, 1.85, 60, 0.56),
+            (0.0, 1.85, 64, 0.54),
+            (2.0, 1.85, 53, 0.6),
+            (2.0, 1.85, 57, 0.54),
+            (2.0, 1.85, 60, 0.52),
+        ]),
+        TrackRole::Lead => midi_notes(&[
+            (0.0, 0.75, 69, 0.72),
+            (1.0, 0.75, 76, 0.75),
+            (2.0, 0.75, 71, 0.72),
+            (3.0, 0.75, 67, 0.66),
+        ]),
+        TrackRole::Texture => midi_notes(&[(0.0, 3.8, 64, 0.5), (0.0, 3.4, 71, 0.38)]),
+    };
+    Action::MidiClip {
+        track_id: 0,
+        target: role,
+        label: label.to_owned(),
+        start,
+        end,
+        loop_beats: 4.0,
+        notes,
+    }
+}
+
+fn midi_notes(specs: &[(f32, f32, u8, f32)]) -> Vec<MidiNote> {
+    specs
+        .iter()
+        .map(|(time, duration, pitch, velocity)| MidiNote {
+            time: *time,
+            duration: *duration,
+            pitch: *pitch,
+            velocity: *velocity,
+        })
+        .collect()
+}
+
 fn detect_role(prompt: &str) -> Option<TrackRole> {
     if contains_any(
         prompt,
@@ -466,8 +682,24 @@ mod tests {
             }
         );
 
-        let drop = PromptEngine::interpret("insert a sick drop here", 112);
-        assert_eq!(drop.action, Action::Drop { build: 0.4 });
+        let drop = PromptEngine::interpret("insert a dubstep drop here", 112);
+        let Action::Compound { actions } = drop.action else {
+            panic!("a genre request should be composed from generic actions");
+        };
+        assert!(matches!(
+            &actions[0],
+            Action::MidiClip {
+                target: TrackRole::Drums,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &actions[1],
+            Action::MidiClip {
+                target: TrackRole::Bass,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -647,6 +879,8 @@ mod tests {
             PromptEngine::interpret("add vibrato modulation to the lead", 112).action,
             Action::Modulator {
                 parameter: "instrument.pitch".to_owned(),
+                shape: "sine",
+                rate: 5.0,
                 depth: 0.2,
                 target: TrackRole::Lead,
             }
@@ -655,6 +889,8 @@ mod tests {
             PromptEngine::interpret("add a sawtooth LFO to the bass", 112).action,
             Action::Modulator {
                 parameter: "instrument.tone".to_owned(),
+                shape: "sine",
+                rate: 0.5,
                 depth: 0.2,
                 target: TrackRole::Bass,
             }

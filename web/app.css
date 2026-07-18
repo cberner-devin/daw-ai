@@ -1282,8 +1282,17 @@ input[type="range"]::-moz-range-thumb {
 }
 
 .routing-chain i {
+  display: grid;
+  justify-items: center;
+  gap: 1px;
   color: var(--track-color);
   font-style: normal;
+}
+
+.routing-chain i b {
+  font-size: 6px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
 }
 
 .effect-stack {

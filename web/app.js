@@ -64,7 +64,6 @@
       this.reverbImpulse = null;
       this.trackGraphs = new Map();
       this.activeSources = new Set();
-      this.triggeredDropImpacts = new Set();
     }
 
     get isPlaying() {
@@ -109,7 +108,6 @@
       if (this.playhead >= state.project.duration - 0.01) this.playhead = 0;
 
       this.createTrackGraphs();
-      this.triggeredDropImpacts.clear();
       this.playbackState = "playing";
       this.contextStartedAt = this.context.currentTime;
       this.projectStartedAt = this.playhead;
@@ -305,13 +303,6 @@
         for (const edit of state.project.edits) {
           if (edit.start >= this.projectStartedAt) boundaries.add(edit.start);
           if (edit.end >= this.projectStartedAt) boundaries.add(edit.end);
-          const dropAction = this.findDropAction(edit.action);
-          if (dropAction) {
-            const timing = this.dropTiming(dropAction, edit);
-            for (const boundary of [timing.midpoint, timing.gapStart, timing.impact]) {
-              if (boundary >= this.projectStartedAt) boundaries.add(boundary);
-            }
-          }
         }
         for (const clip of track.clips) {
           if (clip.start >= this.projectStartedAt) boundaries.add(clip.start);
@@ -386,7 +377,6 @@
         },
         chorus: 0,
         compression: 0,
-        drop: null,
       };
       for (const effect of track.effects) {
         if (!effect.enabled) continue;
@@ -398,9 +388,6 @@
         if (time >= edit.start && time < edit.end) {
           this.applyAutomationAction(edit.action, track.role, automation, edit, time);
         }
-      }
-      if (automation.drop) {
-        this.applyDropAutomation(automation.drop.action, track.role, automation, automation.drop.edit, time);
       }
       return automation;
     }
@@ -460,59 +447,6 @@
       }
       if (action.type === "effect") this.applyEffect(action.name, action.value, automation);
       if (action.type === "remove-effect") this.removeEffect(action.name, automation);
-      if (action.type === "drop") automation.drop = { action, edit };
-    }
-
-    findDropAction(action) {
-      if (action.type === "drop") return action;
-      if (action.type !== "compound") return null;
-      for (const child of action.actions) {
-        const drop = this.findDropAction(child);
-        if (drop) return drop;
-      }
-      return null;
-    }
-
-    dropTiming(action, edit) {
-      const buildFraction = clamp(Number(action.value ?? 0.4), 0.25, 0.6);
-      const impact = edit.start + (edit.end - edit.start) * buildFraction;
-      const gapDuration = Math.min(60 / state.project.bpm, (impact - edit.start) * 0.25);
-      const gapStart = impact - gapDuration;
-      const midpoint = edit.start + (gapStart - edit.start) * 0.55;
-      return { buildFraction, gapStart, impact, midpoint };
-    }
-
-    applyDropAutomation(action, role, automation, edit, time) {
-      const timing = this.dropTiming(action, edit);
-      if (time < timing.impact) {
-        if (time >= timing.gapStart) {
-          automation.gain = 0;
-          return;
-        }
-        const progress = clamp((time - edit.start) / Math.max(0.01, timing.gapStart - edit.start), 0, 1);
-        if (role === "drums") {
-          automation.gain *= 0.9 + progress * 0.08;
-          automation.compression = Math.max(automation.compression, 0.28);
-        } else {
-          automation.gain *= 0.74 - progress * 0.24;
-          automation.filter += 0.08 + progress * 0.28;
-        }
-        return;
-      }
-
-      const impactGain = {
-        drums: 1.22,
-        bass: 1.18,
-        chords: 0.78,
-        lead: 1.16,
-        texture: 0.86,
-      }[role];
-      automation.gain *= impactGain;
-      if (role === "bass" || role === "lead") automation.filter += 0.35;
-      if (role === "drums" || role === "bass") {
-        automation.compression = Math.max(automation.compression, 0.68);
-      }
-      if (role === "lead") automation.echo = Math.max(automation.echo, 0.3);
     }
 
     applyEffect(name, mix, automation) {
@@ -668,23 +602,6 @@
             );
           }
         }
-        if (track.role !== "drums") continue;
-        for (const edit of state.project.edits) {
-          const dropAction = this.findDropAction(edit.action);
-          if (!dropAction) continue;
-          const impact = this.dropTiming(dropAction, edit).impact;
-          const impactKey = `${track.id}:${impact.toFixed(6)}`;
-          if (this.triggeredDropImpacts.has(impactKey)) continue;
-          const clipActive = track.clips.some((clip) => impact >= clip.start && impact < clip.end);
-          if (clipActive && impact >= windowStart && impact < windowEnd) {
-            this.triggeredDropImpacts.add(impactKey);
-            const audioTime = Math.max(
-              this.context.currentTime + 0.005,
-              this.contextStartedAt + impact - this.projectStartedAt,
-            );
-            this.crash(audioTime, 0.18, track.id);
-          }
-        }
       }
     }
 
@@ -721,12 +638,13 @@
 
       const beatDuration = 60 / state.project.bpm;
       const loopDuration = clip.loopBeats * beatDuration;
-      const firstCycle = Math.max(0, Math.floor((windowStart - clip.start) / loopDuration) - 1);
-      const lastCycle = Math.max(0, Math.floor((windowEnd - clip.start) / loopDuration));
+      const sourceStart = clip.sourceStart ?? clip.start;
+      const firstCycle = Math.max(0, Math.floor((windowStart - sourceStart) / loopDuration) - 1);
+      const lastCycle = Math.max(0, Math.floor((windowEnd - sourceStart) / loopDuration));
       const occurrences = [];
       for (let cycle = firstCycle; cycle <= lastCycle; cycle += 1) {
         for (const candidate of pattern) {
-          const time = clip.start + cycle * loopDuration + candidate.event.time * beatDuration;
+          const time = sourceStart + cycle * loopDuration + candidate.event.time * beatDuration;
           if (time < clip.start || time >= clip.end) continue;
           if (time < windowStart - 0.000001 || time >= windowEnd - 0.000001) continue;
           const modifiers = this.modifiers(track, time);
@@ -745,8 +663,11 @@
     scheduleClipEvent(event, track, time, elapsed, projectTime, onsetTime = projectTime) {
       const velocity = clamp(event.velocity, 0.01, 1);
       const instrument = this.instrumentParametersAt(track, onsetTime);
-      if (event.type !== "note") {
-        this.drum(event, track, time, projectTime, elapsed, instrument);
+      if (track.role === "drums" || event.type !== "note") {
+        const drumEvent = event.type === "note"
+          ? { ...event, type: this.drumTypeForPitch(event.pitch) }
+          : event;
+        this.drum(drumEvent, track, time, projectTime, elapsed, instrument);
         return;
       }
 
@@ -806,27 +727,10 @@
     }
 
     modifiers(track, time) {
-      const result = {
-        rhythm: 0,
-        dropAction: null,
-        dropEdit: null,
-      };
+      const result = { rhythm: 0 };
       for (const edit of state.project.edits) {
         if (time < edit.start || time >= edit.end) continue;
         this.applyPatternAction(edit.action, track.role, result, edit);
-      }
-      if (result.dropAction) {
-        const timing = this.dropTiming(result.dropAction, result.dropEdit);
-        if (time < timing.impact) {
-          const progress = clamp(
-            (time - result.dropEdit.start) / Math.max(0.01, timing.impact - result.dropEdit.start),
-            0,
-            1,
-          );
-          result.rhythm += 0.1 + progress * 0.65;
-        } else {
-          result.rhythm += 0.8;
-        }
       }
       return result;
     }
@@ -838,10 +742,15 @@
       }
       if (action.target !== "all" && action.target !== role) return;
       if (action.type === "rhythm") result.rhythm += action.value;
-      if (action.type === "drop") {
-        result.dropAction = action;
-        result.dropEdit = edit;
-      }
+    }
+
+    drumTypeForPitch(pitch) {
+      if (pitch === 35 || pitch === 36) return "kick";
+      if (pitch >= 37 && pitch <= 40) return "snare";
+      if ([41, 43, 45, 47, 48, 50].includes(pitch)) return "tom";
+      if ([42, 44, 46].includes(pitch)) return "hat";
+      if ([49, 51, 52, 53, 55, 57, 59].includes(pitch)) return "cymbal";
+      return "percussion";
     }
 
     schedulePitchModulation(parameter, track, audioTime, projectTime, duration) {
@@ -870,13 +779,15 @@
       oscillator.type = track.instrument.waveform;
       oscillator.dawAiTrackId = track.id;
       oscillator.dawAiChased = elapsed > 0;
+      oscillator.dawAiDrumType = event.type;
+      oscillator.dawAiEventId = event.id;
       oscillator.dawAiEventPitch = event.pitch;
       oscillator.dawAiEventDuration = event.duration;
       oscillator.dawAiInstrumentAttack = instrument.attack;
       oscillator.dawAiInstrumentRelease = instrument.release;
-      if (event.type === "kick") {
-        const startFrequency = frequency * 3.2;
-        const endFrequency = Math.max(20, frequency);
+      if (event.type === "kick" || event.type === "tom") {
+        const startFrequency = frequency * (event.type === "kick" ? 3.2 : 1.8);
+        const endFrequency = Math.max(event.type === "kick" ? 20 : 35, frequency * (event.type === "kick" ? 1 : 0.78));
         if (elapsed < bodyDuration) {
           const progress = elapsed / bodyDuration;
           const currentFrequency = startFrequency * (endFrequency / startFrequency) ** progress;
@@ -892,7 +803,14 @@
         oscillator.frequency.setValueAtTime(frequency, time);
       }
       this.schedulePitchModulation(oscillator.detune, track, time, projectTime, remaining);
-      const tonalLevel = velocity * (event.type === "kick" ? 0.58 : event.type === "snare" ? 0.055 : 0.028);
+      const tonalLevel = velocity * ({
+        kick: 0.58,
+        snare: 0.055,
+        tom: 0.34,
+        hat: 0.028,
+        cymbal: 0.012,
+        percussion: 0.11,
+      }[event.type] ?? 0.05);
       this.scheduleVoiceEnvelope(
         tonalEnvelope.gain,
         time,
@@ -912,7 +830,7 @@
       oscillator.start(time);
       oscillator.stop(time + remaining + 0.01);
 
-      if (event.type === "kick") return;
+      if (event.type === "kick" || event.type === "tom") return;
       const source = this.context.createBufferSource();
       const filter = this.context.createBiquadFilter();
       const noiseEnvelope = this.context.createGain();
@@ -920,11 +838,18 @@
       source.loop = true;
       source.dawAiTrackId = track.id;
       source.dawAiChased = elapsed > 0;
+      source.dawAiDrumType = event.type;
       source.dawAiEventPitch = event.pitch;
       source.dawAiEventDuration = event.duration;
       filter.type = "highpass";
-      filter.frequency.value = clamp(frequency * (event.type === "hat" ? 60 : 24), 300, 12000);
-      const noiseLevel = velocity * (event.type === "hat" ? 0.1 : 0.3);
+      const noise = {
+        snare: { multiplier: 24, minimum: 300, level: 0.3 },
+        hat: { multiplier: 60, minimum: 3000, level: 0.1 },
+        cymbal: { multiplier: 48, minimum: 3500, level: 0.22 },
+        percussion: { multiplier: 32, minimum: 800, level: 0.12 },
+      }[event.type];
+      filter.frequency.value = clamp(frequency * noise.multiplier, noise.minimum, 12000);
+      const noiseLevel = velocity * noise.level;
       this.scheduleVoiceEnvelope(
         noiseEnvelope.gain,
         time,
@@ -1035,23 +960,6 @@
       source.addEventListener("ended", () => this.activeSources.delete(source), { once: true });
     }
 
-    crash(time, level, trackId) {
-      const source = this.context.createBufferSource();
-      const filter = this.context.createBiquadFilter();
-      const envelope = this.context.createGain();
-      source.buffer = this.noiseBuffer;
-      source.dawAiImpactCrash = true;
-      filter.type = "highpass";
-      filter.frequency.value = 2600;
-      envelope.gain.setValueAtTime(level, time);
-      envelope.gain.exponentialRampToValueAtTime(0.0001, time + 0.48);
-      source.connect(filter);
-      filter.connect(envelope);
-      this.routeVoice(envelope, trackId);
-      this.trackSource(source);
-      source.start(time);
-      source.stop(time + 0.49);
-    }
   }
 
   const audio = new AudioEngine();
@@ -1207,9 +1115,16 @@
           .filter((node) => node.startsWith("effect:"))
           .map((node) => track.effects.find((effect) => effect.id === Number(node.slice(7))))
           .filter(Boolean);
-        const route = ["Clips", "Instrument", ...orderedEffects.map((effect) => effect.name), "Master"]
-          .map((node) => `<span>${escapeHtml(node)}</span>`)
-          .join('<i aria-hidden="true">&rarr;</i>');
+        const routeNodes = ["MIDI Clips", "Instrument", ...orderedEffects.map((effect) => effect.name), "Master"];
+        const route = routeNodes
+          .map((node, index) => {
+            const signal = index === 0 ? "MIDI" : "AUDIO";
+            const edge = index < routeNodes.length - 1
+              ? `<i aria-hidden="true"><b>${signal}</b>&rarr;</i>`
+              : "";
+            return `<span>${escapeHtml(node)}</span>${edge}`;
+          })
+          .join("");
         return `<section class="channel-card" style="--track-color:${track.color}">
           <div class="channel-heading">
             <div class="channel-name"><i></i>${escapeHtml(track.name)}</div>
@@ -1234,7 +1149,7 @@
           </div>
           <div class="sound-tool effects-tool">
             <div class="tool-heading"><div><span>Effect chain</span><strong>Processed in this order</strong></div></div>
-            <div class="routing-chain" aria-label="${escapeHtml(track.name)} audio routing">${route}</div>
+            <div class="routing-chain" aria-label="${escapeHtml(track.name)} typed sound routing">${route}</div>
             <div class="effect-stack">${orderedEffects.map((effect, index) => renderEffect(track, effect, index, orderedEffects.length)).join("")}</div>
             <div class="effects-list">${regionalEffects || '<span class="effect-pill">No regional effects</span>'}</div>
           </div>
@@ -1243,8 +1158,8 @@
             ${track.modulators.map((modulator) => renderModulator(track, modulator)).join("")}
           </div>
           <div class="sound-tool clips-tool">
-            <div class="tool-heading"><div><span>Clips</span><strong>Notes and drum events</strong></div></div>
-            ${track.clips.map((clip) => renderClipEvents(track, clip)).join("")}
+            <div class="tool-heading"><div><span>MIDI Clips</span><strong>Timed notes, pitches, and velocities</strong></div></div>
+            ${track.clips.map((clip) => renderClipEvents(track, clip)).join("") || '<span class="effect-pill">No MIDI clips</span>'}
           </div>
         </section>`;
       })
