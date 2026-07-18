@@ -1209,7 +1209,7 @@
           .filter(Boolean);
         const route = ["Clips", "Instrument", ...orderedEffects.map((effect) => effect.name), "Master"]
           .map((node) => `<span>${escapeHtml(node)}</span>`)
-          .join('<i aria-hidden="true">→</i>');
+          .join('<i aria-hidden="true">&rarr;</i>');
         return `<section class="channel-card" style="--track-color:${track.color}">
           <div class="channel-heading">
             <div class="channel-name"><i></i>${escapeHtml(track.name)}</div>
@@ -1333,8 +1333,8 @@
       ${soundRange(track, "effect", effect.id, effect.name, "mix", effect.parameters.mix, 0, 1, "%")}
       <div class="tool-actions">
         ${soundToggle(track, "effect", effect.id, effect.name, effect.enabled)}
-        <button type="button" aria-label="${escapeHtml(`Move ${track.name} ${effect.name} effect #${effect.id} earlier`)}" ${index === 0 ? "disabled" : ""} data-sound-tool="routing" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="position" data-sound-value="${Math.max(0, index - 1)}" data-control-key="${track.id}-routing-${effect.id}-up">↑</button>
-        <button type="button" aria-label="${escapeHtml(`Move ${track.name} ${effect.name} effect #${effect.id} later`)}" ${index === effectCount - 1 ? "disabled" : ""} data-sound-tool="routing" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="position" data-sound-value="${Math.min(effectCount - 1, index + 1)}" data-control-key="${track.id}-routing-${effect.id}-down">↓</button>
+        <button type="button" aria-label="${escapeHtml(`Move ${track.name} ${effect.name} effect #${effect.id} earlier`)}" ${index === 0 ? "disabled" : ""} data-sound-tool="routing" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="position" data-sound-value="${Math.max(0, index - 1)}" data-control-key="${track.id}-routing-${effect.id}-up">&uarr;</button>
+        <button type="button" aria-label="${escapeHtml(`Move ${track.name} ${effect.name} effect #${effect.id} later`)}" ${index === effectCount - 1 ? "disabled" : ""} data-sound-tool="routing" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="position" data-sound-value="${Math.min(effectCount - 1, index + 1)}" data-control-key="${track.id}-routing-${effect.id}-down">&darr;</button>
       </div>
     </div>`;
   }
@@ -1371,7 +1371,7 @@
         </div>`;
       })
       .join("");
-    return `<details class="clip-editor" data-clip-key="${track.id}-${clip.id}" open><summary><span>${escapeHtml(clip.label)}</span><b>${clip.events.length} events · ${clip.loopBeats} beat loop</b></summary><div class="clip-event-list">${rows}</div></details>`;
+    return `<details class="clip-editor" data-clip-key="${track.id}-${clip.id}" open><summary><span>${escapeHtml(clip.label)}</span><b>${clip.events.length} events &middot; ${clip.loopBeats} beat loop</b></summary><div class="clip-event-list">${rows}</div></details>`;
   }
 
   function selectOptions(values, selected) {
