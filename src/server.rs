@@ -10,14 +10,15 @@ use crate::model::{Studio, StudioError, json_string};
 use crate::prompt::{EditPlan, PromptEngine};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const TRUSTED_HOSTS_ENV: &str = "DAW_AI_TRUSTED_HOSTS";
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
 const APP_JS: &str = include_str!("../web/app.js");
 
 pub fn run(port: u16) -> io::Result<()> {
+    let router = Router::new()?;
     let address = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&address)?;
-    let router = Router::new();
     println!("DAW-AI is ready at http://{address}");
 
     for connection in listener.incoming() {
@@ -49,6 +50,7 @@ fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
 struct Router {
     studio: Arc<Mutex<Studio>>,
     planner: Planner,
+    trusted_hosts: Arc<[String]>,
 }
 
 #[derive(Clone, Copy)]
@@ -58,15 +60,16 @@ enum Planner {
 }
 
 impl Router {
-    fn new() -> Self {
+    fn new() -> io::Result<Self> {
         let planner = match std::env::var("DAW_AI_PROMPT_ENGINE") {
             Ok(value) if value == "demo" => Planner::Demo,
             _ => Planner::Codex,
         };
-        Self {
+        Ok(Self {
             studio: Arc::new(Mutex::new(Studio::new())),
             planner,
-        }
+            trusted_hosts: trusted_hosts_from_environment()?,
+        })
     }
 
     #[cfg(test)]
@@ -74,14 +77,27 @@ impl Router {
         Self {
             studio: Arc::new(Mutex::new(Studio::new())),
             planner: Planner::Demo,
+            trusted_hosts: Arc::from(Vec::<String>::new()),
         }
     }
 
+    #[cfg(test)]
+    fn demo_with_trusted_hosts(hosts: &[&str]) -> Self {
+        let mut router = Self::demo();
+        router.trusted_hosts = Arc::from(
+            hosts
+                .iter()
+                .map(|host| (*host).to_owned())
+                .collect::<Vec<_>>(),
+        );
+        router
+    }
+
     fn handle(&self, request: &Request) -> Response {
-        if !request.has_trusted_host() {
+        let Some(public_host) = request.public_host(&self.trusted_hosts) else {
             return Response::json(403, error_json("untrusted host rejected"));
-        }
-        if request.is_mutation() && !request.is_trusted_mutation() {
+        };
+        if request.is_mutation() && !request.is_trusted_mutation(public_host) {
             return Response::json(403, error_json("cross-origin request rejected"));
         }
 
@@ -349,31 +365,26 @@ impl Request {
             )
     }
 
-    fn has_trusted_host(&self) -> bool {
-        // Forwarded authority identifies the public origin; it never replaces loopback trust.
-        self.headers
-            .get("host")
-            .is_some_and(|host| is_loopback_host(host))
-            && self
-                .headers
-                .get("x-forwarded-host")
-                .is_none_or(|host| forwarded_host(host).is_some())
-    }
-
-    fn public_host(&self) -> Option<&str> {
-        if !self.has_trusted_host() {
+    fn public_host<'a>(&'a self, trusted_hosts: &[String]) -> Option<&'a str> {
+        let transport_host = self.headers.get("host")?;
+        let forwarded = match self.headers.get("x-forwarded-host") {
+            Some(value) => Some(forwarded_host(value)?),
+            None => None,
+        };
+        if is_loopback_host(transport_host) {
+            return forwarded.or(Some(transport_host));
+        }
+        if !is_configured_host(transport_host, trusted_hosts) {
             return None;
         }
-        self.headers
-            .get("x-forwarded-host")
-            .and_then(|host| forwarded_host(host))
-            .or_else(|| self.headers.get("host").map(String::as_str))
+        match forwarded {
+            Some(host) if is_configured_host(host, trusted_hosts) => Some(host),
+            Some(_) => None,
+            None => Some(transport_host),
+        }
     }
 
-    fn is_trusted_mutation(&self) -> bool {
-        let Some(host) = self.public_host() else {
-            return false;
-        };
+    fn is_trusted_mutation(&self, host: &str) -> bool {
         if self
             .headers
             .get("sec-fetch-site")
@@ -469,6 +480,46 @@ fn parse_form(body: &str) -> HashMap<String, String> {
 fn forwarded_host(value: &str) -> Option<&str> {
     let host = value.split(',').next()?.trim();
     parse_authority(host).map(|_| host)
+}
+
+fn trusted_hosts_from_environment() -> io::Result<Arc<[String]>> {
+    let value = match std::env::var(TRUSTED_HOSTS_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(Arc::from(Vec::<String>::new())),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{TRUSTED_HOSTS_ENV} must be valid UTF-8"),
+            ));
+        }
+    };
+    let mut hosts = Vec::new();
+    for host in value
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+    {
+        if parse_authority(host).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid host in {TRUSTED_HOSTS_ENV}: {host}"),
+            ));
+        }
+        hosts.push(host.to_owned());
+    }
+    Ok(Arc::from(hosts))
+}
+
+fn is_configured_host(value: &str, trusted_hosts: &[String]) -> bool {
+    let Some((hostname, port)) = parse_authority(value) else {
+        return false;
+    };
+    trusted_hosts.iter().any(|trusted| {
+        parse_authority(trusted).is_some_and(|(trusted_hostname, trusted_port)| {
+            hostname.eq_ignore_ascii_case(trusted_hostname)
+                && trusted_port.is_none_or(|trusted_port| port == Some(trusted_port))
+        })
+    })
 }
 
 fn is_loopback_host(value: &str) -> bool {
@@ -807,6 +858,34 @@ mod tests {
     }
 
     #[test]
+    fn supports_explicitly_configured_public_hosts() {
+        let router = Router::demo_with_trusted_hosts(&["studio.example"]);
+        let mut public = request(
+            "POST",
+            "/api/sound-tools",
+            "track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth",
+        );
+        public
+            .headers
+            .insert("host".to_owned(), "studio.example".to_owned());
+        public
+            .headers
+            .insert("x-forwarded-host".to_owned(), "studio.example".to_owned());
+        public
+            .headers
+            .insert("origin".to_owned(), "https://studio.example".to_owned());
+        public
+            .headers
+            .insert("sec-fetch-site".to_owned(), "same-origin".to_owned());
+
+        assert_eq!(router.handle(&public).status, 200);
+        public
+            .headers
+            .insert("x-forwarded-host".to_owned(), "attacker.example".to_owned());
+        assert_eq!(router.handle(&public).status, 403);
+    }
+
+    #[test]
     fn rejects_dns_rebinding_hosts_before_reading_or_mutating_project() {
         let router = Router::demo();
         let mut rebound = request("GET", "/api/project", "");
@@ -851,6 +930,15 @@ mod tests {
         let response = router.handle(&invalid);
         assert_eq!(response.status, 403);
         assert!(!response.body.contains("Neon First Light"));
+    }
+
+    #[test]
+    fn matches_configured_hosts_case_insensitively_and_honors_ports() {
+        let hosts = vec!["Studio.Example".to_owned(), "secure.example:443".to_owned()];
+        assert!(is_configured_host("studio.example:8443", &hosts));
+        assert!(is_configured_host("secure.example:443", &hosts));
+        assert!(!is_configured_host("secure.example", &hosts));
+        assert!(!is_configured_host("attacker.example", &hosts));
     }
 
     #[test]
