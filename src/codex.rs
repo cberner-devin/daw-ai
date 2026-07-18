@@ -333,8 +333,8 @@ fn midi_notes_field(
         .get("events")
         .and_then(JsonValue::as_array)
         .ok_or_else(|| invalid("midi-clip events must be an array"))?;
-    if events.is_empty() || events.len() > 32 {
-        return Err(invalid("midi-clip requires one to 32 notes"));
+    if events.len() > 32 {
+        return Err(invalid("midi-clip supports up to 32 notes"));
     }
     events
         .iter()
@@ -847,6 +847,32 @@ mod tests {
         assert_eq!(loop_beats, 2.0);
         assert_eq!(notes.len(), 2);
         assert_eq!(notes[1].pitch, 32);
+    }
+
+    #[test]
+    fn parses_an_empty_midi_clip_as_a_region_clear() {
+        let plan = plan_from_json(
+            r#"{
+                "summary":"Cleared the selected bass region",
+                "musicalPlan":"Make room for a replacement bass part by clearing the old MIDI.",
+                "actions":[{
+                    "kind":"midi-clip","target":"bass","name":"MIDI Clip","value":4,
+                    "trackId":2,"tool":"None","toolId":0,"clipId":0,"parameter":"None",
+                    "setting":"Bass rest","start":0,"end":1,"rate":0,"events":[]
+                }]
+            }"#,
+        )
+        .expect("valid empty MIDI clip plan");
+
+        assert!(matches!(
+            plan.action,
+            Action::MidiClip {
+                track_id: 2,
+                target: TrackRole::Bass,
+                notes,
+                ..
+            } if notes.is_empty()
+        ));
     }
 
     #[test]
