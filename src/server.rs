@@ -78,8 +78,8 @@ impl Router {
     }
 
     fn handle(&self, request: &Request) -> Response {
-        if !request.has_valid_host() {
-            return Response::json(403, error_json("invalid host rejected"));
+        if !request.has_trusted_host() {
+            return Response::json(403, error_json("untrusted host rejected"));
         }
         if request.is_mutation() && !request.is_trusted_mutation() {
             return Response::json(403, error_json("cross-origin request rejected"));
@@ -349,10 +349,11 @@ impl Request {
             )
     }
 
-    fn has_valid_host(&self) -> bool {
+    fn has_trusted_host(&self) -> bool {
+        // Forwarded authority identifies the public origin; it never replaces loopback trust.
         self.headers
             .get("host")
-            .is_some_and(|host| parse_authority(host).is_some())
+            .is_some_and(|host| is_loopback_host(host))
             && self
                 .headers
                 .get("x-forwarded-host")
@@ -360,7 +361,7 @@ impl Request {
     }
 
     fn public_host(&self) -> Option<&str> {
-        if !self.has_valid_host() {
+        if !self.has_trusted_host() {
             return None;
         }
         self.headers
@@ -468,6 +469,12 @@ fn parse_form(body: &str) -> HashMap<String, String> {
 fn forwarded_host(value: &str) -> Option<&str> {
     let host = value.split(',').next()?.trim();
     parse_authority(host).map(|_| host)
+}
+
+fn is_loopback_host(value: &str) -> bool {
+    parse_authority(value).is_some_and(|(host, _)| {
+        host.eq_ignore_ascii_case("localhost") || matches!(host, "127.0.0.1" | "[::1]")
+    })
 }
 
 fn origin_matches_host(origin: &str, host: &str) -> bool {
@@ -761,7 +768,7 @@ mod tests {
 
         hostile
             .headers
-            .insert("host".to_owned(), "studio.example".to_owned());
+            .insert("x-forwarded-host".to_owned(), "studio.example".to_owned());
         hostile
             .headers
             .insert("origin".to_owned(), "https://attacker.example".to_owned());
@@ -781,15 +788,6 @@ mod tests {
     #[test]
     fn supports_reverse_proxy_hosts_without_configuration() {
         let router = Router::demo();
-        let mut direct = request("GET", "/api/project", "");
-        direct
-            .headers
-            .insert("host".to_owned(), "studio.example".to_owned());
-
-        let response = router.handle(&direct);
-        assert_eq!(response.status, 200);
-        assert!(response.body.contains("Neon First Light"));
-
         let mut forwarded = request(
             "POST",
             "/api/sound-tools",
@@ -806,6 +804,40 @@ mod tests {
             .headers
             .insert("sec-fetch-site".to_owned(), "same-origin".to_owned());
         assert_eq!(router.handle(&forwarded).status, 200);
+    }
+
+    #[test]
+    fn rejects_dns_rebinding_hosts_before_reading_or_mutating_project() {
+        let router = Router::demo();
+        let mut rebound = request("GET", "/api/project", "");
+        rebound
+            .headers
+            .insert("host".to_owned(), "attacker.example".to_owned());
+
+        let response = router.handle(&rebound);
+        assert_eq!(response.status, 403);
+        assert!(!response.body.contains("Neon First Light"));
+
+        rebound.method = "POST".to_owned();
+        rebound.path = "/api/sound-tools".to_owned();
+        rebound.body =
+            "track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth".to_owned();
+        rebound
+            .headers
+            .insert("origin".to_owned(), "http://attacker.example".to_owned());
+        rebound
+            .headers
+            .insert("sec-fetch-site".to_owned(), "same-origin".to_owned());
+        assert_eq!(router.handle(&rebound).status, 403);
+
+        rebound
+            .headers
+            .insert("x-forwarded-host".to_owned(), "attacker.example".to_owned());
+        assert_eq!(router.handle(&rebound).status, 403);
+
+        let project = router.handle(&request("GET", "/api/project", ""));
+        assert!(project.body.contains("\"waveform\":\"square\""));
+        assert!(!project.body.contains("\"waveform\":\"sawtooth\""));
     }
 
     #[test]
