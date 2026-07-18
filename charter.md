@@ -20,12 +20,25 @@ interfaces over super powerful tools.
 
 The following sound tools should be implemented and available in the advanced view of the UI and also to the AI model.
 
-* Clip: Contains notes or drum events, including their timing, duration, pitch, and velocity.
+* MIDI Clip: Contains notes, including their timing, duration, pitch, and velocity.
 * Instrument: Produces sound from musical events. Instruments may be synthesizers or sample-based instruments and expose configurable parameters.
 * Effect: Processes sound produced by an instrument, such as a filter, distortion, compressor, delay, or reverb, and exposes configurable parameters. May be chained with previous Effect.
 * Modulator: Generates time-varying control values—such as envelopes, LFOs, or arbitrary curves—which can control any Instrument or Effect parameter.
 
 Routing: Instruments, effects, and modulators can be connected into a signal chain.
+
+### AI editing
+
+The AI edits the sound graph. It is able to use any of the tools, and may construct the graph iteratively over many modifications.
+
+The AI should first form a musical plan based on the user’s request, the selected region, and the existing composition,
+and then produce the corresponding sound-graph changes. The system instructions should include concrete examples and
+concise guidance connecting musical concepts to the available sound tools.
+
+### Vetoed Implementations
+
+The implementation MUST NOT hardcode niche sound tools such as a dubstep "drop" tool. All the tools should
+be simple primitives that the AI (or user) uses to build the sound
 
 ### Implementation
 
@@ -35,7 +48,7 @@ It should support reverse proxy deployments without any configuration of the hos
 The backend is written in Rust. The client code should be responsive and the UI should work on mobile or a desktop
 browser.
 
-The AI used should be the local Codex agent. Installing and authenticating Codex is a required part of the installation
+The AI used should be the local Codex agent with the 5.6-Sol model on High reasoning. Installing and authenticating Codex is a required part of the installation
 process that the user must complete.
 
 Since Codex is best at writing code and config files, the internal synth and other tools that DAW-AI uses should
