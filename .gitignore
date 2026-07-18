@@ -7,3 +7,7 @@ target/
 .vscode/
 *.swp
 *~
+
+# Local DAW-AI project state
+/sound-graph.json
+/.sound-graph.json.*.tmp

@@ -95,7 +95,7 @@
       } catch (error) {
         if (generation !== this.playbackGeneration) return;
         this.stop(true);
-        showToast("Could not start audio: " + error.message, true);
+        showError(error, "starting audio", "Could not start audio: ");
         return;
       }
       if (
@@ -971,12 +971,39 @@
     return data;
   }
 
+  function errorMessage(error) {
+    if (error instanceof Error && error.message) return error.message;
+    if (typeof error === "string" && error) return error;
+    return "Unknown browser error";
+  }
+
+  function reportClientIssue(level, error, context) {
+    const message = errorMessage(error);
+    const stack = error instanceof Error && error.stack ? `\n${error.stack}` : "";
+    const body = new URLSearchParams({
+      level,
+      context: String(context || "browser").slice(0, 160),
+      message: `${message}${stack}`.slice(0, 4096),
+    });
+    void fetch("/api/logs", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+      keepalive: true,
+    }).catch(() => {});
+  }
+
+  function showError(error, context, prefix = "") {
+    reportClientIssue("error", error, context);
+    showToast(prefix + errorMessage(error), true);
+  }
+
   async function loadProject() {
     try {
       state.project = await api("/api/project");
       renderProject();
     } catch (error) {
-      showToast(error.message, true);
+      showError(error, "loading the project");
       elements.savedState.textContent = "Offline";
     }
   }
@@ -1431,7 +1458,7 @@
     } catch (error) {
       renderProject();
       restoreSoundToolFocus(request, focusKey);
-      showToast(error.message, true);
+      showError(error, "updating a sound tool");
     }
   }
 
@@ -1449,7 +1476,7 @@
         elements.channelList.querySelector(selector)?.focus({ preventScroll: true });
       });
     } catch (error) {
-      showToast(error.message, true);
+      showError(error, "updating the mixer");
     }
   }
 
@@ -1582,8 +1609,8 @@
       );
       showToast(result.message);
     } catch (error) {
-      showToast(error.message, true);
-      elements.savedState.textContent = `Version ${state.project.version}`;
+      showError(error, "applying a prompted edit");
+      elements.savedState.textContent = state.project ? `Version ${state.project.version}` : "Offline";
     } finally {
       state.promptPending = false;
       elements.composeButton.disabled = false;
@@ -1606,7 +1633,7 @@
       );
       showToast("Last change undone");
     } catch (error) {
-      showToast(error.message, true);
+      showError(error, "undoing a project change");
     }
   }
 
@@ -1628,7 +1655,7 @@
       );
       showToast("Demo arrangement restored");
     } catch (error) {
-      showToast(error.message, true);
+      showError(error, "resetting the project");
     }
   }
 
@@ -1749,6 +1776,12 @@
       event.preventDefault();
       if (!state.promptPending) elements.promptForm.requestSubmit();
     }
+  });
+  window.addEventListener("error", (event) => {
+    reportClientIssue("error", event.error || event.message, "uncaught browser error");
+  });
+  window.addEventListener("unhandledrejection", (event) => {
+    reportClientIssue("error", event.reason, "unhandled browser promise rejection");
   });
   window.addEventListener("resize", () => {
     renderSelection();

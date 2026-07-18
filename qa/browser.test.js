@@ -273,7 +273,11 @@ async function run() {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "daw-ai-browser-"));
   const app = spawn(path.join(root, "target", "debug", "daw-ai"), ["--port", String(appPort)], {
     cwd: root,
-    env: { ...process.env, DAW_AI_PROMPT_ENGINE: "demo" },
+    env: {
+      ...process.env,
+      DAW_AI_PROMPT_ENGINE: "demo",
+      DAW_AI_PROJECT_PATH: path.join(profile, "sound-graph.json"),
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   const chrome = spawn(
@@ -335,6 +339,36 @@ async function run() {
       async () => evaluate(cdp, appSession, "document.querySelectorAll('.track-row').length === 3"),
       "initial arrangement",
     );
+    await evaluate(cdp, appSession, `(() => {
+      const originalFetch = window.fetch;
+      window.__clientLogBodies = [];
+      window.fetch = function fetch(resource, options) {
+        if (resource !== '/api/logs') return originalFetch(resource, options);
+        window.__clientLogBodies.push(options.body.toString());
+        return Promise.resolve(new Response('{"status":"logged"}', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      };
+      window.__restoreFetchAfterClientLog = () => {
+        window.fetch = originalFetch;
+      };
+      window.dispatchEvent(new ErrorEvent('error', {
+        message: 'Synthetic browser failure',
+        error: new Error('Synthetic browser failure'),
+      }));
+    })()`);
+    await waitFor(
+      async () => evaluate(cdp, appSession, "window.__clientLogBodies.length === 1"),
+      "client error forwarding",
+    );
+    const clientLog = new URLSearchParams(
+      await evaluate(cdp, appSession, "window.__clientLogBodies[0]"),
+    );
+    assert.equal(clientLog.get("level"), "error");
+    assert.equal(clientLog.get("context"), "uncaught browser error");
+    assert.match(clientLog.get("message"), /Synthetic browser failure/);
+    await evaluate(cdp, appSession, "window.__restoreFetchAfterClientLog()");
     assert.equal(
       await evaluate(
         cdp,

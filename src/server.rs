@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::codex::CodexPlanner;
+use crate::codex::{CodexEdit, CodexPlanner};
 use crate::model::{Studio, StudioError, json_string};
 use crate::prompt::{EditPlan, PromptEngine};
+use crate::storage::ProjectStore;
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const TRUSTED_HOSTS_ENV: &str = "DAW_AI_TRUSTED_HOSTS";
@@ -20,6 +21,7 @@ pub fn run(port: u16) -> io::Result<()> {
     let address = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&address)?;
     println!("DAW-AI is ready at http://{address}");
+    println!("Sound graph: {}", router.project_path().display());
 
     for connection in listener.incoming() {
         match connection {
@@ -40,8 +42,15 @@ pub fn run(port: u16) -> io::Result<()> {
 fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let response = match Request::read(stream) {
-        Ok(request) => router.handle(&request),
-        Err(error) => Response::json(400, error_json(&error)),
+        Ok(request) => {
+            let response = router.handle(&request);
+            log_http_response(&request, &response);
+            response
+        }
+        Err(error) => {
+            eprintln!("warning: rejected HTTP request: {error}");
+            Response::json(400, error_json(&error))
+        }
     };
     response.write(stream)
 }
@@ -49,6 +58,7 @@ fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
 #[derive(Clone)]
 struct Router {
     studio: Arc<Mutex<Studio>>,
+    store: Option<ProjectStore>,
     planner: Planner,
     trusted_hosts: Arc<[String]>,
 }
@@ -59,14 +69,21 @@ enum Planner {
     Demo,
 }
 
+enum PlannedEdit {
+    Plan(EditPlan),
+    Graph(CodexEdit),
+}
+
 impl Router {
     fn new() -> io::Result<Self> {
         let planner = match std::env::var("DAW_AI_PROMPT_ENGINE") {
             Ok(value) if value == "demo" => Planner::Demo,
             _ => Planner::Codex,
         };
+        let (store, studio) = ProjectStore::open_from_environment()?;
         Ok(Self {
-            studio: Arc::new(Mutex::new(Studio::new())),
+            studio: Arc::new(Mutex::new(studio)),
+            store: Some(store),
             planner,
             trusted_hosts: trusted_hosts_from_environment()?,
         })
@@ -76,6 +93,7 @@ impl Router {
     fn demo() -> Self {
         Self {
             studio: Arc::new(Mutex::new(Studio::new())),
+            store: None,
             planner: Planner::Demo,
             trusted_hosts: Arc::from(Vec::<String>::new()),
         }
@@ -113,11 +131,14 @@ impl Router {
             ("POST", "/api/edits") => self.apply_edit(&request.body),
             ("POST", "/api/mix") => self.change_mix(&request.body),
             ("POST", "/api/sound-tools") => self.change_sound_tool(&request.body),
+            ("POST", "/api/logs") => Self::client_log(&request.body),
             ("POST", "/api/undo") => self.undo(),
             ("POST", "/api/reset") => self.reset(),
-            (_, "/api/edits" | "/api/mix" | "/api/sound-tools" | "/api/undo" | "/api/reset") => {
-                Response::json(405, error_json("method not allowed")).with_header("Allow", "POST")
-            }
+            (
+                _,
+                "/api/edits" | "/api/mix" | "/api/sound-tools" | "/api/logs" | "/api/undo"
+                | "/api/reset",
+            ) => Response::json(405, error_json("method not allowed")).with_header("Allow", "POST"),
             (_, "/api/project" | "/api/health") => {
                 Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
             }
@@ -147,8 +168,8 @@ impl Router {
             }
             studio.project().clone()
         };
-        let plan = match self.plan_edit(prompt, start, end, &project) {
-            Ok(plan) => plan,
+        let planned_edit = match self.plan_edit(prompt, start, end, &project) {
+            Ok(planned_edit) => planned_edit,
             Err(message) => return Response::json(503, error_json(&message)),
         };
         let mut studio = self.lock_studio();
@@ -158,15 +179,25 @@ impl Router {
                 error_json("the project changed; submit the edit again"),
             );
         }
-        match studio.apply_plan(start, end, prompt, plan) {
-            Ok(summary) => Response::json(
-                200,
-                format!(
-                    "{{\"message\":{},\"project\":{}}}",
-                    json_string(&summary),
-                    studio.to_json()
+        let mut candidate = studio.clone();
+        let result = match planned_edit {
+            PlannedEdit::Plan(plan) => candidate.apply_plan(start, end, prompt, plan),
+            PlannedEdit::Graph(edit) => {
+                candidate.replace_graph(edit.project, start, end, prompt, edit.plan)
+            }
+        };
+        match result {
+            Ok(summary) => match self.commit(&mut studio, candidate) {
+                Ok(()) => Response::json(
+                    200,
+                    format!(
+                        "{{\"message\":{},\"project\":{}}}",
+                        json_string(&summary),
+                        studio.to_json()
+                    ),
                 ),
-            ),
+                Err(response) => response,
+            },
             Err(error) => Response::json(422, studio_error(error)),
         }
     }
@@ -177,10 +208,13 @@ impl Router {
         start: f32,
         end: f32,
         project: &crate::model::Project,
-    ) -> Result<EditPlan, String> {
+    ) -> Result<PlannedEdit, String> {
         match self.planner {
-            Planner::Demo => Ok(PromptEngine::interpret_project(prompt, project, start, end)),
+            Planner::Demo => Ok(PlannedEdit::Plan(PromptEngine::interpret_project(
+                prompt, project, start, end,
+            ))),
             Planner::Codex => CodexPlanner::interpret(prompt, start, end, project)
+                .map(PlannedEdit::Graph)
                 .map_err(|error| error.to_string()),
         }
     }
@@ -208,8 +242,12 @@ impl Router {
         };
 
         let mut studio = self.lock_studio();
-        match studio.set_mix(track_id, volume, muted) {
-            Ok(()) => Response::json(200, studio.to_json()),
+        let mut candidate = studio.clone();
+        match candidate.set_mix(track_id, volume, muted) {
+            Ok(()) => match self.commit(&mut studio, candidate) {
+                Ok(()) => Response::json(200, studio.to_json()),
+                Err(response) => response,
+            },
             Err(error) => Response::json(422, studio_error(error)),
         }
     }
@@ -246,16 +284,54 @@ impl Router {
         };
 
         let mut studio = self.lock_studio();
-        match studio.configure_sound_tool(track_id, tool, tool_id, clip_id, parameter, value) {
-            Ok(()) => Response::json(200, studio.to_json()),
+        let mut candidate = studio.clone();
+        match candidate.configure_sound_tool(track_id, tool, tool_id, clip_id, parameter, value) {
+            Ok(()) => match self.commit(&mut studio, candidate) {
+                Ok(()) => Response::json(200, studio.to_json()),
+                Err(response) => response,
+            },
             Err(error) => Response::json(422, studio_error(error)),
         }
     }
 
+    fn client_log(body: &str) -> Response {
+        let form = parse_form(body);
+        let Some(level) = form.get("level").map(String::as_str) else {
+            return Response::json(422, error_json("log level is required"));
+        };
+        if !matches!(level, "warning" | "error") {
+            return Response::json(422, error_json("log level must be warning or error"));
+        }
+        let Some(message) = form.get("message").map(|message| message.trim()) else {
+            return Response::json(422, error_json("log message is required"));
+        };
+        if message.is_empty() || message.chars().count() > 4_096 {
+            return Response::json(422, error_json("log message length is invalid"));
+        }
+        let context = form
+            .get("context")
+            .map(|context| context.trim())
+            .filter(|context| !context.is_empty())
+            .unwrap_or("browser");
+        if context.chars().count() > 160 {
+            return Response::json(422, error_json("log context length is invalid"));
+        }
+        eprintln!(
+            "client {level}: {}: {}",
+            single_line(context),
+            single_line(message)
+        );
+        Response::json(200, "{\"status\":\"logged\"}".to_owned())
+    }
+
     fn undo(&self) -> Response {
         let mut studio = self.lock_studio();
-        if studio.undo() {
-            Response::json(200, studio.to_json())
+        let mut candidate = studio.clone();
+        if candidate.undo() {
+            match self.commit(&mut studio, candidate) {
+                Ok(()) => Response::json(200, studio.to_json()),
+                Err(response) => response,
+            }
         } else {
             Response::json(409, error_json("nothing to undo"))
         }
@@ -263,8 +339,37 @@ impl Router {
 
     fn reset(&self) -> Response {
         let mut studio = self.lock_studio();
-        studio.reset();
-        Response::json(200, studio.to_json())
+        let mut candidate = studio.clone();
+        candidate.reset();
+        match self.commit(&mut studio, candidate) {
+            Ok(()) => Response::json(200, studio.to_json()),
+            Err(response) => response,
+        }
+    }
+
+    fn commit(
+        &self,
+        studio: &mut std::sync::MutexGuard<'_, Studio>,
+        candidate: Studio,
+    ) -> Result<(), Response> {
+        if let Some(store) = &self.store {
+            if let Err(error) = store.save(candidate.project()) {
+                eprintln!("error: could not save sound graph: {error}");
+                return Err(Response::json(
+                    500,
+                    error_json("could not save the sound graph"),
+                ));
+            }
+        }
+        **studio = candidate;
+        Ok(())
+    }
+
+    fn project_path(&self) -> &std::path::Path {
+        self.store
+            .as_ref()
+            .expect("production router has a project store")
+            .path()
     }
 
     fn lock_studio(&self) -> std::sync::MutexGuard<'_, Studio> {
@@ -361,7 +466,12 @@ impl Request {
         self.method == "POST"
             && matches!(
                 self.path.as_str(),
-                "/api/edits" | "/api/mix" | "/api/sound-tools" | "/api/undo" | "/api/reset"
+                "/api/edits"
+                    | "/api/mix"
+                    | "/api/sound-tools"
+                    | "/api/logs"
+                    | "/api/undo"
+                    | "/api/reset"
             )
     }
 
@@ -641,9 +751,37 @@ fn error_json(message: &str) -> String {
     format!("{{\"error\":{}}}", json_string(message))
 }
 
+fn single_line(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn log_http_response(request: &Request, response: &Response) {
+    if response.status >= 500 {
+        eprintln!(
+            "error: {} {} returned {}",
+            request.method, request.path, response.status
+        );
+    } else if response.status >= 400 {
+        eprintln!(
+            "warning: {} {} returned {}",
+            request.method, request.path, response.status
+        );
+    }
+}
+
 fn studio_error(error: StudioError) -> String {
     match error {
         StudioError::EmptyPrompt => error_json("describe the change you want"),
+        StudioError::InvalidPrompt => error_json("prompt is too long"),
         StudioError::InvalidSelection => error_json("select a valid part of the track"),
         StudioError::UnknownTrack => error_json("track not found"),
         StudioError::InvalidMix => error_json("invalid mixer setting"),
@@ -655,6 +793,9 @@ fn studio_error(error: StudioError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
     fn request(method: &str, path: &str, body: &str) -> Request {
         Request {
@@ -663,6 +804,24 @@ mod tests {
             headers: HashMap::from([("host".to_owned(), "127.0.0.1:8888".to_owned())]),
             body: body.to_owned(),
         }
+    }
+
+    fn persisted_demo() -> (Router, std::path::PathBuf) {
+        let id = TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "daw-ai-server-test-{}-{id}.json",
+            std::process::id()
+        ));
+        let (store, studio) = ProjectStore::open(path.clone()).expect("test project store");
+        (
+            Router {
+                studio: Arc::new(Mutex::new(studio)),
+                store: Some(store),
+                planner: Planner::Demo,
+                trusted_hosts: Arc::from(Vec::<String>::new()),
+            },
+            path,
+        )
     }
 
     #[test]
@@ -711,6 +870,46 @@ mod tests {
         assert_eq!(invalid.status, 422);
         let project = router.handle(&request("GET", "/api/project", ""));
         assert!(project.body.contains("\"waveform\":\"sawtooth\""));
+    }
+
+    #[test]
+    fn accepts_bounded_client_error_and_warning_logs() {
+        let router = Router::demo();
+        let error = router.handle(&request(
+            "POST",
+            "/api/logs",
+            "level=error&context=starting+audio&message=AudioContext+failed",
+        ));
+        assert_eq!(error.status, 200);
+        assert_eq!(error.body, "{\"status\":\"logged\"}");
+
+        let warning = router.handle(&request(
+            "POST",
+            "/api/logs",
+            "level=warning&message=Recovered+from+an+invalid+node",
+        ));
+        assert_eq!(warning.status, 200);
+        assert_eq!(
+            router
+                .handle(&request("POST", "/api/logs", "level=info&message=no"))
+                .status,
+            422
+        );
+        assert_eq!(router.handle(&request("GET", "/api/logs", "")).status, 405);
+    }
+
+    #[test]
+    fn successful_api_mutations_persist_the_sound_graph() {
+        let (router, path) = persisted_demo();
+        let response = router.handle(&request(
+            "POST",
+            "/api/sound-tools",
+            "track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth",
+        ));
+        assert_eq!(response.status, 200);
+        let saved = ProjectStore::open(path.clone()).expect("saved project").1;
+        assert_eq!(saved.project().tracks[1].instrument.waveform, "sawtooth");
+        std::fs::remove_file(path).expect("remove test graph");
     }
 
     #[test]
