@@ -709,7 +709,7 @@ impl Studio {
         end: f32,
         prompt: &str,
     ) -> Result<String, StudioError> {
-        let plan = PromptEngine::interpret_project(prompt, &self.project);
+        let plan = PromptEngine::interpret_project(prompt, &self.project, start, end);
         self.apply_plan(start, end, prompt, plan)
     }
 
@@ -1925,20 +1925,20 @@ mod tests {
     #[test]
     fn composes_genre_prompt_from_generic_midi_and_sound_tools() {
         let mut studio = Studio::new();
-        let original_bass_modulator = studio
+        let original_bass = studio
             .project()
             .tracks
             .iter()
             .find(|track| track.role == TrackRole::Bass)
-            .and_then(|track| track.modulators.first())
-            .expect("seeded bass modulation")
-            .id;
+            .expect("seeded bass");
+        let original_bass_id = original_bass.id;
+        let original_bass_modulator = original_bass.modulators[0].clone();
         let summary = studio
             .apply_prompt(8.0, 16.0, "insert a dubstep drop here")
             .expect("valid edit");
 
         assert!(summary.contains("half-time drums"));
-        assert_eq!(studio.project().tracks.len(), 3);
+        assert_eq!(studio.project().tracks.len(), 4);
         assert_eq!(studio.project().edits.len(), 1);
         let drums = studio
             .project()
@@ -1958,12 +1958,31 @@ mod tests {
         assert!(drum_clip.events.iter().any(|event| event.pitch == 41));
         assert!(drum_clip.events.iter().any(|event| event.pitch == 49));
 
+        let original_bass = studio
+            .project()
+            .tracks
+            .iter()
+            .find(|track| track.id == original_bass_id)
+            .expect("original bass");
+        assert_eq!(original_bass.instrument.waveform, "square");
+        assert_eq!(original_bass.modulators[0].id, original_bass_modulator.id);
+        assert_eq!(
+            original_bass.modulators[0].shape,
+            original_bass_modulator.shape
+        );
+
         let bass = studio
             .project()
             .tracks
             .iter()
-            .find(|track| track.role == TrackRole::Bass)
+            .find(|track| {
+                track
+                    .clips
+                    .iter()
+                    .any(|clip| clip.label == "Syncopated bass")
+            })
             .expect("bass track");
+        let drop_bass_id = bass.id;
         assert_eq!(bass.instrument.waveform, "sawtooth");
         assert!(
             bass.clips
@@ -1975,12 +1994,14 @@ mod tests {
         assert_eq!(wobble.shape, "square");
         assert_eq!(wobble.rate, 2.0);
         assert_eq!(wobble.depth, 0.72);
-        assert_eq!(bass.modulators.len(), 1);
-        assert_eq!(wobble.id, original_bass_modulator);
+        assert_eq!(bass.modulators.len(), 2);
+        assert_eq!(wobble.name, "AI modulation");
+        let wobble_id = wobble.id;
 
         let action_json = studio.project().to_json();
         assert!(action_json.contains("\"type\":\"midi-clip\""));
-        assert!(action_json.contains("\"type\":\"configure\""));
+        assert!(action_json.contains("\"type\":\"add-track\""));
+        assert!(action_json.contains("\"type\":\"modulator\""));
         assert!(!action_json.contains("\"type\":\"drop\""));
 
         studio
@@ -1990,11 +2011,11 @@ mod tests {
             .project()
             .tracks
             .iter()
-            .find(|track| track.role == TrackRole::Bass)
+            .find(|track| track.id == drop_bass_id)
             .expect("refined bass");
-        assert_eq!(studio.project().tracks.len(), 3);
-        assert_eq!(bass.modulators.len(), 1);
-        assert_eq!(bass.modulators[0].id, original_bass_modulator);
+        assert_eq!(studio.project().tracks.len(), 4);
+        assert_eq!(bass.modulators.len(), 2);
+        assert_eq!(bass.modulators.last().expect("wobble").id, wobble_id);
         assert_eq!(
             bass.clips
                 .iter()
@@ -2002,6 +2023,9 @@ mod tests {
                 .count(),
             1
         );
+        let action_json = studio.project().to_json();
+        assert_eq!(action_json.matches("\"type\":\"gain\"").count(), 1);
+        assert!(action_json.contains("\"type\":\"configure\""));
 
         assert!(studio.undo());
         assert_eq!(studio.project().edits.len(), 1);
@@ -2009,6 +2033,77 @@ mod tests {
         assert_eq!(studio.project().tracks.len(), 3);
         assert!(studio.project().edits.is_empty());
         assert!(!studio.undo());
+    }
+
+    #[test]
+    fn genre_refinement_reenables_its_region_owned_modulator() {
+        let mut studio = Studio::new();
+        studio
+            .apply_prompt(8.0, 16.0, "insert a dubstep drop here")
+            .expect("valid edit");
+        let drop_bass = studio
+            .project()
+            .tracks
+            .iter()
+            .find(|track| {
+                track
+                    .clips
+                    .iter()
+                    .any(|clip| clip.label == "Syncopated bass")
+            })
+            .expect("drop bass");
+        let track_id = drop_bass.id;
+        let modulator_id = drop_bass.modulators.last().expect("drop modulation").id;
+
+        studio
+            .configure_sound_tool(
+                track_id,
+                "modulator",
+                modulator_id,
+                None,
+                "enabled",
+                "false",
+            )
+            .expect("disable drop modulation");
+        studio
+            .apply_prompt(8.0, 16.0, "make the drop hit harder")
+            .expect("valid refinement");
+
+        let drop_bass = studio
+            .project()
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .expect("same drop bass");
+        assert!(
+            drop_bass
+                .modulators
+                .iter()
+                .find(|modulator| modulator.id == modulator_id)
+                .expect("same drop modulation")
+                .enabled
+        );
+    }
+
+    #[test]
+    fn midi_prompt_creates_a_missing_role_before_writing_notes() {
+        let mut studio = Studio::new();
+        studio
+            .apply_prompt(0.0, 4.0, "add a lead MIDI clip")
+            .expect("create and author a missing lead");
+
+        let lead = studio
+            .project()
+            .tracks
+            .iter()
+            .find(|track| track.role == TrackRole::Lead)
+            .expect("lead track");
+        assert!(lead.clips.iter().any(|clip| clip.label == "AI MIDI clip"));
+        assert!(matches!(
+            studio.project().edits[0].action,
+            Action::Compound { ref actions }
+                if matches!(actions.as_slice(), [Action::AddTrack { role: TrackRole::Lead }, Action::MidiClip { target: TrackRole::Lead, .. }])
+        ));
     }
 
     #[test]

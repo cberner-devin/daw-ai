@@ -2355,12 +2355,17 @@ async function run() {
     const genreActions = genreProject.edits[0].action.actions;
     assert.deepEqual(
       genreActions.map((action) => action.type),
-      ["midi-clip", "midi-clip", "instrument", "configure", "configure", "configure", "effect", "gain"],
+      ["add-track", "midi-clip", "midi-clip", "instrument", "modulator", "effect", "gain"],
       "a genre request must be built from generic sound-graph operations",
     );
-    assert.equal(genreProject.tracks.length, 3, "composing a dubstep section must not inject a canned lead track");
+    assert.equal(genreProject.tracks.length, 4, "regional sound design must use one dedicated generic bass track");
     const genreDrums = genreProject.tracks.find((track) => track.role === "drums");
-    const genreBass = genreProject.tracks.find((track) => track.role === "bass");
+    const genreBass = genreProject.tracks.find((track) =>
+      track.clips.some((clip) => clip.label === "Syncopated bass"),
+    );
+    const originalGenreBass = genreProject.tracks.find(
+      (track) => track.role === "bass" && track.id !== genreBass.id,
+    );
     const drumMidi = genreDrums.clips.find((clip) => clip.label === "Half-time drums");
     const bassMidi = genreBass.clips.find((clip) => clip.label === "Syncopated bass");
     assert.deepEqual(
@@ -2387,7 +2392,17 @@ async function run() {
       ["sawtooth", "square", 2, 0.72, "instrument.tone"],
       "the bass instrument and modulation must realize the sound-design portion of the plan",
     );
-    assert.equal(genreBass.modulators.length, 1, "genre composition must reuse the bass modulator");
+    assert.equal(genreBass.modulators.length, 2, "genre composition must add one authored modulator");
+    assert.equal(
+      genreBass.modulators.filter((modulator) => modulator.name === "AI modulation").length,
+      1,
+      "genre composition must add only one authored modulator",
+    );
+    assert.equal(
+      originalGenreBass.instrument.waveform,
+      "square",
+      "regional sound design must not alter the original bass outside the selection",
+    );
 
     await submitPrompt(cdp, appSession, "make the drop hit harder", 2);
     await waitFor(
@@ -2395,22 +2410,25 @@ async function run() {
       "genre refinement completion",
     );
     const refinedGenre = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-    assert.equal(refinedGenre.tracks.length, 3, "refining a genre section must reuse the sound graph");
+    const refinedGenreBass = refinedGenre.tracks.find((track) => track.id === genreBass.id);
+    assert.equal(refinedGenre.tracks.length, 4, "refining a genre section must reuse the sound graph");
     assert.equal(
-      refinedGenre.tracks.find((track) => track.role === "bass").modulators.length,
-      1,
+      refinedGenreBass.modulators.length,
+      2,
       "refining a genre section must not stack identical bass modulators",
     );
     assert.equal(
-      refinedGenre.tracks
-        .find((track) => track.role === "bass")
-        .clips.filter((clip) => clip.label === "Syncopated bass").length,
+      refinedGenreBass.clips.filter((clip) => clip.label === "Syncopated bass").length,
       1,
       "refining the same section must replace, not duplicate, its bass MIDI",
     );
-    const refinedBassOnsetId = refinedGenre.tracks
-      .find((track) => track.role === "bass")
-      .clips.find((clip) => clip.label === "Syncopated bass")
+    assert.equal(
+      refinedGenre.edits.flatMap((edit) => edit.action.actions).filter((action) => action.type === "gain").length,
+      1,
+      "refining the same section must not stack its chord cut",
+    );
+    const refinedBassOnsetId = refinedGenreBass.clips
+      .find((clip) => clip.label === "Syncopated bass")
       .events[0].id;
 
     await evaluate(cdp, appSession, `(() => {

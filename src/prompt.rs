@@ -82,6 +82,20 @@ pub struct EditPlan {
 
 pub struct PromptEngine;
 
+#[derive(Clone, Copy)]
+struct PromptContext<'a> {
+    project: &'a Project,
+    selection_start: f32,
+    selection_end: f32,
+}
+
+#[derive(Clone, Copy)]
+struct DropBass {
+    track_id: u64,
+    instrument_id: u64,
+    modulator_id: Option<u64>,
+}
+
 impl PromptEngine {
     #[must_use]
     pub fn interpret(prompt: &str, current_bpm: u16) -> EditPlan {
@@ -89,26 +103,27 @@ impl PromptEngine {
     }
 
     #[must_use]
-    pub fn interpret_project(prompt: &str, project: &Project) -> EditPlan {
-        let bass_modulator = project
-            .tracks
-            .iter()
-            .rev()
-            .find(|track| track.role == TrackRole::Bass)
-            .and_then(|track| {
-                track
-                    .modulators
-                    .iter()
-                    .find(|modulator| modulator.target == "instrument.tone")
-                    .map(|modulator| (track.id, modulator.id))
-            });
-        Self::interpret_with_context(prompt, project.bpm, bass_modulator)
+    pub fn interpret_project(
+        prompt: &str,
+        project: &Project,
+        selection_start: f32,
+        selection_end: f32,
+    ) -> EditPlan {
+        Self::interpret_with_context(
+            prompt,
+            project.bpm,
+            Some(PromptContext {
+                project,
+                selection_start,
+                selection_end,
+            }),
+        )
     }
 
     fn interpret_with_context(
         prompt: &str,
         current_bpm: u16,
-        bass_modulator: Option<(u64, u64)>,
+        context: Option<PromptContext<'_>>,
     ) -> EditPlan {
         let normalized = prompt.trim().to_lowercase();
         let target = detect_role(&normalized);
@@ -129,7 +144,7 @@ impl PromptEngine {
         let wants_addition = contains_any(&normalized, &["add", "insert", "bring in"]);
 
         if contains_any(&normalized, &["drop", "dubstep"]) {
-            return electronic_drop_plan(bass_modulator);
+            return electronic_drop_plan(context);
         }
 
         if contains_any(
@@ -137,8 +152,26 @@ impl PromptEngine {
             &["midi clip", "rewrite the notes", "recompose the notes"],
         ) {
             if let Some(target) = target {
+                let midi_clip = midi_clip_for_role(target, "AI MIDI clip", 0.0, 1.0);
+                if context.is_some_and(|context| {
+                    !context
+                        .project
+                        .tracks
+                        .iter()
+                        .any(|track| track.role == target)
+                }) {
+                    return EditPlan {
+                        action: Action::Compound {
+                            actions: vec![Action::AddTrack { role: target }, midi_clip],
+                        },
+                        summary: format!(
+                            "Added a {} and composed an explicit MIDI clip",
+                            target.display_name()
+                        ),
+                    };
+                }
                 return EditPlan {
-                    action: midi_clip_for_role(target, "AI MIDI clip", 0.0, 1.0),
+                    action: midi_clip,
                     summary: format!(
                         "Recomposed the {} as an explicit MIDI clip",
                         target.display_name()
@@ -377,8 +410,15 @@ impl PromptEngine {
     }
 }
 
-fn electronic_drop_plan(bass_modulator: Option<(u64, u64)>) -> EditPlan {
-    let mut actions = vec![
+fn electronic_drop_plan(context: Option<PromptContext<'_>>) -> EditPlan {
+    let drop_bass = context.and_then(drop_bass_for_selection);
+    let mut actions = Vec::new();
+    if context.is_some() && drop_bass.is_none() {
+        actions.push(Action::AddTrack {
+            role: TrackRole::Bass,
+        });
+    }
+    actions.extend([
         Action::MidiClip {
             track_id: 0,
             target: TrackRole::Drums,
@@ -404,7 +444,7 @@ fn electronic_drop_plan(bass_modulator: Option<(u64, u64)>) -> EditPlan {
             ]),
         },
         Action::MidiClip {
-            track_id: 0,
+            track_id: drop_bass.map_or(0, |bass| bass.track_id),
             target: TrackRole::Bass,
             label: "Syncopated bass".to_owned(),
             start: 0.0,
@@ -420,12 +460,26 @@ fn electronic_drop_plan(bass_modulator: Option<(u64, u64)>) -> EditPlan {
                 (3.75, 0.25, 36, 0.8),
             ]),
         },
-        Action::Instrument {
+    ]);
+    if let Some(bass) = drop_bass {
+        actions.push(Action::Configure {
+            track_id: bass.track_id,
+            target: TrackRole::Bass,
+            tool: "instrument",
+            tool_id: bass.instrument_id,
+            clip_id: None,
+            parameter: "waveform",
+            value: "sawtooth".to_owned(),
+        });
+    } else {
+        actions.push(Action::Instrument {
             waveform: "sawtooth",
             target: TrackRole::Bass,
-        },
-    ];
-    if let Some((track_id, tool_id)) = bass_modulator {
+        });
+    }
+    if let Some((track_id, tool_id)) =
+        drop_bass.and_then(|bass| bass.modulator_id.map(|id| (bass.track_id, id)))
+    {
         actions.extend([
             Action::Configure {
                 track_id,
@@ -454,6 +508,15 @@ fn electronic_drop_plan(bass_modulator: Option<(u64, u64)>) -> EditPlan {
                 parameter: "depth",
                 value: "0.72".to_owned(),
             },
+            Action::Configure {
+                track_id,
+                target: TrackRole::Bass,
+                tool: "modulator",
+                tool_id,
+                clip_id: None,
+                parameter: "enabled",
+                value: "true".to_owned(),
+            },
         ]);
     } else {
         actions.push(Action::Modulator {
@@ -464,22 +527,47 @@ fn electronic_drop_plan(bass_modulator: Option<(u64, u64)>) -> EditPlan {
             target: TrackRole::Bass,
         });
     }
-    actions.extend([
-        Action::Effect {
-            name: "Punch compressor",
-            mix: 0.68,
-            target: Some(TrackRole::Bass),
-        },
-        Action::Gain {
+    actions.push(Action::Effect {
+        name: "Punch compressor",
+        mix: 0.68,
+        target: Some(TrackRole::Bass),
+    });
+    if drop_bass.is_none() {
+        actions.push(Action::Gain {
             amount: 0.58,
             target: Some(TrackRole::Chords),
-        },
-    ]);
+        });
+    }
     EditPlan {
         action: Action::Compound { actions },
         summary: "Recomposed the selection with half-time drums and syncopated modulated bass"
             .to_owned(),
     }
+}
+
+fn drop_bass_for_selection(context: PromptContext<'_>) -> Option<DropBass> {
+    context.project.tracks.iter().rev().find_map(|track| {
+        let owns_selection = track.role == TrackRole::Bass
+            && track.clips.iter().any(|clip| {
+                clip.label == "Syncopated bass"
+                    && same_time(clip.start, context.selection_start)
+                    && same_time(clip.end, context.selection_end)
+            });
+        owns_selection.then(|| DropBass {
+            track_id: track.id,
+            instrument_id: track.instrument.id,
+            modulator_id: track
+                .modulators
+                .iter()
+                .rev()
+                .find(|modulator| modulator.target == "instrument.tone")
+                .map(|modulator| modulator.id),
+        })
+    })
+}
+
+fn same_time(left: f32, right: f32) -> bool {
+    (left - right).abs() <= 0.001
 }
 
 fn midi_clip_for_role(role: TrackRole, label: &str, start: f32, end: f32) -> Action {
