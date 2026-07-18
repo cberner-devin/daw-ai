@@ -73,6 +73,7 @@ impl CodexPlanner {
         let mut child = Command::new("codex")
             .arg("exec")
             .arg("--ephemeral")
+            .arg("--skip-git-repo-check")
             .arg("--sandbox")
             .arg("read-only")
             .arg("--output-schema")
