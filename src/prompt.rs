@@ -152,7 +152,19 @@ impl PromptEngine {
             &["midi clip", "rewrite the notes", "recompose the notes"],
         ) {
             if let Some(target) = target {
-                let midi_clip = midi_clip_for_role(target, "AI MIDI clip", 0.0, 1.0);
+                let track_id = context
+                    .and_then(|context| overlapping_track_id(context, target))
+                    .unwrap_or(0);
+                if wants_removal {
+                    return EditPlan {
+                        action: midi_rest(track_id, target, "AI MIDI rest"),
+                        summary: format!(
+                            "Cleared the {} MIDI in the selection",
+                            target.display_name()
+                        ),
+                    };
+                }
+                let midi_clip = midi_clip_for_role(track_id, target, "AI MIDI clip", 0.0, 1.0);
                 if context.is_some_and(|context| {
                     !context
                         .project
@@ -414,16 +426,10 @@ fn electronic_drop_plan(context: Option<PromptContext<'_>>) -> EditPlan {
     let drop_bass = context.and_then(drop_bass_for_selection);
     let mut actions = Vec::new();
     if context.is_some() && drop_bass.is_none() {
-        if let Some(track_id) = context.and_then(latest_bass_track_id) {
-            actions.push(Action::MidiClip {
-                track_id,
-                target: TrackRole::Bass,
-                label: "Bass rest".to_owned(),
-                start: 0.0,
-                end: 1.0,
-                loop_beats: 4.0,
-                notes: Vec::new(),
-            });
+        if let Some(track_id) =
+            context.and_then(|context| overlapping_track_id(context, TrackRole::Bass))
+        {
+            actions.push(midi_rest(track_id, TrackRole::Bass, "Bass rest"));
         }
         actions.push(Action::AddTrack {
             role: TrackRole::Bass,
@@ -431,7 +437,9 @@ fn electronic_drop_plan(context: Option<PromptContext<'_>>) -> EditPlan {
     }
     actions.extend([
         Action::MidiClip {
-            track_id: 0,
+            track_id: context
+                .and_then(|context| overlapping_track_id(context, TrackRole::Drums))
+                .unwrap_or(0),
             target: TrackRole::Drums,
             label: "Half-time drums".to_owned(),
             start: 0.0,
@@ -556,13 +564,18 @@ fn electronic_drop_plan(context: Option<PromptContext<'_>>) -> EditPlan {
     }
 }
 
-fn latest_bass_track_id(context: PromptContext<'_>) -> Option<u64> {
+fn overlapping_track_id(context: PromptContext<'_>, role: TrackRole) -> Option<u64> {
     context
         .project
         .tracks
         .iter()
         .rev()
-        .find(|track| track.role == TrackRole::Bass)
+        .find(|track| {
+            track.role == role
+                && track.clips.iter().any(|clip| {
+                    clip.start < context.selection_end && clip.end > context.selection_start
+                })
+        })
         .map(|track| track.id)
 }
 
@@ -591,7 +604,19 @@ fn same_time(left: f32, right: f32) -> bool {
     (left - right).abs() <= 0.001
 }
 
-fn midi_clip_for_role(role: TrackRole, label: &str, start: f32, end: f32) -> Action {
+fn midi_rest(track_id: u64, role: TrackRole, label: &str) -> Action {
+    Action::MidiClip {
+        track_id,
+        target: role,
+        label: label.to_owned(),
+        start: 0.0,
+        end: 1.0,
+        loop_beats: 4.0,
+        notes: Vec::new(),
+    }
+}
+
+fn midi_clip_for_role(track_id: u64, role: TrackRole, label: &str, start: f32, end: f32) -> Action {
     let notes = match role {
         TrackRole::Drums => midi_notes(&[
             (0.0, 0.25, 36, 0.92),
@@ -622,7 +647,7 @@ fn midi_clip_for_role(role: TrackRole, label: &str, start: f32, end: f32) -> Act
         TrackRole::Texture => midi_notes(&[(0.0, 3.8, 64, 0.5), (0.0, 3.4, 71, 0.38)]),
     };
     Action::MidiClip {
-        track_id: 0,
+        track_id,
         target: role,
         label: label.to_owned(),
         start,
