@@ -61,7 +61,6 @@ be simple primitives that the AI (or user) uses to build the sound
 ### Implementation
 
 The interface should be a local webserver with no authentication required. It should run on port 8888 by default.
-It should support reverse proxy deployments without any configuration of the hostname by the user.
 
 The backend is written in Rust. The client code should be responsive and the UI should work on mobile or a desktop
 browser.
@@ -74,3 +73,10 @@ be represented a way that is friendly for Codex:
 * The sound graph should be stored in a file on disk that Codex can edit directly
 * Additionally, tools should be provided that are registered with Codex and that make the
   modifications to the sound graph and return useful error messages to Codex.
+
+### Deployment
+
+The expected deployment is either as a local webserver, or on a private network where a gateway handles authentication.
+To support the latter case, the DAW AI server must not restrict the hostname in requests.
+Also to support the reverse proxy case, the server must be designed for reasonable timeouts and other characters
+appropriate to deploy it behind nginx.
