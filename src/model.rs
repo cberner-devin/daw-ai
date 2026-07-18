@@ -1,8 +1,10 @@
-use std::fmt::Write;
+use std::fmt::{self, Write};
 
 use crate::prompt::{Action, PromptEngine};
 
 const HISTORY_LIMIT: usize = 50;
+pub(crate) const EDIT_LOG_LIMIT: usize = 256;
+pub(crate) const MAX_PROMPT_CHARACTERS: usize = 2_000;
 
 struct ModulationTarget {
     id: String,
@@ -138,6 +140,21 @@ pub struct Project {
     pub edits: Vec<Edit>,
 }
 
+#[derive(Debug, PartialEq)]
+pub struct ProjectFileError(String);
+
+impl ProjectFileError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl fmt::Display for ProjectFileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 impl Project {
     #[must_use]
     pub fn demo() -> Self {
@@ -153,6 +170,10 @@ impl Project {
             ],
             edits: Vec::new(),
         }
+    }
+
+    pub fn from_json(source: &str) -> Result<Self, ProjectFileError> {
+        crate::project_file::parse_project(source)
     }
 
     fn highest_id(&self) -> u64 {
@@ -195,10 +216,16 @@ impl Project {
         let mut output = String::with_capacity(4096);
         self.write_graph_json(&mut output);
         output.push_str(",\"regionalEdits\":[");
+        let regional_count = self
+            .edits
+            .iter()
+            .filter(|edit| edit.action.has_regional_state())
+            .count();
         for (index, edit) in self
             .edits
             .iter()
             .filter(|edit| edit.action.has_regional_state())
+            .skip(regional_count.saturating_sub(EDIT_LOG_LIMIT))
             .enumerate()
         {
             if index > 0 {
@@ -208,6 +235,21 @@ impl Project {
         }
         output.push_str("]}");
         output
+    }
+
+    fn compact_edit_log(&mut self) {
+        let mut excess = self.edits.len().saturating_sub(EDIT_LOG_LIMIT);
+        self.edits.retain(|edit| {
+            if excess > 0 && !edit.action.has_regional_state() {
+                excess -= 1;
+                false
+            } else {
+                true
+            }
+        });
+        if excess > 0 {
+            self.edits.drain(..excess);
+        }
     }
 
     fn write_graph_json(&self, output: &mut String) {
@@ -655,6 +697,7 @@ impl Action {
 #[derive(Debug, PartialEq)]
 pub enum StudioError {
     EmptyPrompt,
+    InvalidPrompt,
     InvalidSelection,
     UnknownTrack,
     InvalidMix,
@@ -662,6 +705,7 @@ pub enum StudioError {
     InvalidSoundTool,
 }
 
+#[derive(Clone)]
 pub struct Studio {
     project: Project,
     history: Vec<Project>,
@@ -682,6 +726,20 @@ impl Studio {
             .highest_id()
             .checked_add(1)
             .expect("demo project exhausted the ID namespace");
+        Self {
+            project,
+            history: Vec::new(),
+            next_id,
+        }
+    }
+
+    #[must_use]
+    pub fn from_project(mut project: Project) -> Self {
+        project.compact_edit_log();
+        let next_id = project
+            .highest_id()
+            .checked_add(1)
+            .expect("project exhausted the ID namespace");
         Self {
             project,
             history: Vec::new(),
@@ -717,6 +775,9 @@ impl Studio {
         let prompt = prompt.trim();
         if prompt.is_empty() {
             return Err(StudioError::EmptyPrompt);
+        }
+        if prompt.chars().count() > MAX_PROMPT_CHARACTERS {
+            return Err(StudioError::InvalidPrompt);
         }
         if !start.is_finite()
             || !end.is_finite()
@@ -758,6 +819,42 @@ impl Studio {
             summary: summary.clone(),
             action: plan.action,
         });
+        self.project.compact_edit_log();
+        self.project.version += 1;
+        Ok(summary)
+    }
+
+    pub fn replace_graph(
+        &mut self,
+        mut project: Project,
+        start: f32,
+        end: f32,
+        prompt: &str,
+        plan: crate::prompt::EditPlan,
+    ) -> Result<String, StudioError> {
+        self.validate_edit(start, end, prompt)?;
+        project.edits = self.project.edits.clone();
+        project.version = self.project.version;
+        let next_id = project
+            .highest_id()
+            .checked_add(1)
+            .expect("project exhausted the ID namespace");
+
+        let prompt = prompt.trim();
+        let summary = plan.summary;
+        self.remember();
+        self.project = project;
+        self.next_id = next_id;
+        let edit_id = self.take_id();
+        self.project.edits.push(Edit {
+            id: edit_id,
+            start,
+            end,
+            prompt: prompt.to_owned(),
+            summary: summary.clone(),
+            action: plan.action,
+        });
+        self.project.compact_edit_log();
         self.project.version += 1;
         Ok(summary)
     }
@@ -2379,6 +2476,10 @@ mod tests {
             Err(StudioError::EmptyPrompt)
         );
         assert_eq!(
+            studio.apply_prompt(0.0, 2.0, &"x".repeat(MAX_PROMPT_CHARACTERS + 1)),
+            Err(StudioError::InvalidPrompt)
+        );
+        assert_eq!(
             studio.apply_prompt(4.0, 2.0, "louder"),
             Err(StudioError::InvalidSelection)
         );
@@ -2508,7 +2609,46 @@ mod tests {
     }
 
     #[test]
-    fn planner_projection_excludes_materialized_edit_payloads() {
+    fn replaces_a_codex_graph_as_one_undoable_edit() {
+        let mut studio = Studio::new();
+        let before = studio.project().to_json();
+        let plan = crate::prompt::EditPlan {
+            action: Action::Configure {
+                track_id: 2,
+                target: TrackRole::Bass,
+                tool: "instrument",
+                tool_id: 201,
+                clip_id: None,
+                parameter: "waveform",
+                value: "sawtooth".to_owned(),
+            },
+            summary: "Brightened the bass".to_owned(),
+        };
+        let mut session = Studio::from_project(studio.project().clone());
+        session
+            .apply_plan(4.0, 8.0, "brighten the bass", plan.clone())
+            .expect("valid session edit");
+
+        studio
+            .replace_graph(
+                session.project().clone(),
+                4.0,
+                8.0,
+                "brighten the bass",
+                plan,
+            )
+            .expect("valid graph replacement");
+        assert_eq!(studio.project().edits.len(), 1);
+        assert_eq!(studio.project().version, 2);
+        assert_eq!(studio.project().tracks[1].instrument.waveform, "sawtooth");
+        assert!(studio.undo());
+        let mut restored = studio.project().clone();
+        restored.version = 1;
+        assert_eq!(restored.to_json(), before);
+    }
+
+    #[test]
+    fn planner_projection_omits_materialized_history_payloads() {
         let mut studio = Studio::new();
         for _ in 0..64 {
             studio
@@ -2534,6 +2674,19 @@ mod tests {
         assert!(!planner_json.contains("\"prompt\":"));
         assert!(planner_json.contains("\"regionalEdits\":["));
         assert!(planner_json.contains("\"type\":\"effect\""));
+    }
+
+    #[test]
+    fn materialized_edit_log_is_bounded() {
+        let mut studio = Studio::new();
+        for _ in 0..EDIT_LOG_LIMIT + 8 {
+            studio
+                .apply_prompt(0.0, 2.0, "increase volume")
+                .expect("valid edit");
+        }
+
+        assert_eq!(studio.project().edits.len(), EDIT_LOG_LIMIT);
+        assert!(Project::from_json(&studio.project().to_json()).is_ok());
     }
 
     #[test]

@@ -1,22 +1,20 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::model::{Project, TrackRole};
+use crate::codex_mcp::{EditSession, MCP_SESSION_ENV, MCP_TOOL_NAME};
+use crate::json::{JsonParser, JsonValue};
+use crate::model::{Project, TrackRole, json_string};
 use crate::prompt::{Action, EditPlan, MidiNote};
 
-const EDIT_SCHEMA: &str = include_str!("../codex/edit-plan.schema.json");
+pub(crate) const EDIT_SCHEMA: &str = include_str!("../codex/edit-plan.schema.json");
 const STUDIO_CONTRACT: &str = include_str!("../codex/STUDIO.md");
 const CODEX_MODEL: &str = "gpt-5.6-sol";
 const CODEX_REASONING: &str = "model_reasoning_effort=\"high\"";
 const CODEX_TIMEOUT: Duration = Duration::from_secs(90);
-static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub enum PlannerError {
@@ -49,32 +47,57 @@ impl fmt::Display for PlannerError {
 
 pub struct CodexPlanner;
 
+pub struct CodexEdit {
+    pub plan: EditPlan,
+    pub project: Project,
+}
+
 impl CodexPlanner {
     pub fn interpret(
         prompt: &str,
         start: f32,
         end: f32,
         project: &Project,
-    ) -> Result<EditPlan, PlannerError> {
-        let schema = TempSchema::create()?;
-        let task = planner_task(prompt, start, end, project);
-        let current_directory = std::env::current_dir().map_err(PlannerError::Io)?;
+    ) -> Result<CodexEdit, PlannerError> {
+        let session = EditSession::create(project, prompt, start, end).map_err(PlannerError::Io)?;
+        let task = planner_task(prompt, start, end);
+        let executable = std::env::current_exe().map_err(PlannerError::Io)?;
+        let mcp_config = format!(
+            concat!(
+                "mcp_servers={{daw_ai={{command={},args=[\"--mcp\"],",
+                "env_vars=[\"{}\"],required=true,enabled_tools=[\"{}\"],",
+                "default_tools_approval_mode=\"approve\"}}}}"
+            ),
+            json_string(&executable.to_string_lossy()),
+            MCP_SESSION_ENV,
+            MCP_TOOL_NAME
+        );
         let mut child = Command::new("codex")
             .arg("exec")
             .arg("--ephemeral")
+            .arg("--ignore-user-config")
             .arg("--model")
             .arg(CODEX_MODEL)
             .arg("--config")
             .arg(CODEX_REASONING)
+            .arg("--config")
+            .arg("approval_policy=\"never\"")
+            .arg("--config")
+            .arg("web_search=\"disabled\"")
+            .arg("--config")
+            .arg("sandbox_workspace_write.exclude_tmpdir_env_var=true")
+            .arg("--config")
+            .arg("sandbox_workspace_write.exclude_slash_tmp=true")
+            .arg("--config")
+            .arg(mcp_config)
             .arg("--skip-git-repo-check")
             .arg("--sandbox")
-            .arg("read-only")
-            .arg("--output-schema")
-            .arg(&schema.path)
+            .arg("workspace-write")
             .arg("--color")
             .arg("never")
             .arg("--cd")
-            .arg(current_directory)
+            .arg(session.path())
+            .env(MCP_SESSION_ENV, session.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -112,37 +135,83 @@ impl CodexPlanner {
         let output = stdout_reader
             .join()
             .map_err(|_| PlannerError::InvalidOutput("stdout reader stopped".to_owned()))??;
-        let _stderr = stderr_reader
+        let stderr = stderr_reader
             .join()
             .map_err(|_| PlannerError::InvalidOutput("stderr reader stopped".to_owned()))??;
         let stdin_result = stdin_writer
             .join()
             .map_err(|_| PlannerError::InvalidOutput("stdin writer stopped".to_owned()))?;
+        let stderr = String::from_utf8_lossy(&stderr);
         if !status.success() {
+            if !stderr.trim().is_empty() {
+                eprintln!(
+                    "error: Codex edit failed: {}",
+                    bounded_log_text(&stderr, 4_096)
+                );
+            }
             return Err(PlannerError::Failed);
         }
         stdin_result?;
-        let output = String::from_utf8(output)
+        String::from_utf8(output)
             .map_err(|_| PlannerError::InvalidOutput("response was not UTF-8".to_owned()))?;
-        plan_from_json(&output)
+        log_codex_warnings(&stderr);
+        let (plan, project) = session.finish().map_err(|message| invalid(&message))?;
+        Ok(CodexEdit { plan, project })
     }
 }
 
-fn planner_task(prompt: &str, start: f32, end: f32, project: &Project) -> String {
+pub fn run_mcp() -> std::io::Result<()> {
+    crate::codex_mcp::run_from_environment()
+}
+
+fn planner_task(prompt: &str, start: f32, end: f32) -> String {
     format!(
         concat!(
-            "You are the planning engine inside DAW-AI. Do not edit files or run tools. ",
-            "Return only a synth edit matching the provided JSON schema.\n\n",
-            "{contract}\n\nCurrent project JSON:\n{project}\n\n",
+            "You are the sound-graph editing engine inside DAW-AI. Read sound-graph.json in ",
+            "the current directory before deciding what to change. First form a musical plan, ",
+            "then use the registered daw_ai {tool} tool for every intended graph change. ",
+            "You may work iteratively, but use no more than eight actions in total. The tool ",
+            "validates each batch, updates sound-graph.json, and gives errors you must correct. ",
+            "Do not stop after merely describing or manually editing the graph: at least one ",
+            "successful {tool} call is required. After the graph is complete, reply briefly.\n\n",
+            "{contract}\n\n",
             "Selected region: {start:.3} to {end:.3} seconds.\n",
             "User request: {prompt}\n"
         ),
         contract = STUDIO_CONTRACT,
-        project = project.planner_json(),
+        tool = MCP_TOOL_NAME,
         start = start,
         end = end,
         prompt = prompt,
     )
+}
+
+fn log_codex_warnings(stderr: &str) {
+    for line in stderr
+        .lines()
+        .filter(|line| {
+            let line = line.to_ascii_lowercase();
+            line.contains("warning") || line.contains("error")
+        })
+        .take(16)
+    {
+        eprintln!("warning: Codex: {}", bounded_log_text(line, 1_024));
+    }
+}
+
+fn bounded_log_text(value: &str, maximum: usize) -> String {
+    value
+        .trim()
+        .chars()
+        .take(maximum)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn read_stream(mut stream: impl Read) -> Result<Vec<u8>, PlannerError> {
@@ -151,57 +220,10 @@ fn read_stream(mut stream: impl Read) -> Result<Vec<u8>, PlannerError> {
     Ok(bytes)
 }
 
-struct TempSchema {
-    path: PathBuf,
-}
-
-impl TempSchema {
-    fn create() -> Result<Self, PlannerError> {
-        for _ in 0..64 {
-            let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "daw-ai-edit-schema-{}-{id}.json",
-                std::process::id()
-            ));
-            match Self::create_at(path) {
-                Err(PlannerError::Io(error))
-                    if error.kind() == std::io::ErrorKind::AlreadyExists =>
-                {
-                    continue;
-                }
-                result => return result,
-            }
-        }
-        Err(PlannerError::Io(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not reserve a temporary schema path",
-        )))
-    }
-
-    fn create_at(path: PathBuf) -> Result<Self, PlannerError> {
-        // create_new atomically refuses existing files and symlinks.
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(PlannerError::Io)?;
-        if let Err(error) = file.write_all(EDIT_SCHEMA.as_bytes()) {
-            drop(file);
-            let _ = fs::remove_file(&path);
-            return Err(PlannerError::Io(error));
-        }
-        Ok(Self { path })
-    }
-}
-
-impl Drop for TempSchema {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn plan_from_json(source: &str) -> Result<EditPlan, PlannerError> {
-    let value = JsonParser::new(source).parse()?;
+pub(crate) fn plan_from_json(source: &str) -> Result<EditPlan, PlannerError> {
+    let value = JsonParser::new(source)
+        .parse()
+        .map_err(|error| invalid(&error.to_string()))?;
     let object = value
         .as_object()
         .ok_or_else(|| invalid("top-level response must be an object"))?;
@@ -500,288 +522,9 @@ fn invalid(message: &str) -> PlannerError {
     PlannerError::InvalidOutput(message.to_owned())
 }
 
-#[derive(Debug)]
-enum JsonValue {
-    Null,
-    Bool,
-    Number(f64),
-    String(String),
-    Array(Vec<JsonValue>),
-    Object(HashMap<String, JsonValue>),
-}
-
-impl JsonValue {
-    fn as_object(&self) -> Option<&HashMap<String, Self>> {
-        if let Self::Object(value) = self {
-            Some(value)
-        } else {
-            None
-        }
-    }
-
-    fn as_array(&self) -> Option<&[Self]> {
-        if let Self::Array(value) = self {
-            Some(value)
-        } else {
-            None
-        }
-    }
-
-    fn as_string(&self) -> Option<&str> {
-        if let Self::String(value) = self {
-            Some(value)
-        } else {
-            None
-        }
-    }
-
-    const fn as_number(&self) -> Option<f64> {
-        if let Self::Number(value) = self {
-            Some(*value)
-        } else {
-            None
-        }
-    }
-}
-
-struct JsonParser<'a> {
-    bytes: &'a [u8],
-    index: usize,
-}
-
-impl<'a> JsonParser<'a> {
-    const fn new(source: &'a str) -> Self {
-        Self {
-            bytes: source.as_bytes(),
-            index: 0,
-        }
-    }
-
-    fn parse(mut self) -> Result<JsonValue, PlannerError> {
-        let value = self.parse_value()?;
-        self.skip_whitespace();
-        if self.index != self.bytes.len() {
-            return Err(invalid("unexpected content after JSON response"));
-        }
-        Ok(value)
-    }
-
-    fn parse_value(&mut self) -> Result<JsonValue, PlannerError> {
-        self.skip_whitespace();
-        match self.bytes.get(self.index) {
-            Some(b'{') => self.parse_object(),
-            Some(b'[') => self.parse_array(),
-            Some(b'"') => self.parse_string().map(JsonValue::String),
-            Some(b't') => self.parse_literal(b"true", JsonValue::Bool),
-            Some(b'f') => self.parse_literal(b"false", JsonValue::Bool),
-            Some(b'n') => self.parse_literal(b"null", JsonValue::Null),
-            Some(b'-' | b'0'..=b'9') => self.parse_number(),
-            _ => Err(invalid("invalid JSON value")),
-        }
-    }
-
-    fn parse_object(&mut self) -> Result<JsonValue, PlannerError> {
-        self.index += 1;
-        let mut object = HashMap::new();
-        loop {
-            self.skip_whitespace();
-            if self.consume(b'}') {
-                return Ok(JsonValue::Object(object));
-            }
-            let key = self.parse_string()?;
-            self.skip_whitespace();
-            if !self.consume(b':') {
-                return Err(invalid("missing colon in JSON object"));
-            }
-            let value = self.parse_value()?;
-            object.insert(key, value);
-            self.skip_whitespace();
-            if self.consume(b'}') {
-                return Ok(JsonValue::Object(object));
-            }
-            if !self.consume(b',') {
-                return Err(invalid("missing comma in JSON object"));
-            }
-        }
-    }
-
-    fn parse_array(&mut self) -> Result<JsonValue, PlannerError> {
-        self.index += 1;
-        let mut values = Vec::new();
-        loop {
-            self.skip_whitespace();
-            if self.consume(b']') {
-                return Ok(JsonValue::Array(values));
-            }
-            values.push(self.parse_value()?);
-            self.skip_whitespace();
-            if self.consume(b']') {
-                return Ok(JsonValue::Array(values));
-            }
-            if !self.consume(b',') {
-                return Err(invalid("missing comma in JSON array"));
-            }
-        }
-    }
-
-    fn parse_string(&mut self) -> Result<String, PlannerError> {
-        if !self.consume(b'"') {
-            return Err(invalid("expected JSON string"));
-        }
-        let mut output = Vec::new();
-        while let Some(byte) = self.bytes.get(self.index).copied() {
-            self.index += 1;
-            match byte {
-                b'"' => {
-                    return String::from_utf8(output)
-                        .map_err(|_| invalid("JSON string was not valid UTF-8"));
-                }
-                b'\\' => self.parse_escape(&mut output)?,
-                0..=31 => return Err(invalid("control character in JSON string")),
-                _ => output.push(byte),
-            }
-        }
-        Err(invalid("unterminated JSON string"))
-    }
-
-    fn parse_escape(&mut self, output: &mut Vec<u8>) -> Result<(), PlannerError> {
-        let Some(escaped) = self.bytes.get(self.index).copied() else {
-            return Err(invalid("unterminated JSON escape"));
-        };
-        self.index += 1;
-        match escaped {
-            b'"' | b'\\' | b'/' => output.push(escaped),
-            b'b' => output.push(8),
-            b'f' => output.push(12),
-            b'n' => output.push(b'\n'),
-            b'r' => output.push(b'\r'),
-            b't' => output.push(b'\t'),
-            b'u' => {
-                let character = self.parse_unicode_escape()?;
-                let mut bytes = [0_u8; 4];
-                output.extend_from_slice(character.encode_utf8(&mut bytes).as_bytes());
-            }
-            _ => return Err(invalid("invalid JSON escape")),
-        }
-        Ok(())
-    }
-
-    fn parse_unicode_escape(&mut self) -> Result<char, PlannerError> {
-        let first = self.parse_hex_codepoint()?;
-        let codepoint = match first {
-            0xD800..=0xDBFF => {
-                if !self.consume(b'\\') || !self.consume(b'u') {
-                    return Err(invalid("unpaired high surrogate in JSON string"));
-                }
-                let second = self.parse_hex_codepoint()?;
-                if !(0xDC00..=0xDFFF).contains(&second) {
-                    return Err(invalid("unpaired high surrogate in JSON string"));
-                }
-                0x1_0000 + ((first - 0xD800) << 10) + (second - 0xDC00)
-            }
-            0xDC00..=0xDFFF => return Err(invalid("unpaired low surrogate in JSON string")),
-            _ => first,
-        };
-        char::from_u32(codepoint).ok_or_else(|| invalid("invalid Unicode escape in JSON string"))
-    }
-
-    fn parse_hex_codepoint(&mut self) -> Result<u32, PlannerError> {
-        if self.index + 4 > self.bytes.len() {
-            return Err(invalid("short Unicode escape in JSON string"));
-        }
-        let mut value = 0_u32;
-        for byte in &self.bytes[self.index..self.index + 4] {
-            value = value * 16
-                + match byte {
-                    b'0'..=b'9' => u32::from(byte - b'0'),
-                    b'a'..=b'f' => u32::from(byte - b'a' + 10),
-                    b'A'..=b'F' => u32::from(byte - b'A' + 10),
-                    _ => return Err(invalid("invalid Unicode escape in JSON string")),
-                };
-        }
-        self.index += 4;
-        Ok(value)
-    }
-
-    fn parse_number(&mut self) -> Result<JsonValue, PlannerError> {
-        let start = self.index;
-        while matches!(
-            self.bytes.get(self.index),
-            Some(b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
-        ) {
-            self.index += 1;
-        }
-        let number = std::str::from_utf8(&self.bytes[start..self.index])
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite())
-            .ok_or_else(|| invalid("invalid JSON number"))?;
-        Ok(JsonValue::Number(number))
-    }
-
-    fn parse_literal(
-        &mut self,
-        literal: &[u8],
-        value: JsonValue,
-    ) -> Result<JsonValue, PlannerError> {
-        if self.bytes.get(self.index..self.index + literal.len()) == Some(literal) {
-            self.index += literal.len();
-            Ok(value)
-        } else {
-            Err(invalid("invalid JSON literal"))
-        }
-    }
-
-    fn skip_whitespace(&mut self) {
-        while matches!(
-            self.bytes.get(self.index),
-            Some(b' ' | b'\n' | b'\r' | b'\t')
-        ) {
-            self.index += 1;
-        }
-    }
-
-    fn consume(&mut self, byte: u8) -> bool {
-        if self.bytes.get(self.index) == Some(&byte) {
-            self.index += 1;
-            true
-        } else {
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn temporary_schema_creation_does_not_follow_symlinks() {
-        use std::os::unix::fs::symlink;
-
-        let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let target =
-            std::env::temp_dir().join(format!("daw-ai-schema-target-{}-{id}", std::process::id()));
-        let link =
-            std::env::temp_dir().join(format!("daw-ai-schema-link-{}-{id}", std::process::id()));
-        fs::write(&target, "preserve this file").expect("writable test target");
-        symlink(&target, &link).expect("creatable test symlink");
-
-        let error = match TempSchema::create_at(link.clone()) {
-            Ok(_) => panic!("an existing symlink must not be opened"),
-            Err(PlannerError::Io(error)) => error,
-            Err(error) => panic!("unexpected error: {error}"),
-        };
-        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(
-            fs::read_to_string(&target).expect("readable test target"),
-            "preserve this file"
-        );
-
-        fs::remove_file(link).expect("removable test symlink");
-        fs::remove_file(target).expect("removable test target");
-    }
 
     #[test]
     fn parses_a_compound_structured_edit() {
