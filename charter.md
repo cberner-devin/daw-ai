@@ -25,7 +25,20 @@ The following sound tools should be implemented and available in the advanced vi
 * Effect: Processes sound produced by an instrument, such as a filter, distortion, compressor, delay, or reverb, and exposes configurable parameters. May be chained with previous Effect.
 * Modulator: Generates time-varying control values—such as envelopes, LFOs, or arbitrary curves—which can control any Instrument or Effect parameter.
 
-Routing: Instruments, effects, and modulators can be connected into a signal chain.
+Routing: Instruments, effects, and modulators can be connected into a sound graph.
+
+Edges in the sound graph carry one of the following types:
+
+* MIDI events: Timed musical events such as note-on, note-off, pitch, velocity, and other performance controls.
+* Audio signal: Mono or stereo digital audio.
+* Control signal: A time-varying numeric value used to control an Instrument or Effect parameter.
+
+Connections must have compatible types:
+
+* MIDI Clip -> Instrument: MIDI events
+* Instrument -> Effect: Audio signal
+* Effect -> Effect or Output: Audio signal
+* Modulator -> Instrument or Effect parameter: Control signal
 
 ### AI editing
 
