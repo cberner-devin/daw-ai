@@ -2066,6 +2066,10 @@
     }
     elements.advancedDrawer.classList.toggle("is-open", view === "advanced");
     if (view === "debug") renderDebug();
+    if (view === "ai" && state.project) {
+      renderSelection();
+      renderPlayhead();
+    }
     window.scrollTo(0, 0);
   }
 
