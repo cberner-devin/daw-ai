@@ -31,12 +31,22 @@ the user and coding assistant have access to the machine DAW AI is deployed on, 
 
 The following sound tools should be implemented and available in the advanced view of the UI and also to the AI model.
 
-* MIDI Clip: Contains notes, including their timing, duration, pitch, and velocity.
-* Instrument: Produces sound from musical events. Instruments may be synthesizers or sample-based instruments and expose configurable parameters.
-* Effect: Processes sound produced by an instrument, such as a filter, distortion, compressor, delay, or reverb, and exposes configurable parameters. May be chained with previous Effect.
-* Modulator: Generates time-varying control values—such as envelopes, LFOs, or arbitrary curves—which can control any Instrument or Effect parameter.
+#### MIDI Clip
+Contains notes, including their timing, duration, pitch, and velocity.
 
-Routing: Instruments, effects, and modulators can be connected into a sound graph.
+#### Instrument:
+Produces sound from musical events. Instruments may be synthesizers or sample-based instruments and expose configurable parameters.
+At a minimum, this should include at least two oscillators, independently configurable waveform, tuning, and level all with configurable parameters.
+
+#### Effect
+Processes sound produced by an instrument, such as a filter, distortion, compressor, delay, or reverb, and exposes configurable parameters. May be chained with previous Effect.
+
+#### Modulator
+Generates time-varying control values—such as envelopes, LFOs, or arbitrary curves—which can control any Instrument or Effect parameter.
+My also be tempo sync'ed, or configured to trigger off a MIDI note event
+
+#### Routing
+Instruments, effects, and modulators can be connected into a sound graph.
 
 Edges in the sound graph carry one of the following types:
 
@@ -46,7 +56,7 @@ Edges in the sound graph carry one of the following types:
 
 Connections must have compatible types:
 
-* MIDI Clip -> Instrument: MIDI events
+* MIDI Clip -> Instrument or Modulator: MIDI events
 * Instrument -> Effect: Audio signal
 * Effect -> Effect or Output: Audio signal
 * Modulator -> Instrument or Effect parameter: Control signal
@@ -102,6 +112,10 @@ Codex is told to operate in an implementation loop. It should:
 DAW AI MUST NOT limit the number of iterations or tools calls, except with a long timeout on the whole request.
 
 DAW AI should display incremental updates to the progress bar as Codex progresses.
+
+#### Codex sessions
+By default Codex sessions are run in "ephemeral" mode. However, a toggle is available on the Debug tab to disable this
+and keep the sessions persistent. This is intended for debugging purposes.
 
 ### Deployment
 
