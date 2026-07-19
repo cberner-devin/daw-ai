@@ -123,6 +123,7 @@ pub struct Track {
 #[derive(Clone, Debug)]
 pub struct Edit {
     pub id: u64,
+    pub operation_id: Option<String>,
     pub start: f32,
     pub end: f32,
     pub prompt: String,
@@ -463,13 +464,17 @@ impl Track {
 
 impl Edit {
     fn write_json(&self, output: &mut String) {
+        write!(output, "{{\"id\":{}", self.id).expect("writing to a string cannot fail");
+        if let Some(operation_id) = &self.operation_id {
+            write!(output, ",\"operationId\":{}", json_string(operation_id))
+                .expect("writing to a string cannot fail");
+        }
         write!(
             output,
             concat!(
-                "{{\"id\":{},\"start\":{},\"end\":{},\"prompt\":{},",
+                ",\"start\":{},\"end\":{},\"prompt\":{},",
                 "\"summary\":{},\"action\":"
             ),
-            self.id,
             decimal(self.start),
             decimal(self.end),
             json_string(&self.prompt),
@@ -797,6 +802,28 @@ impl Studio {
         prompt: &str,
         plan: crate::prompt::EditPlan,
     ) -> Result<String, StudioError> {
+        self.apply_plan_inner(start, end, prompt, None, plan)
+    }
+
+    pub(crate) fn apply_plan_for_operation(
+        &mut self,
+        start: f32,
+        end: f32,
+        prompt: &str,
+        operation_id: String,
+        plan: crate::prompt::EditPlan,
+    ) -> Result<String, StudioError> {
+        self.apply_plan_inner(start, end, prompt, Some(operation_id), plan)
+    }
+
+    fn apply_plan_inner(
+        &mut self,
+        start: f32,
+        end: f32,
+        prompt: &str,
+        operation_id: Option<String>,
+        plan: crate::prompt::EditPlan,
+    ) -> Result<String, StudioError> {
         self.validate_edit(start, end, prompt)?;
         let mut candidate = Self {
             project: self.project.clone(),
@@ -813,6 +840,7 @@ impl Studio {
         let edit_id = self.take_id();
         self.project.edits.push(Edit {
             id: edit_id,
+            operation_id,
             start,
             end,
             prompt: prompt.to_owned(),
@@ -826,10 +854,34 @@ impl Studio {
 
     pub fn replace_graph(
         &mut self,
+        project: Project,
+        start: f32,
+        end: f32,
+        prompt: &str,
+        plan: crate::prompt::EditPlan,
+    ) -> Result<String, StudioError> {
+        self.replace_graph_inner(project, start, end, prompt, None, plan)
+    }
+
+    pub(crate) fn replace_graph_for_operation(
+        &mut self,
+        project: Project,
+        start: f32,
+        end: f32,
+        prompt: &str,
+        operation_id: String,
+        plan: crate::prompt::EditPlan,
+    ) -> Result<String, StudioError> {
+        self.replace_graph_inner(project, start, end, prompt, Some(operation_id), plan)
+    }
+
+    fn replace_graph_inner(
+        &mut self,
         mut project: Project,
         start: f32,
         end: f32,
         prompt: &str,
+        operation_id: Option<String>,
         plan: crate::prompt::EditPlan,
     ) -> Result<String, StudioError> {
         self.validate_edit(start, end, prompt)?;
@@ -848,6 +900,7 @@ impl Studio {
         let edit_id = self.take_id();
         self.project.edits.push(Edit {
             id: edit_id,
+            operation_id,
             start,
             end,
             prompt: prompt.to_owned(),

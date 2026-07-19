@@ -20,6 +20,11 @@
     promptForm: document.querySelector("#prompt-form"),
     promptInput: document.querySelector("#prompt-input"),
     composeButton: document.querySelector("#compose-button"),
+    editProgress: document.querySelector("#edit-progress"),
+    editProgressLabel: document.querySelector("#edit-progress-label"),
+    editProgressTime: document.querySelector("#edit-progress-time"),
+    editProgressTrack: document.querySelector("#edit-progress-track"),
+    editProgressFill: document.querySelector("#edit-progress-fill"),
     undoButton: document.querySelector("#undo-button"),
     resetButton: document.querySelector("#reset-button"),
     savedState: document.querySelector("#saved-state"),
@@ -47,6 +52,9 @@
   };
 
   let projectMutationQueue = Promise.resolve();
+  const RECONCILED_REQUEST_TIMEOUT_MS = 2000;
+  const EDIT_ACCEPTANCE_TIMEOUT_MS = 10_000;
+  const PENDING_EDIT_STORAGE_KEY = "daw-ai.pending-edit.v1";
 
   class AudioEngine {
     constructor() {
@@ -964,11 +972,61 @@
 
   const audio = new AudioEngine();
 
-  async function api(path, options = {}) {
-    const response = await fetch(path, options);
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "The studio could not complete that request.");
-    return data;
+  class ApiError extends Error {
+    constructor(message, status, retryable) {
+      super(message);
+      this.name = "ApiError";
+      this.status = status;
+      this.retryable = retryable;
+    }
+  }
+
+  class CommittedEditSyncError extends Error {
+    constructor(cause) {
+      super(`The edit completed, but the project could not be refreshed. Reload to see it. ${errorMessage(cause)}`);
+      this.name = "CommittedEditSyncError";
+    }
+  }
+
+  function isRetryableHttpStatus(status) {
+    return status >= 500 || status === 408 || status === 429;
+  }
+
+  async function api(path, options = {}, timeoutMs = null) {
+    let requestOptions = options;
+    let timeout = null;
+    if (timeoutMs !== null) {
+      const controller = new AbortController();
+      timeout = window.setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+      requestOptions = { ...options, signal: controller.signal };
+    }
+    try {
+      const response = await fetch(path, requestOptions);
+      let data;
+      try {
+        data = await response.json();
+      } catch (_error) {
+        throw new ApiError(
+          `The studio returned an invalid response (${response.status}).`,
+          response.status,
+          response.ok || isRetryableHttpStatus(response.status),
+        );
+      }
+      if (!response.ok) {
+        throw new ApiError(
+          data.error || "The studio could not complete that request.",
+          response.status,
+          isRetryableHttpStatus(response.status),
+        );
+      }
+      return data;
+    } finally {
+      if (timeout !== null) window.clearTimeout(timeout);
+    }
+  }
+
+  function isRetryableApiError(error) {
+    return !(error instanceof ApiError) || error.retryable;
   }
 
   function errorMessage(error) {
@@ -1577,45 +1635,358 @@
     renderSelection();
   }
 
+  function showEditProgress(job) {
+    const elapsed = Math.max(0, Number(job.elapsedSeconds) || 0);
+    const timeout = Math.max(1, Number(job.timeoutSeconds) || 20 * 60);
+    const detail = job.detail || "Codex is working on the edit";
+    const percent = clamp((elapsed / timeout) * 100, 0, 100);
+    elements.editProgress.hidden = false;
+    if (elements.editProgressLabel.textContent !== detail) elements.editProgressLabel.textContent = detail;
+    elements.editProgressTime.textContent = `${formatTime(elapsed, false)} / ${formatTime(timeout, false)}`;
+    elements.editProgressFill.style.width = `${percent}%`;
+    elements.editProgressTrack.setAttribute("aria-valuemax", String(timeout));
+    elements.editProgressTrack.setAttribute("aria-valuenow", String(Math.min(elapsed, timeout)));
+    elements.savedState.textContent = `${detail} - ${formatTime(elapsed, false)} elapsed`;
+    elements.composeButton.querySelector("span").textContent =
+      job.phase === "syncing"
+        ? "Refreshing project..."
+        : job.phase === "applying"
+          ? "Applying change..."
+          : "Codex is working...";
+  }
+
+  function hideEditProgress() {
+    elements.editProgress.hidden = true;
+    elements.editProgressFill.style.width = "0%";
+  }
+
+  function wait(milliseconds) {
+    return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+  }
+
+  function operationId() {
+    if (typeof window.crypto.randomUUID === "function") return window.crypto.randomUUID();
+    const bytes = window.crypto.getRandomValues(new Uint8Array(16));
+    return `client-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  }
+
+  function readPendingEdit() {
+    try {
+      const serialized = window.localStorage.getItem(PENDING_EDIT_STORAGE_KEY);
+      if (!serialized) return null;
+      const pending = JSON.parse(serialized);
+      const validOperationId =
+        typeof pending.operationId === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(pending.operationId);
+      const validRequest =
+        typeof pending.prompt === "string" &&
+        pending.prompt.length > 0 &&
+        typeof pending.submittedText === "string" &&
+        Number.isFinite(pending.start) &&
+        Number.isFinite(pending.end) &&
+        pending.start < pending.end;
+      const validJob =
+        pending.acceptedJob === null ||
+        (typeof pending.acceptedJob === "object" &&
+          typeof pending.acceptedJob.id === "string" &&
+          pending.acceptedJob.operationId === pending.operationId);
+      if (validOperationId && validRequest && validJob) return pending;
+    } catch (_error) {
+      // Invalid or unavailable storage must not prevent the studio from loading.
+    }
+    try {
+      window.localStorage.removeItem(PENDING_EDIT_STORAGE_KEY);
+    } catch (_error) {
+      // Ignore unavailable storage.
+    }
+    return null;
+  }
+
+  function persistPendingEdit(pending) {
+    try {
+      window.localStorage.setItem(PENDING_EDIT_STORAGE_KEY, JSON.stringify(pending));
+    } catch (error) {
+      reportClientIssue("warning", error, "persisting an active edit");
+    }
+  }
+
+  function clearPendingEdit(clientOperationId) {
+    try {
+      const serialized = window.localStorage.getItem(PENDING_EDIT_STORAGE_KEY);
+      if (!serialized) return;
+      const pending = JSON.parse(serialized);
+      if (pending.operationId === clientOperationId) {
+        window.localStorage.removeItem(PENDING_EDIT_STORAGE_KEY);
+      }
+    } catch (_error) {
+      // Ignore unavailable storage.
+    }
+  }
+
+  function requestTimeout(deadline) {
+    return Math.min(RECONCILED_REQUEST_TIMEOUT_MS, Math.max(0, Math.floor(deadline - performance.now())));
+  }
+
+  async function acceptEdit(clientOperationId, requestBody, onFirstAttempt) {
+    const deadline = performance.now() + EDIT_ACCEPTANCE_TIMEOUT_MS;
+    let failures = 0;
+    let firstAttempt = true;
+    for (;;) {
+      const timeout = requestTimeout(deadline);
+      if (timeout === 0) {
+        return {
+          status: "unavailable",
+          operationId: clientOperationId,
+          error: new Error("The studio did not confirm whether it accepted the edit."),
+        };
+      }
+      try {
+        const job = await enqueueProjectMutation(async () => {
+          if (firstAttempt) {
+            firstAttempt = false;
+            onFirstAttempt();
+          }
+          return api(
+            "/api/edits",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: requestBody,
+            },
+            timeout,
+          );
+        });
+        if (job.operationId !== clientOperationId) {
+          return {
+            status: "unavailable",
+            operationId: clientOperationId,
+            error: new Error("The studio returned a different edit operation."),
+          };
+        }
+        return job;
+      } catch (error) {
+        if (error instanceof ApiError && !error.retryable) {
+          if (failures === 0) throw error;
+          return { status: "unavailable", operationId: clientOperationId, error };
+        }
+        if (performance.now() >= deadline) {
+          return { status: "unavailable", operationId: clientOperationId, error };
+        }
+        failures += 1;
+        showEditProgress({
+          phase: "queued",
+          detail: "Connection interrupted; confirming the edit was accepted",
+          elapsedSeconds: Math.floor((EDIT_ACCEPTANCE_TIMEOUT_MS - (deadline - performance.now())) / 1000),
+          timeoutSeconds: EDIT_ACCEPTANCE_TIMEOUT_MS / 1000,
+        });
+        await wait(clamp(250 * 2 ** (failures - 1), 250, 5000));
+      }
+    }
+  }
+
+  async function pollAcceptedEdit(initialJob) {
+    let job = initialJob;
+    let consecutivePollFailures = 0;
+    const remainingSeconds = Math.max(
+      0,
+      (Number(initialJob.timeoutSeconds) || 20 * 60) - (Number(initialJob.elapsedSeconds) || 0),
+    );
+    const visibilityDeadline = performance.now() + remainingSeconds * 1000 + 30_000;
+    for (;;) {
+      showEditProgress(job);
+      if (job.status === "completed") return job;
+      if (job.status === "failed") return job;
+      if (job.status !== "queued" && job.status !== "running") {
+        return { status: "unavailable", error: new Error("The studio returned an unknown edit status.") };
+      }
+      const serverPollAfter = clamp(Number(job.pollAfterMs) || 1000, 20, 5000);
+      const pollAfter = clamp(serverPollAfter * 2 ** consecutivePollFailures, 20, 5000);
+      await wait(pollAfter);
+      const timeout = requestTimeout(visibilityDeadline);
+      if (timeout === 0) {
+        return { status: "unavailable", error: new Error("The edit status polling deadline expired.") };
+      }
+      try {
+        const nextJob = await api(`/api/edits/${encodeURIComponent(job.id)}`, {}, timeout);
+        if (nextJob.operationId !== initialJob.operationId) {
+          return { status: "unavailable", error: new Error("The edit job identity changed.") };
+        }
+        job = nextJob;
+        consecutivePollFailures = 0;
+      } catch (error) {
+        if (!isRetryableApiError(error) || performance.now() >= visibilityDeadline) {
+          return { status: "unavailable", error };
+        }
+        consecutivePollFailures += 1;
+        job = {
+          ...job,
+          detail: "Connection interrupted; still waiting for the accepted edit",
+          elapsedSeconds: (Number(job.elapsedSeconds) || 0) + Math.ceil(pollAfter / 1000),
+        };
+      }
+    }
+  }
+
+  async function refreshAuthoritativeProject(detail, deadline = performance.now() + 30_000) {
+    let failures = 0;
+    for (;;) {
+      showEditProgress({
+        phase: "syncing",
+        detail: failures === 0 ? detail : "Connection interrupted; retrying the project refresh",
+        elapsedSeconds: 0,
+        timeoutSeconds: 30,
+      });
+      if (requestTimeout(deadline) === 0) throw new Error("The project refresh deadline expired.");
+      try {
+        return await enqueueProjectMutation(() =>
+          replaceProject(async () => {
+            const timeout = requestTimeout(deadline);
+            if (timeout === 0) throw new Error("The project refresh deadline expired.");
+            state.project = await api("/api/project", {}, timeout);
+            renderProject();
+            return state.project;
+          }),
+        );
+      } catch (error) {
+        if (!isRetryableApiError(error) || performance.now() >= deadline) throw error;
+        const retryAfter = clamp(250 * 2 ** failures, 250, 5000);
+        failures += 1;
+        await wait(retryAfter);
+      }
+    }
+  }
+
+  async function reconcileUnavailableEdit(operationId) {
+    const deadline = performance.now() + 2_000;
+    for (;;) {
+      let project;
+      try {
+        project = await refreshAuthoritativeProject(
+          "Edit status unavailable; checking the current project",
+          deadline,
+        );
+      } catch (error) {
+        if (performance.now() >= deadline) return null;
+        throw error;
+      }
+      const committedEdit = project.edits.find((edit) => edit.operationId === operationId);
+      if (committedEdit) return committedEdit;
+      if (performance.now() >= deadline) return null;
+      await wait(100);
+    }
+  }
+
+  function showPendingEdit(detail) {
+    state.promptPending = true;
+    elements.composeButton.disabled = true;
+    elements.composeButton.querySelector("span").textContent = "Starting Codex...";
+    elements.savedState.textContent = "Waiting for Codex";
+    showEditProgress({
+      phase: "queued",
+      detail,
+      elapsedSeconds: 0,
+      timeoutSeconds: 20 * 60,
+    });
+  }
+
+  async function runPendingEdit(pending, capturePlayback) {
+    const {
+      operationId: clientOperationId,
+      prompt,
+      start: selectionStart,
+      end: selectionEnd,
+      submittedText,
+    } = pending;
+    let editCommitted = false;
+    let restorePlayback = false;
+    let playbackStateCaptured = false;
+    showPendingEdit(pending.acceptedJob ? "Reconnecting to the active AI edit" : "Starting the AI edit");
+    try {
+      let accepted = pending.acceptedJob;
+      if (!accepted) {
+        accepted = await acceptEdit(
+          clientOperationId,
+          new URLSearchParams({
+            operation_id: clientOperationId,
+            prompt,
+            start: String(selectionStart),
+            end: String(selectionEnd),
+          }),
+          () => {
+            if (!capturePlayback) return;
+            restorePlayback = audio.isActive;
+            playbackStateCaptured = true;
+            audio.stop(true);
+          },
+        );
+        if (accepted.status !== "unavailable") {
+          pending.acceptedJob = accepted;
+          persistPendingEdit(pending);
+        }
+      }
+      const outcome = accepted.status === "unavailable" ? accepted : await pollAcceptedEdit(accepted);
+      let result;
+      if (outcome.status === "failed") {
+        if (Number(outcome.errorStatus) === 409) {
+          await refreshAuthoritativeProject("The project changed; loading its current version");
+          result = { error: new Error(outcome.error || "The project changed while Codex was working.") };
+        } else {
+          throw new Error(outcome.error || "Codex could not complete the edit.");
+        }
+      } else if (outcome.status === "unavailable") {
+        const committedEdit = await reconcileUnavailableEdit(clientOperationId);
+        if (!committedEdit) {
+          result = {
+            error: new Error(
+              "The edit status was lost. The current project was refreshed; review it before retrying.",
+            ),
+          };
+        } else {
+          editCommitted = true;
+          if (elements.promptInput.value === submittedText) elements.promptInput.value = "";
+          result = { message: committedEdit.summary || "Edit completed" };
+        }
+      } else {
+        editCommitted = true;
+        try {
+          await refreshAuthoritativeProject("Edit completed; refreshing the project");
+        } catch (error) {
+          throw new CommittedEditSyncError(error);
+        }
+        if (elements.promptInput.value === submittedText) elements.promptInput.value = "";
+        result = outcome;
+      }
+      if (result.error) throw result.error;
+      showToast(result.message);
+    } catch (error) {
+      if (editCommitted && elements.promptInput.value === submittedText) elements.promptInput.value = "";
+      showError(error, "applying a prompted edit");
+      elements.savedState.textContent = state.project ? `Version ${state.project.version}` : "Offline";
+    } finally {
+      clearPendingEdit(clientOperationId);
+      state.promptPending = false;
+      hideEditProgress();
+      elements.composeButton.disabled = false;
+      elements.composeButton.querySelector("span").textContent = "Make change";
+      if (playbackStateCaptured && restorePlayback && !audio.isActive) await audio.start();
+    }
+  }
+
   async function submitPrompt(event) {
     event.preventDefault();
     if (state.promptPending) return;
     const submittedText = elements.promptInput.value;
     const prompt = submittedText.trim();
     if (!prompt) return;
-    const selectionStart = state.selectionStart;
-    const selectionEnd = state.selectionEnd;
-    state.promptPending = true;
-    elements.composeButton.disabled = true;
-    elements.composeButton.querySelector("span").textContent = "Codex is planning...";
-    elements.savedState.textContent = "Waiting for Codex";
-    try {
-      const result = await enqueueProjectMutation(() =>
-        replaceProject(async () => {
-          const response = await api("/api/edits", {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: new URLSearchParams({
-              prompt,
-              start: String(selectionStart),
-              end: String(selectionEnd),
-            }),
-          });
-          state.project = response.project;
-          if (elements.promptInput.value === submittedText) elements.promptInput.value = "";
-          renderProject();
-          return response;
-        }),
-      );
-      showToast(result.message);
-    } catch (error) {
-      showError(error, "applying a prompted edit");
-      elements.savedState.textContent = state.project ? `Version ${state.project.version}` : "Offline";
-    } finally {
-      state.promptPending = false;
-      elements.composeButton.disabled = false;
-      elements.composeButton.querySelector("span").textContent = "Make change";
-    }
+    const pending = {
+      operationId: operationId(),
+      prompt,
+      submittedText,
+      start: state.selectionStart,
+      end: state.selectionEnd,
+      acceptedJob: null,
+    };
+    persistPendingEdit(pending);
+    await runPendingEdit(pending, true);
   }
 
   function undo() {
@@ -1801,5 +2172,15 @@
     }
   });
 
-  void loadProject();
+  async function initialize() {
+    const pending = readPendingEdit();
+    if (pending) {
+      if (!elements.promptInput.value) elements.promptInput.value = pending.submittedText;
+      showPendingEdit("Reconnecting to the active AI edit");
+    }
+    await loadProject();
+    if (pending && state.project) await runPendingEdit(pending, false);
+  }
+
+  void initialize();
 })();

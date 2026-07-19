@@ -93,6 +93,14 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         }
         (None, None) => Vec::new(),
     };
+    let mut operation_ids = HashSet::new();
+    if edits
+        .iter()
+        .filter_map(|edit| edit.operation_id.as_deref())
+        .any(|operation_id| !operation_ids.insert(operation_id))
+    {
+        return Err(invalid("edit operation IDs must be unique"));
+    }
     if !ids.is_disjoint(&event_ids) {
         return Err(invalid(
             "MIDI event IDs must not collide with sound graph object IDs",
@@ -469,6 +477,10 @@ fn parse_edit(
     }
     Ok(Edit {
         id,
+        operation_id: edit
+            .get("operationId")
+            .map(|_| limited_string(edit, "operationId", 1, 128))
+            .transpose()?,
         start,
         end,
         prompt: limited_string(edit, "prompt", 1, MAX_PROMPT_CHARACTERS)?,
@@ -503,6 +515,7 @@ fn parse_regional_edit(
     }
     Ok(Edit {
         id,
+        operation_id: None,
         start,
         end,
         prompt: "Prior regional edit".to_owned(),

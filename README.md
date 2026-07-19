@@ -53,6 +53,8 @@ The current project is stored as `sound-graph.json` in the working directory. Se
 
 For each prompt, Codex receives an isolated writable projection of that file containing the current graph and bounded active regional state, plus the selected range and the checked-in synth contract under `codex/`. Global temporary roots are excluded from the Codex sandbox. The JSON is a stable sound graph: MIDI clips own beat-relative notes; instruments, effects, and modulators expose numeric parameters; and routing publishes explicitly typed MIDI, audio, and control edges. Codex first forms a musical plan, then uses the registered `apply_sound_graph_edits` tool one or more times to write exact note timing, duration, pitch, and velocity as well as arrangement, instrument, modulation, level, effect, tempo, tone, and rhythmic-density changes. The server validates the completed graph again and commits it as one undoable change. Direct Advanced edits use the same persisted graph.
 
+Prompted edits run as asynchronous jobs so reverse proxies never need to hold one request open while Codex works. The browser polls short status requests, fetches the current project after completion, and shows the current phase and elapsed time. Codex may spend up to 20 minutes on an edit; if the project changes before that edit finishes, the result is rejected instead of overwriting newer work.
+
 ## Development
 
 Development checks additionally require Node.js 22 or newer and Chrome or Chromium. Set `CHROME_PATH` when the browser executable is outside its usual system or Playwright-cache locations. Verify browser discovery with `just qa-browser-setup`.
