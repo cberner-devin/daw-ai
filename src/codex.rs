@@ -1,6 +1,12 @@
+#[cfg(unix)]
+use std::collections::HashSet;
 use std::fmt;
 use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,8 +20,22 @@ pub(crate) const EDIT_SCHEMA: &str = include_str!("../codex/edit-plan.schema.jso
 const STUDIO_CONTRACT: &str = include_str!("../codex/STUDIO.md");
 const CODEX_MODEL: &str = "gpt-5.6-sol";
 const CODEX_REASONING: &str = "model_reasoning_effort=\"high\"";
-const CODEX_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const EDIT_TIMEOUT_SECONDS: u64 = 20 * 60;
+const CODEX_TIMEOUT: Duration = Duration::from_secs(EDIT_TIMEOUT_SECONDS);
+#[cfg(unix)]
+const CODEX_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 type Object = Map<String, JsonValue>;
+
+#[cfg(unix)]
+static ACTIVE_PROCESS_GROUPS: LazyLock<Mutex<HashSet<i32>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+#[cfg(unix)]
+static PROCESS_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
 
 #[derive(Debug)]
 pub enum PlannerError {
@@ -73,7 +93,8 @@ impl CodexPlanner {
             MCP_SESSION_ENV,
             MCP_TOOL_NAME
         );
-        let mut child = Command::new("codex")
+        let mut command = Command::new("codex");
+        command
             .arg("exec")
             .arg("--ephemeral")
             .arg("--ignore-user-config")
@@ -101,15 +122,16 @@ impl CodexPlanner {
             .env(MCP_SESSION_ENV, session.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    PlannerError::Unavailable
-                } else {
-                    PlannerError::Io(error)
-                }
-            })?;
+            .stderr(Stdio::piped());
+        isolate_process_group(&mut command);
+        let mut child = command.spawn().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                PlannerError::Unavailable
+            } else {
+                PlannerError::Io(error)
+            }
+        })?;
+        let _process_group = register_process_group(&mut child)?;
 
         let mut stdin = child.stdin.take().expect("piped stdin");
         let stdin_writer =
@@ -124,11 +146,18 @@ impl CodexPlanner {
                 break status;
             }
             if started.elapsed() >= CODEX_TIMEOUT {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_process_group(&mut child);
                 let _ = stdin_writer.join();
                 let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+                if let Ok(Ok(stderr)) = stderr_reader.join() {
+                    let stderr = String::from_utf8_lossy(&stderr);
+                    if !stderr.trim().is_empty() {
+                        eprintln!(
+                            "error: Codex edit timed out: {}",
+                            bounded_log_text(&stderr, 4_096)
+                        );
+                    }
+                }
                 return Err(PlannerError::TimedOut);
             }
             thread::sleep(Duration::from_millis(50));
@@ -159,6 +188,122 @@ impl CodexPlanner {
         let (plan, project) = session.finish().map_err(|message| invalid(&message))?;
         Ok(CodexEdit { plan, project })
     }
+}
+
+#[cfg(unix)]
+fn isolate_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_process_group(child: &mut Child) {
+    const SIGTERM: i32 = 15;
+    const SIGKILL: i32 = 9;
+    const SIGNAL_EXISTS: i32 = 0;
+
+    let Ok(process_group) = i32::try_from(child.id()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
+    // The child was placed in a new process group before spawn, so a negative PID targets
+    // only Codex and its launcher descendants.
+    let _ = unsafe { kill(-process_group, SIGTERM) };
+    let deadline = Instant::now() + CODEX_TERMINATION_GRACE;
+    while Instant::now() < deadline {
+        let _ = child.try_wait();
+        if unsafe { kill(-process_group, SIGNAL_EXISTS) } != 0
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let _ = unsafe { kill(-process_group, SIGKILL) };
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+struct ProcessGroupRegistration(i32);
+
+#[cfg(unix)]
+impl Drop for ProcessGroupRegistration {
+    fn drop(&mut self) {
+        ACTIVE_PROCESS_GROUPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+#[cfg(unix)]
+fn register_process_group(child: &mut Child) -> Result<ProcessGroupRegistration, PlannerError> {
+    let process_group = i32::try_from(child.id()).map_err(|_| PlannerError::Failed)?;
+    let mut active = ACTIVE_PROCESS_GROUPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if PROCESS_SHUTDOWN.load(Ordering::SeqCst) {
+        drop(active);
+        terminate_process_group(child);
+        return Err(PlannerError::Failed);
+    }
+    active.insert(process_group);
+    Ok(ProcessGroupRegistration(process_group))
+}
+
+#[cfg(not(unix))]
+fn register_process_group(_child: &mut Child) -> Result<(), PlannerError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn terminate_active_process_groups() {
+    PROCESS_SHUTDOWN.store(true, Ordering::SeqCst);
+    let process_groups = ACTIVE_PROCESS_GROUPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    terminate_process_groups(&process_groups);
+}
+
+#[cfg(unix)]
+fn terminate_process_groups(process_groups: &[i32]) {
+    const SIGTERM: i32 = 15;
+    const SIGKILL: i32 = 9;
+    const SIGNAL_EXISTS: i32 = 0;
+
+    for &process_group in process_groups {
+        let _ = unsafe { kill(-process_group, SIGTERM) };
+    }
+    let deadline = Instant::now() + CODEX_TERMINATION_GRACE;
+    while Instant::now() < deadline
+        && process_groups
+            .iter()
+            .any(|process_group| unsafe { kill(-process_group, SIGNAL_EXISTS) } == 0)
+    {
+        thread::sleep(Duration::from_millis(25));
+    }
+    for &process_group in process_groups {
+        if unsafe { kill(-process_group, SIGNAL_EXISTS) } == 0 {
+            let _ = unsafe { kill(-process_group, SIGKILL) };
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn terminate_active_process_groups() {}
+
+#[cfg(not(unix))]
+fn terminate_process_group(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 pub fn run_mcp() -> std::io::Result<()> {
@@ -741,5 +886,62 @@ mod tests {
             );
             assert!(plan_from_json(&invalid).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_terminates_launcher_descendants_and_closes_their_pipes() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap 'exit 0' TERM; sh -c 'trap \"\" TERM; sleep 30' & wait")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        isolate_process_group(&mut command);
+        let mut child = command.spawn().expect("launcher process");
+        let stdout = child.stdout.take().expect("launcher stdout");
+        let stderr = child.stderr.take().expect("launcher stderr");
+        let stdout_reader = thread::spawn(move || read_stream(stdout));
+        let stderr_reader = thread::spawn(move || read_stream(stderr));
+        thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        terminate_process_group(&mut child);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        stdout_reader
+            .join()
+            .expect("stdout reader thread")
+            .expect("closed stdout");
+        stderr_reader
+            .join()
+            .expect("stderr reader thread")
+            .expect("closed stderr");
+        assert_eq!(EDIT_TIMEOUT_SECONDS, 20 * 60);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_codex_process_groups_are_tracked_for_server_shutdown() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        isolate_process_group(&mut command);
+        let mut child = command.spawn().expect("tracked process");
+        let process_group = i32::try_from(child.id()).expect("process group ID");
+        let registration = register_process_group(&mut child).expect("process registration");
+        assert!(
+            ACTIVE_PROCESS_GROUPS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&process_group)
+        );
+
+        terminate_process_group(&mut child);
+        drop(registration);
+        assert!(
+            !ACTIVE_PROCESS_GROUPS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&process_group)
+        );
     }
 }

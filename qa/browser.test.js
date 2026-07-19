@@ -339,6 +339,85 @@ async function run() {
       async () => evaluate(cdp, appSession, "document.querySelectorAll('.track-row').length === 3"),
       "initial arrangement",
     );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `({
+        containerRole: document.querySelector('#edit-progress').getAttribute('role'),
+        labelRole: document.querySelector('#edit-progress-label').getAttribute('role'),
+        labelLive: document.querySelector('#edit-progress-label').getAttribute('aria-live'),
+        timerHidden: document.querySelector('#edit-progress-time').getAttribute('aria-hidden'),
+      })`),
+      { containerRole: null, labelRole: "status", labelLive: "polite", timerHidden: "true" },
+      "elapsed edit time must remain outside the progress live region",
+    );
+    const { identifier: resumeEditScript } = await cdp.send(
+      "Page.addScriptToEvaluateOnNewDocument",
+      {
+        source: `(() => {
+          const originalFetch = window.fetch;
+          window.__reloadPollCount = 0;
+          window.__releaseReloadJob = false;
+          window.fetch = function fetch(resource, options) {
+            if (resource !== '/api/edits/reload-job') return originalFetch(resource, options);
+            window.__reloadPollCount += 1;
+            const job = window.__releaseReloadJob
+              ? {
+                  id: 'reload-job', operationId: 'reload-operation', status: 'failed', phase: 'failed',
+                  errorStatus: 422, error: 'Simulated resumed edit stopped', elapsedSeconds: 14,
+                  timeoutSeconds: 1200,
+                }
+              : {
+                  id: 'reload-job', operationId: 'reload-operation', status: 'running', phase: 'planning',
+                  detail: 'Codex is planning the reloaded edit', elapsedSeconds: 13,
+                  timeoutSeconds: 1200, pollAfterMs: 20,
+                };
+            return Promise.resolve(new Response(JSON.stringify(job), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            }));
+          };
+        })();`,
+      },
+      appSession,
+    );
+    await evaluate(cdp, appSession, `localStorage.setItem('daw-ai.pending-edit.v1', JSON.stringify({
+      operationId: 'reload-operation',
+      prompt: 'resume after reload',
+      submittedText: 'resume after reload',
+      start: 8,
+      end: 16,
+      acceptedJob: {
+        id: 'reload-job', operationId: 'reload-operation', status: 'running', phase: 'planning',
+        detail: 'Codex is planning the reloaded edit', elapsedSeconds: 13,
+        timeoutSeconds: 1200, pollAfterMs: 20,
+      },
+    }))`);
+    await cdp.send("Page.reload", { ignoreCache: true }, appSession);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `window.__reloadPollCount >= 1 &&
+          document.querySelector('#compose-button').disabled &&
+          !document.querySelector('#edit-progress').hidden &&
+          document.querySelector('#edit-progress-label').textContent === 'Codex is planning the reloaded edit' &&
+          document.querySelector('#prompt-input').value === 'resume after reload'`,
+      ),
+      "pending edit recovery after page reload",
+    );
+    await evaluate(cdp, appSession, "window.__releaseReloadJob = true");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `!document.querySelector('#compose-button').disabled &&
+          document.querySelector('#edit-progress').hidden &&
+          document.querySelector('#toast').textContent === 'Simulated resumed edit stopped' &&
+          localStorage.getItem('daw-ai.pending-edit.v1') === null`,
+      ),
+      "resumed edit terminal cleanup",
+    );
+    await cdp.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: resumeEditScript }, appSession);
+    await evaluate(cdp, appSession, "document.querySelector('#prompt-input').value = ''");
     await evaluate(cdp, appSession, `(() => {
       const originalFetch = window.fetch;
       window.__clientLogBodies = [];
@@ -564,6 +643,46 @@ async function run() {
     await mouse(cdp, appSession, "mouseReleased", lane.left + lane.width * 0.5, lane.y);
 
     await evaluate(cdp, appSession, `(() => {
+      const originalFetch = window.fetch;
+      window.__refusedEditRequests = 0;
+      window.fetch = function fetch(resource, options) {
+        if (resource === '/api/edits') {
+          window.__refusedEditRequests += 1;
+          return Promise.resolve(new Response(JSON.stringify({ error: 'Edit request refused' }), {
+            status: 422,
+            headers: { 'Content-Type': 'application/json' },
+          }));
+        }
+        return originalFetch(resource, options);
+      };
+      window.__restoreFetchAfterRefusedEdit = () => {
+        window.fetch = originalFetch;
+      };
+      const input = document.querySelector('#prompt-input');
+      input.value = 'refused edit';
+      document.querySelector('#prompt-form').requestSubmit();
+    })()`);
+    await waitFor(
+      async () => evaluate(
+          cdp,
+          appSession,
+          `!document.querySelector('#compose-button').disabled &&
+          document.querySelector('#toast').classList.contains('is-error') &&
+          document.querySelector('#toast').textContent === 'Edit request refused'`,
+      ),
+      "definitive edit-acceptance refusal",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "window.__refusedEditRequests"),
+      1,
+      "an explicit acceptance refusal must not retry for the edit execution window",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      window.__restoreFetchAfterRefusedEdit();
+      document.querySelector('#prompt-input').value = '';
+    })()`);
+
+    await evaluate(cdp, appSession, `(() => {
       const originalClose = AudioContext.prototype.close;
       window.__promptAudioCloseCount = 0;
       AudioContext.prototype.close = function close() {
@@ -596,17 +715,97 @@ async function run() {
     const promptSingleFlight = await evaluate(cdp, appSession, `(async () => {
       const originalFetch = window.fetch;
       const deferred = [];
+      let promptRequestsReleased = false;
       window.__promptRequestCount = 0;
+      window.__promptOperationIds = [];
+      window.__editPollCount = 0;
       window.fetch = function fetch(resource, options) {
+        if (typeof resource === 'string' && resource.startsWith('/api/edits/')) {
+          window.__editPollCount += 1;
+          if (window.__editPollCount === 1) {
+            return Promise.resolve(new Response(JSON.stringify({
+              id: resource.split('/').at(-1),
+              operationId: window.__acceptedOperationId,
+              status: 'running',
+              phase: 'planning',
+              detail: 'Codex is arranging the requested change',
+              elapsedSeconds: 73,
+              timeoutSeconds: 1200,
+              pollAfterMs: 100,
+            }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            }));
+          }
+          if (window.__editPollCount === 2) {
+            return Promise.resolve(new Response('not valid JSON', {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            }));
+          }
+          if (window.__editPollCount === 3) {
+            return new Promise((_resolve, reject) => {
+              options.signal.addEventListener('abort', () => {
+                reject(new DOMException('Simulated hanging edit-status request', 'AbortError'));
+              }, { once: true });
+            });
+          }
+          if (window.__editPollCount <= 7) {
+            return new Promise((_resolve, reject) => window.setTimeout(
+              () => reject(new TypeError('Simulated transient edit-status failure')),
+              50,
+            ));
+          }
+          if (window.__editPollCount === 8) {
+            return Promise.resolve(new Response('<h1>Not Found</h1>', {
+              status: 404,
+              headers: { 'Content-Type': 'text/html' },
+            }));
+          }
+          return originalFetch(resource, options);
+        }
         if (resource !== '/api/edits') return originalFetch(resource, options);
         window.__promptRequestCount += 1;
+        window.__promptOperationIds.push(new URLSearchParams(options.body).get('operation_id'));
+        if (promptRequestsReleased) {
+          return originalFetch(resource, options).then(async (response) => {
+            if (window.__promptRequestCount === 2) {
+              return new Response(JSON.stringify({
+                error: 'Simulated gateway timeout after forwarding',
+              }), {
+                status: 504,
+                headers: { 'Content-Type': 'application/json' },
+              });
+            }
+            const job = await response.clone().json();
+            return new Response(JSON.stringify({
+              ...job,
+              status: 'queued',
+              phase: 'queued',
+              detail: 'Waiting for the edit worker',
+              pollAfterMs: 20,
+            }), {
+              status: 202,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          });
+        }
         return new Promise((resolve, reject) => deferred.push({ resource, options, resolve, reject }));
       };
       window.__releasePromptRequests = () => {
-        window.fetch = originalFetch;
+        promptRequestsReleased = true;
         for (const request of deferred) {
-          originalFetch(request.resource, request.options).then(request.resolve, request.reject);
+          originalFetch(request.resource, request.options).then(async (response) => {
+            window.__acceptedOperationId = (await response.clone().json()).operationId;
+            request.resolve(new Response('not valid JSON', {
+              status: 202,
+              headers: { 'Content-Type': 'application/json' },
+            }));
+          }, request.reject);
         }
+      };
+      window.__restorePromptFetch = () => {
+        window.fetch = originalFetch;
       };
       const input = document.querySelector('#prompt-input');
       input.value = 'increase volume';
@@ -621,11 +820,19 @@ async function run() {
         requests: window.__promptRequestCount,
         submitDisabled: document.querySelector('#compose-button').disabled,
         transportActive: document.querySelector('#play-button').classList.contains('is-playing'),
+        progressVisible: !document.querySelector('#edit-progress').hidden,
+        progressText: document.querySelector('#edit-progress-label').textContent,
       };
     })()`);
     assert.deepEqual(
       promptSingleFlight,
-      { requests: 1, submitDisabled: true, transportActive: false },
+      {
+        requests: 1,
+        submitDisabled: true,
+        transportActive: false,
+        progressVisible: true,
+        progressText: "Starting the AI edit",
+      },
       "prompt shortcuts must share one in-flight edit request",
     );
     await evaluate(cdp, appSession, "document.querySelector('#prompt-input').value = 'draft the next edit'");
@@ -636,14 +843,82 @@ async function run() {
     );
     await evaluate(cdp, appSession, "window.__releasePromptRequests()");
     await waitFor(
-      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 1"),
-      "single-flight prompt completion",
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `document.querySelector('#edit-progress-label').textContent === 'Codex is arranging the requested change' &&
+            document.querySelector('#edit-progress-time').textContent === '1:13 / 20:00'`,
+        ),
+      "running Codex progress",
     );
+    await waitFor(
+      async () => evaluate(cdp, appSession, "window.__editPollCount >= 7"),
+      "malformed and transient edit-status failures",
+      12_000,
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `({
+        submitDisabled: document.querySelector('#compose-button').disabled,
+        progressVisible: !document.querySelector('#edit-progress').hidden,
+        progressText: document.querySelector('#edit-progress-label').textContent,
+        renderedEdits: document.querySelectorAll('.edit-item').length,
+      })`),
+      {
+        submitDisabled: true,
+        progressVisible: true,
+        progressText: "Connection interrupted; still waiting for the accepted edit",
+        renderedEdits: 0,
+      },
+      "poll failures must leave the accepted edit pending until status reconciliation",
+    );
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 1"),
+      "single-flight prompt reconciliation after status loss",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "window.__promptRequestCount"),
+      3,
+      "malformed and gateway acceptance responses must retry with the same operation",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, "window.__promptOperationIds"),
+      [
+        await evaluate(cdp, appSession, "window.__acceptedOperationId"),
+        await evaluate(cdp, appSession, "window.__acceptedOperationId"),
+        await evaluate(cdp, appSession, "window.__acceptedOperationId"),
+      ],
+      "acceptance retries must preserve the client-generated operation ID",
+    );
+    const reconciledPrompt = await evaluate(cdp, appSession, `(async () => {
+      const project = await fetch('/api/project').then((response) => response.json());
+      return {
+        serverVersion: project.version,
+        serverEdits: project.edits.length,
+        renderedEdits: document.querySelectorAll('.edit-item').length,
+        savedState: document.querySelector('#saved-state').textContent,
+        errorToast: document.querySelector('#toast').classList.contains('is-error'),
+      };
+    })()`);
+    assert.equal(reconciledPrompt.serverEdits, 1);
+    assert.equal(reconciledPrompt.renderedEdits, reconciledPrompt.serverEdits);
+    assert.equal(reconciledPrompt.savedState, `Version ${reconciledPrompt.serverVersion}`);
+    assert.equal(reconciledPrompt.errorToast, false);
     assert.equal(
       await evaluate(cdp, appSession, "document.querySelector('#compose-button').disabled"),
       false,
       "prompt submission must release its lock after completion",
     );
+    assert.ok(
+      await evaluate(cdp, appSession, "window.__editPollCount >= 8"),
+      "prompt submission must reconcile its asynchronous edit after transient failures and terminal status loss",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('#edit-progress').hidden"),
+      true,
+      "prompt progress must hide after completion",
+    );
+    await evaluate(cdp, appSession, "window.__restorePromptFetch()");
     assert.equal(
       await evaluate(cdp, appSession, "document.querySelector('#prompt-input').value"),
       "draft the next edit",
@@ -671,15 +946,51 @@ async function run() {
     );
     await evaluate(cdp, appSession, "window.__restoreAudioCloseAfterPrompt()");
 
+    const compoundPlaybackTime = await evaluate(
+      cdp,
+      appSession,
+      "document.querySelector('#current-time').textContent",
+    );
     await evaluate(cdp, appSession, `(() => {
+      const originalFetch = window.fetch;
+      window.__projectRefreshFailures = 0;
+      window.fetch = function fetch(resource, options) {
+        if (resource === '/api/project' && window.__projectRefreshFailures === 0) {
+          window.__projectRefreshFailures += 1;
+          return new Promise((_resolve, reject) => {
+            options.signal.addEventListener('abort', () => {
+              reject(new DOMException('Simulated hanging project refresh', 'AbortError'));
+            }, { once: true });
+          });
+        }
+        return originalFetch(resource, options);
+      };
+      window.__restoreFetchAfterProjectRefresh = () => {
+        window.fetch = originalFetch;
+      };
       const input = document.querySelector('#prompt-input');
       input.value = 'make the chords warm and spacious';
       document.querySelector('#prompt-form').requestSubmit();
     })()`);
     await waitFor(
       async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 2"),
-      "compound AI edit",
+      "compound AI edit after project refresh retry",
     );
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.querySelector('#play-button').classList.contains('is-playing') &&
+          document.querySelector('#current-time').textContent !== ${JSON.stringify(compoundPlaybackTime)}`,
+      ),
+      "pre-submit playback restoration without a manual restart",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "window.__projectRefreshFailures"),
+      1,
+      "a committed edit must retry project synchronization separately",
+    );
+    await evaluate(cdp, appSession, "window.__restoreFetchAfterProjectRefresh()");
     const compoundProject = await evaluate(
       cdp,
       appSession,
@@ -704,13 +1015,126 @@ async function run() {
       "Advanced must expose the filter half of a compound edit",
     );
 
+    const projectBeforeConflict = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const originalFetch = window.fetch;
+      window.__conflictProjectRefreshes = 0;
+      window.__conflictPollCount = 0;
+      window.__mixDuringPromptRequests = 0;
+      window.__releaseConflictStatus = false;
+      window.fetch = async function fetch(resource, options) {
+        if (resource === '/api/edits') {
+          window.__conflictOperationId = new URLSearchParams(options.body).get('operation_id');
+          return new Response(JSON.stringify({
+            id: 'conflict-test', operationId: window.__conflictOperationId, status: 'queued', phase: 'queued',
+            detail: 'Waiting for the edit worker', elapsedSeconds: 0,
+            timeoutSeconds: 1200, pollAfterMs: 20,
+          }), { status: 202, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (resource === '/api/edits/conflict-test') {
+          window.__conflictPollCount += 1;
+          if (!window.__releaseConflictStatus) {
+            return new Response(JSON.stringify({
+              id: 'conflict-test', operationId: window.__conflictOperationId, status: 'running', phase: 'planning',
+              detail: 'Codex is planning the edit', pollAfterMs: 20,
+              elapsedSeconds: 1, timeoutSeconds: 1200,
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+          }
+          return new Response(JSON.stringify({
+            id: 'conflict-test', operationId: window.__conflictOperationId, status: 'failed', phase: 'failed',
+            errorStatus: 409, error: 'the project changed; submit the edit again',
+            elapsedSeconds: 1, timeoutSeconds: 1200,
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (resource === '/api/mix') window.__mixDuringPromptRequests += 1;
+        if (resource === '/api/project') window.__conflictProjectRefreshes += 1;
+        return originalFetch(resource, options);
+      };
+      window.__restoreFetchAfterConflict = () => {
+        window.fetch = originalFetch;
+      };
+      const input = document.querySelector('#prompt-input');
+      input.value = 'conflicting prompt';
+      document.querySelector('#prompt-form').requestSubmit();
+    })()`);
+    await waitFor(
+      async () => evaluate(cdp, appSession, "window.__conflictPollCount >= 1"),
+      "accepted edit polling before a manual mutation",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const volume = document.querySelector('[data-volume-track="1"]');
+      volume.value = '0.51';
+      volume.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `window.__mixDuringPromptRequests === 1 &&
+          document.querySelector('[data-volume-track="1"]').value === '0.51' &&
+          document.querySelector('#compose-button').disabled`,
+      ),
+      "manual mixer mutation during accepted edit polling",
+    );
+    await evaluate(cdp, appSession, "window.__releaseConflictStatus = true");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `!document.querySelector('#compose-button').disabled &&
+          document.querySelector('#toast').textContent === 'the project changed; submit the edit again'`,
+      ),
+      "conflicted edit project reconciliation",
+    );
+    const conflictProject = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    assert.ok(await evaluate(cdp, appSession, "window.__conflictProjectRefreshes >= 2"));
+    assert.equal(conflictProject.version, projectBeforeConflict.version + 1);
+    assert.equal(conflictProject.tracks[0].volume, 0.51);
+    assert.equal(
+      await evaluate(cdp, appSession, "window.__mixDuringPromptRequests"),
+      1,
+      "accepted edit polling must not own the project mutation queue",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('[data-volume-track=\"1\"]').value"),
+      "0.51",
+      "a 409 edit must render the newer authoritative project before unlocking",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('#saved-state').textContent"),
+      `Version ${conflictProject.version}`,
+    );
+    await evaluate(cdp, appSession, `(() => {
+      window.__restoreFetchAfterConflict();
+      document.querySelector('#prompt-input').value = '';
+      document.querySelector('#undo-button').click();
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.querySelector('[data-volume-track="1"]').value === ${JSON.stringify(String(projectBeforeConflict.tracks[0].volume))}`,
+      ),
+      "conflict test project restoration",
+    );
+
     await evaluate(cdp, appSession, `(() => {
       const originalFetch = window.fetch;
       const deferred = [];
       window.__undoRequestCount = 0;
+      window.__undoHadAbortSignal = [];
       window.fetch = function fetch(resource, options) {
         if (resource !== '/api/undo') return originalFetch(resource, options);
         window.__undoRequestCount += 1;
+        window.__undoHadAbortSignal.push(Boolean(options.signal));
         return new Promise((resolve, reject) => deferred.push({ resource, options, resolve, reject }));
       };
       window.__releaseNextUndoRequest = () => {
@@ -735,10 +1159,20 @@ async function run() {
       1,
       "a second undo must wait for the first project snapshot",
     );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, "window.__undoHadAbortSignal"),
+      [false],
+      "non-idempotent undo must not be abandoned on a client timeout",
+    );
     await evaluate(cdp, appSession, "window.__releaseNextUndoRequest()");
     await waitFor(
       async () => evaluate(cdp, appSession, "window.__undoRequestCount === 2"),
       "second serialized undo request",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, "window.__undoHadAbortSignal"),
+      [false, false],
+      "serialized undo requests must await their authoritative response",
     );
     await evaluate(cdp, appSession, `(() => {
       window.__restoreFetchAfterUndo();
@@ -747,6 +1181,81 @@ async function run() {
     await waitFor(
       async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 0"),
       "serialized undo completion",
+    );
+
+    await evaluate(cdp, appSession, `(() => {
+      const originalFetch = window.fetch;
+      let competingEditCreated = false;
+      window.fetch = async function fetch(resource, options) {
+        if (resource === '/api/edits') {
+          window.__missingOperationId = new URLSearchParams(options.body).get('operation_id');
+          return new Response(JSON.stringify({
+            id: 'missing-job', operationId: window.__missingOperationId, status: 'queued', phase: 'queued',
+            detail: 'Waiting for the edit worker', elapsedSeconds: 0,
+            timeoutSeconds: 1200, pollAfterMs: 20,
+          }), { status: 202, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (resource === '/api/edits/missing-job') {
+          if (!competingEditCreated) {
+            competingEditCreated = true;
+            const accepted = await originalFetch('/api/edits', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+              body: new URLSearchParams({ prompt: 'increase volume', start: '4', end: '8' }),
+            }).then((response) => response.json());
+            window.__competingOperationId = accepted.operationId;
+            for (;;) {
+              const status = await originalFetch('/api/edits/' + accepted.id).then((response) => response.json());
+              if (status.status === 'completed' || status.status === 'failed') break;
+              await new Promise((resolve) => window.setTimeout(resolve, 20));
+            }
+          }
+          return new Response(JSON.stringify({ error: 'edit job not found' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return originalFetch(resource, options);
+      };
+      window.__restoreFetchAfterOperationIdentity = () => {
+        window.fetch = originalFetch;
+      };
+      const input = document.querySelector('#prompt-input');
+      input.value = 'increase volume';
+      document.querySelector('#prompt-form').requestSubmit();
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `!document.querySelector('#compose-button').disabled &&
+          document.querySelector('#toast').classList.contains('is-error') &&
+          document.querySelector('#toast').textContent.startsWith('The edit status was lost')`,
+      ),
+      "operation-bound status-loss reconciliation",
+    );
+    const operationIdentity = await evaluate(cdp, appSession, `(async () => {
+      const project = await fetch('/api/project').then((response) => response.json());
+      return {
+        competingOperationId: window.__competingOperationId,
+        renderedEdits: document.querySelectorAll('.edit-item').length,
+        prompt: document.querySelector('#prompt-input').value,
+        projectOperationId: project.edits.at(-1).operationId,
+        missingOperationId: window.__missingOperationId,
+      };
+    })()`);
+    assert.equal(operationIdentity.renderedEdits, 1);
+    assert.equal(operationIdentity.prompt, "increase volume");
+    assert.equal(operationIdentity.projectOperationId, operationIdentity.competingOperationId);
+    assert.notEqual(operationIdentity.projectOperationId, operationIdentity.missingOperationId);
+    await evaluate(cdp, appSession, `(() => {
+      window.__restoreFetchAfterOperationIdentity();
+      document.querySelector('#prompt-input').value = '';
+      document.querySelector('#undo-button').click();
+    })()`);
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 0"),
+      "operation identity test cleanup",
     );
 
     await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
@@ -991,7 +1500,12 @@ async function run() {
     );
     await waitFor(async () => {
       const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-      return project.tracks[2].routing.audio[2] === "effect:311";
+      const clientReady = await evaluate(
+        cdp,
+        appSession,
+        "document.activeElement.dataset.controlKey === '3-routing-311-down'",
+      );
+      return project.tracks[2].routing.audio[2] === "effect:311" && clientReady;
     }, "advanced effect reorder");
     assert.equal(
       await evaluate(cdp, appSession, "document.activeElement.dataset.controlKey"),
@@ -1279,10 +1793,18 @@ async function run() {
     })()`);
     await waitFor(async () => {
       const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      const clientReady = await evaluate(
+        cdp,
+        appSession,
+        `document.activeElement.dataset.volumeTrack === '2' &&
+          document.querySelector('[data-volume-track="1"]').value === '0.83' &&
+          document.querySelector('[data-volume-track="2"]').value === '0.75'`,
+      );
       return (
         project.version >= projectBeforeMix.version + 2 &&
         Math.abs(project.tracks[0].volume - 0.83) < 0.001 &&
-        Math.abs(project.tracks[1].volume - 0.75) < 0.001
+        Math.abs(project.tracks[1].volume - 0.75) < 0.001 &&
+        clientReady
       );
     }, "serialized mixer changes");
     assert.equal(
@@ -1716,13 +2238,15 @@ async function run() {
       const attack = document.querySelector(
         '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="attack"]',
       );
+      window.__longAttackControl = attack;
       attack.value = '2';
       attack.dispatchEvent(new Event('change', { bubbles: true }));
     })()`);
     await waitFor(async () => {
       const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
       return project.tracks[1].clips[0].events[0].duration === 0.7 &&
-        project.tracks[1].instrument.parameters.attack === 2;
+        project.tracks[1].instrument.parameters.attack === 2 &&
+        await evaluate(cdp, appSession, "!window.__longAttackControl.isConnected");
     }, "short note with long attack configuration");
     await evaluate(cdp, appSession, `(() => {
       document.querySelector('#close-advanced').click();
