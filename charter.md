@@ -8,13 +8,16 @@ It should be simple to use and the interface should rely heavily on AI powered i
 
 ### UI
 
+#### AI Mode
 "AI Mode" is the primary UI and it is a timeline view of the track. The user can then select a portion of the track
 with their mouse and enter a prompt for the AI describing the change to be made. This might be something
 as simple as "increase volume" or as complex as "insert a sick drop here". The AI then makes those changes.
 
+#### Advanced Mode
 There is also an advanced view which the user can open that shows the details of the instruments, effects,...etc
 that the agent has implemented for the track. This should be similar to a traditional DAW, but prioritize simple
-interfaces over super powerful tools.
+interfaces over super powerful tools. It allows the user to directly edit any of the channels, and also create
+or delete entire channels of the sound graph.
 
 These two views are separate tabs, each filling most of the screen, and there is a prominent tab near the top to
 switch between AI Mode and Advanced.
@@ -81,6 +84,7 @@ be represented a way that is friendly for Codex:
 * The sound graph should be stored in a file on disk that Codex can edit directly
 * Additionally, tools should be provided that are registered with Codex and that make the
   modifications to the sound graph and return useful error messages to Codex.
+* Codex my perform multiple edits to fulfil a request, which show to the user incrementally
 
 ### Deployment
 
