@@ -338,7 +338,7 @@ fn audio_region_arguments(
             let available = project
                 .tracks
                 .iter()
-                .map(|track| track.id.to_string())
+                .map(|track| format!("{} ({}, {})", track.id, track.name, track.role.as_str()))
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(format!(
@@ -376,12 +376,13 @@ fn render_mel_spectrogram(session_path: &Path, arguments: &JsonValue) -> Result<
     let (track_ids, start, end) = audio_region_arguments(&project, arguments)?;
     let region = audio_analysis::render_region(&project, &track_ids, start, end)?;
     let spectrogram = audio_analysis::mel_spectrogram(&region);
+    let channels = selected_channel_labels(&project, &track_ids);
     let description = format!(
         concat!(
-            "Rendered channels {:?} from {:.3} to {:.3} seconds at {} Hz: ",
+            "Rendered {} from {:.3} to {:.3} seconds at {} Hz: ",
             "{} events, {} Mel bands, {} source frames, {}x{} PNG, {:.1} to {:.1} dB."
         ),
-        track_ids,
+        channels,
         start,
         end,
         audio_analysis::SAMPLE_RATE,
@@ -408,8 +409,10 @@ fn analyze_audio_region(session_path: &Path, arguments: &JsonValue) -> Result<St
     let (track_ids, start, end) = audio_region_arguments(&project, arguments)?;
     let region = audio_analysis::render_region(&project, &track_ids, start, end)?;
     let analysis = audio_analysis::analyze(&region);
+    let channels = selected_channel_metadata(&project, &track_ids);
     let report = serde_json::json!({
         "trackIds": track_ids,
+        "channels": channels,
         "start": start,
         "end": end,
         "sampleRate": audio_analysis::SAMPLE_RATE,
@@ -425,6 +428,29 @@ fn analyze_audio_region(session_path: &Path, arguments: &JsonValue) -> Result<St
         }
     });
     Ok(text_content(&report.to_string()))
+}
+
+fn selected_channel_labels(project: &Project, track_ids: &[u64]) -> String {
+    track_ids
+        .iter()
+        .filter_map(|track_id| project.tracks.iter().find(|track| track.id == *track_id))
+        .map(|track| format!("{} ({}, ID {})", track.name, track.role.as_str(), track.id))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn selected_channel_metadata(project: &Project, track_ids: &[u64]) -> Vec<JsonValue> {
+    track_ids
+        .iter()
+        .filter_map(|track_id| project.tracks.iter().find(|track| track.id == *track_id))
+        .map(|track| {
+            serde_json::json!({
+                "id": track.id,
+                "name": track.name,
+                "role": track.role.as_str()
+            })
+        })
+        .collect()
 }
 
 fn round_measurement(value: f32) -> f32 {
@@ -787,15 +813,29 @@ mod tests {
         assert!(spectrogram.contains("\"mimeType\":\"image/png\""));
         assert!(spectrogram.contains("iVBORw0KGgo"));
         assert!(spectrogram.contains("\"isError\":false"));
+        assert!(spectrogram.contains("Pulse Kit (drums, ID 1)"));
+        assert!(spectrogram.contains("Soft Current (bass, ID 2)"));
 
         let analysis = handle_message(
             &listening_tool_call(2, ANALYZE_TOOL_NAME, "[2,3]", 0.0, 1.0),
             session.path(),
         )
         .expect("analysis response");
-        assert!(analysis.contains("spectralCentroidHz"));
-        assert!(analysis.contains("energyRatios"));
-        assert!(analysis.contains("\"isError\":false"));
+        let analysis: JsonValue = serde_json::from_str(&analysis).expect("analysis envelope");
+        assert_eq!(analysis["result"]["isError"], false);
+        let report = analysis["result"]["content"][0]["text"]
+            .as_str()
+            .expect("analysis text");
+        let report: JsonValue = serde_json::from_str(report).expect("analysis report");
+        assert!(report.get("spectralCentroidHz").is_some());
+        assert!(report.get("energyRatios").is_some());
+        assert_eq!(
+            report["channels"],
+            serde_json::json!([
+                {"id": 2, "name": "Soft Current", "role": "bass"},
+                {"id": 3, "name": "Glass Chords", "role": "chords"}
+            ])
+        );
 
         let invalid = handle_message(
             &listening_tool_call(3, ANALYZE_TOOL_NAME, "[999]", 0.0, 1.0),
@@ -803,6 +843,7 @@ mod tests {
         )
         .expect("invalid analysis response");
         assert!(invalid.contains("available channel IDs"));
+        assert!(invalid.contains("1 (Pulse Kit, drums)"));
         assert!(invalid.contains("\"isError\":true"));
     }
 

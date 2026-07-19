@@ -18,7 +18,7 @@ Prefer these exact field names when reasoning about the current sound. The proje
 
 ## Listening tools
 
-Use `render_mel_spectrogram` with one or more stable `trackIds` and a time range of at most 16 seconds when a visual frequency-time view would help evaluate tone, transients, density, or separation. It returns a PNG built from DAW-AI's deterministic 16 kHz sound-graph render. Use `analyze_audio_region` for complementary peak, RMS, zero-crossing, spectral-centroid, and low/mid/high energy measurements. Both tools are read-only and always inspect the latest graph produced by prior edit batches. They approximate the browser synth deterministically; use them for comparison and musical diagnosis, not mastering-grade metering.
+Use `render_mel_spectrogram` with one or more stable `trackIds` and a time range of at most 16 seconds when a visual frequency-time view would help evaluate tone, transients, density, or separation. It returns a PNG built from DAW-AI's deterministic 16 kHz sound-graph render. Use `analyze_audio_region` for complementary peak, RMS, zero-crossing, spectral-centroid, and low/mid/high energy measurements. Both responses identify the selected channels by stable ID, name, and role. Both tools are read-only and always inspect the latest graph produced by prior edit batches. They approximate the browser synth deterministically; use them for comparison and musical diagnosis, not mastering-grade metering.
 
 ## Track roles
 
