@@ -10,7 +10,7 @@ use serde_json::Value as JsonValue;
 use crate::audio_analysis::{self, MAX_REGION_SECONDS};
 use crate::codex::{EDIT_SCHEMA, plan_from_json};
 use crate::model::{Project, StudioError, json_string};
-use crate::prompt::{Action, EditPlan};
+use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS};
 use crate::storage::ProjectStore;
 
 pub(crate) const MCP_SESSION_ENV: &str = "DAW_AI_MCP_SESSION";
@@ -79,7 +79,7 @@ impl EditSession {
         let mut actions = Vec::new();
         let mut summary = None;
         for plan in plans {
-            append_actions(plan.action, &mut actions);
+            actions.push(plan.action);
             summary = Some(plan.summary);
         }
         if actions.is_empty() {
@@ -87,11 +87,7 @@ impl EditSession {
                 "Codex did not use the registered {MCP_TOOL_NAME} tool"
             ));
         }
-        let action = if actions.len() == 1 {
-            actions.pop().expect("one action")
-        } else {
-            Action::Compound { actions }
-        };
+        let action = bounded_compound(actions);
         let graph = fs::read_to_string(self.path.join(GRAPH_FILE))
             .map_err(|error| format!("could not read Codex sound graph: {error}"))?;
         let project = Project::from_json(&graph)
@@ -563,13 +559,30 @@ fn read_request(session_path: &Path) -> Result<(f32, f32, String), String> {
     Ok((number("start")?, number("end")?, prompt))
 }
 
-fn append_actions(action: Action, actions: &mut Vec<Action>) {
-    if let Action::Compound { actions: children } = action {
-        for child in children {
-            append_actions(child, actions);
+fn bounded_compound(mut actions: Vec<Action>) -> Action {
+    while actions.len() > MAX_COMPOUND_ACTIONS {
+        let mut grouped = Vec::with_capacity(actions.len().div_ceil(MAX_COMPOUND_ACTIONS));
+        let mut remaining = actions.into_iter();
+        loop {
+            let children = remaining
+                .by_ref()
+                .take(MAX_COMPOUND_ACTIONS)
+                .collect::<Vec<_>>();
+            if children.is_empty() {
+                break;
+            }
+            grouped.push(action_group(children));
         }
+        actions = grouped;
+    }
+    action_group(actions)
+}
+
+fn action_group(mut actions: Vec<Action>) -> Action {
+    if actions.len() == 1 {
+        actions.pop().expect("one action")
     } else {
-        actions.push(action);
+        Action::Compound { actions }
     }
 }
 
@@ -809,6 +822,19 @@ mod tests {
         let (plan, graph) = session.finish(plans).expect("completed iterative edit");
         assert_eq!(action_count(&plan.action), 9);
         assert_eq!(graph.tracks[1].instrument.waveform, "sawtooth");
+
+        let (store, mut studio) = ProjectStore::open(session.path().join("iterative-result.json"))
+            .expect("project store");
+        studio
+            .apply_plan(4.0, 8.0, "iterate on the bass", plan)
+            .expect("apply aggregate plan");
+        store.save(studio.project()).expect("save aggregate plan");
+        assert_eq!(
+            store.read().expect("reload aggregate plan").tracks[1]
+                .instrument
+                .waveform,
+            "sawtooth"
+        );
     }
 
     #[test]

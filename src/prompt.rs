@@ -1,5 +1,7 @@
 use crate::model::{Project, TrackRole};
 
+pub(crate) const MAX_COMPOUND_ACTIONS: usize = 8;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MidiNote {
     pub time: f32,
