@@ -20,7 +20,7 @@ codex login
 codex login status
 ```
 
-Codex also offers standalone installers; see the linked official CLI documentation when Node.js is not available. DAW-AI invokes `codex exec` with GPT-5.6 Sol at high reasoning in an ephemeral, isolated workspace. It registers a local DAW-AI MCP server whose sound-graph edit tool validates each operation and whose read-only listening tools render spectrograms and audio measurements from the current graph.
+Codex also offers standalone installers; see the linked official CLI documentation when Node.js is not available. DAW-AI invokes `codex exec` with GPT-5.6 Sol at high reasoning in an ephemeral, isolated workspace by default. The Debug tab can retain Codex sessions when a persistent transcript is useful. It registers a local DAW-AI MCP server whose sound-graph edit tool validates each operation and whose read-only listening tools render spectrograms and audio measurements from the current graph.
 
 Start the studio on the charter's default port:
 
@@ -47,7 +47,7 @@ cargo run -- --port 8888
 1. Drag over any part of the arrangement to set the edit region. On touch devices, swipe to pan normally or tap **Select region** before dragging a selection.
 2. Enter a request such as `increase the volume`, `add a bass`, `make the chords warm and spacious`, or `turn this section into a dubstep drop`.
 3. Press **Make change**, then use the transport to hear the result.
-4. Switch to **Advanced** to edit clip notes/drums, synth envelopes and waveforms, ordered effect chains, modulators, routing, levels, and mute states. The **Debug** tab provides a copyable environment and browser-error report for troubleshooting with a coding assistant.
+4. Switch to **Advanced** to edit clip notes/drums, layered oscillator waveforms/tuning/levels, synth envelopes, ordered effect chains, free-running or MIDI-triggered and tempo-synced modulators, routing, levels, and mute states. The **Debug** tab provides session controls plus a copyable environment and browser-error report for troubleshooting with a coding assistant.
 
 The current project is stored as `sound-graph.json` in the working directory. Set `DAW_AI_PROJECT_PATH` to use another path. DAW-AI validates an existing file at startup, creates the demo graph when it is missing, and safely saves every accepted prompt, mixer change, Advanced edit, undo, and reset. This makes the graph directly inspectable and editable while the server is stopped.
 

@@ -70,10 +70,18 @@ pub struct Effect {
 }
 
 #[derive(Clone, Debug)]
+pub struct Oscillator {
+    pub waveform: String,
+    pub tuning: f32,
+    pub level: f32,
+}
+
+#[derive(Clone, Debug)]
 pub struct Instrument {
     pub id: u64,
     pub engine: String,
     pub waveform: String,
+    pub oscillators: Vec<Oscillator>,
     pub attack: f32,
     pub release: f32,
     pub tone: f32,
@@ -107,6 +115,8 @@ pub struct Modulator {
     pub name: String,
     pub shape: String,
     pub rate: f32,
+    pub rate_mode: String,
+    pub trigger: String,
     pub depth: f32,
     pub target: String,
     pub enabled: bool,
@@ -355,7 +365,7 @@ impl Track {
                 "{{\"id\":{},\"name\":{},\"role\":{},\"color\":{},",
                 "\"volume\":{},\"muted\":{},\"instrument\":{{",
                 "\"id\":{},\"type\":\"instrument\",\"engine\":{},\"waveform\":{},",
-                "\"parameters\":{{\"attack\":{},\"release\":{},\"tone\":{}}}}},\"effects\":["
+                "\"oscillators\":["
             ),
             self.id,
             json_string(&self.name),
@@ -365,7 +375,29 @@ impl Track {
             self.muted,
             self.instrument.id,
             json_string(&self.instrument.engine),
-            json_string(&self.instrument.waveform),
+            json_string(&self.instrument.waveform)
+        )
+        .expect("writing to a string cannot fail");
+
+        for (index, oscillator) in self.instrument.oscillators.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            write!(
+                output,
+                "{{\"waveform\":{},\"tuning\":{},\"level\":{}}}",
+                json_string(&oscillator.waveform),
+                decimal(oscillator.tuning),
+                decimal(oscillator.level)
+            )
+            .expect("writing to a string cannot fail");
+        }
+        write!(
+            output,
+            concat!(
+                "],\"parameters\":{{\"attack\":{},\"release\":{},",
+                "\"tone\":{}}}}},\"effects\":["
+            ),
             decimal(self.instrument.attack),
             decimal(self.instrument.release),
             decimal(self.instrument.tone)
@@ -399,7 +431,8 @@ impl Track {
                 output,
                 concat!(
                     "{{\"id\":{},\"type\":\"modulator\",\"name\":{},",
-                    "\"shape\":{},\"enabled\":{},\"target\":{},",
+                    "\"shape\":{},\"enabled\":{},\"target\":{},\"rateMode\":{},",
+                    "\"trigger\":{},",
                     "\"parameters\":{{\"rate\":{},\"depth\":{}}}}}"
                 ),
                 modulator.id,
@@ -407,6 +440,8 @@ impl Track {
                 json_string(&modulator.shape),
                 modulator.enabled,
                 json_string(&modulator.target),
+                json_string(&modulator.rate_mode),
+                json_string(&modulator.trigger),
                 decimal(modulator.rate),
                 decimal(modulator.depth)
             )
@@ -474,6 +509,19 @@ impl Track {
         output.push_str(",\"edges\":[");
         let instrument = format!("instrument:{}", self.instrument.id);
         write_signal_edge(output, false, "clips", &instrument, "midi");
+        for modulator in self
+            .modulators
+            .iter()
+            .filter(|modulator| modulator.enabled && modulator.trigger == "midi")
+        {
+            write_signal_edge(
+                output,
+                true,
+                "clips",
+                &format!("modulator:{}", modulator.id),
+                "midi",
+            );
+        }
         let mut audio_source = instrument;
         for effect_id in &self.routing.effect_order {
             let effect = format!("effect:{effect_id}");
@@ -1102,7 +1150,9 @@ impl Studio {
             Action::Instrument { waveform, target } => {
                 let track_index = role_action_track_index(&self.project, *target, None)
                     .ok_or(StudioError::UnknownTrack)?;
-                self.project.tracks[track_index].instrument.waveform = (*waveform).to_owned();
+                let instrument = &mut self.project.tracks[track_index].instrument;
+                instrument.waveform = (*waveform).to_owned();
+                instrument.oscillators[0].waveform = (*waveform).to_owned();
                 Ok(())
             }
             Action::Modulator {
@@ -1424,6 +1474,8 @@ impl Studio {
             name: "AI modulation".to_owned(),
             shape: shape.to_owned(),
             rate,
+            rate_mode: "hz".to_owned(),
+            trigger: "free".to_owned(),
             depth,
             target: parameter.to_owned(),
             enabled: true,
@@ -1509,6 +1561,12 @@ fn configure_track_tool(
                     modulator.shape = value.to_owned();
                 }
                 "rate" => modulator.rate = parse_range(value, 0.01, 20.0)?,
+                "rateMode" if matches!(value, "hz" | "tempo") => {
+                    modulator.rate_mode = value.to_owned();
+                }
+                "trigger" if matches!(value, "free" | "midi") => {
+                    modulator.trigger = value.to_owned();
+                }
                 "depth" => modulator.depth = parse_range(value, 0.0, 1.0)?,
                 "target" => modulator.target = value.to_owned(),
                 "enabled" => modulator.enabled = parse_bool(value)?,
@@ -1568,9 +1626,26 @@ fn configure_instrument(
     if instrument.id != tool_id {
         return Err(StudioError::UnknownSoundTool);
     }
+    if let Some((index, oscillator_parameter)) = oscillator_parameter(parameter) {
+        let oscillator = instrument
+            .oscillators
+            .get_mut(index)
+            .ok_or(StudioError::UnknownSoundTool)?;
+        match oscillator_parameter {
+            "waveform" if valid_waveform(value) => oscillator.waveform = value.to_owned(),
+            "tuning" => oscillator.tuning = parse_range(value, -24.0, 24.0)?,
+            "level" => oscillator.level = parse_range(value, 0.0, 1.0)?,
+            _ => return Err(StudioError::InvalidSoundTool),
+        }
+        if index == 0 {
+            instrument.waveform.clone_from(&oscillator.waveform);
+        }
+        return Ok(());
+    }
     match parameter {
-        "waveform" if matches!(value, "sine" | "triangle" | "sawtooth" | "square") => {
+        "waveform" if valid_waveform(value) => {
             instrument.waveform = value.to_owned();
+            instrument.oscillators[0].waveform = value.to_owned();
         }
         "attack" => instrument.attack = parse_range(value, 0.001, 2.0)?,
         "release" => instrument.release = parse_range(value, 0.02, 5.0)?,
@@ -1578,6 +1653,17 @@ fn configure_instrument(
         _ => return Err(StudioError::InvalidSoundTool),
     }
     Ok(())
+}
+
+fn oscillator_parameter(parameter: &str) -> Option<(usize, &str)> {
+    let parameter = parameter.strip_prefix("oscillator")?;
+    let (number, parameter) = parameter.split_once('.')?;
+    let index = number.parse::<usize>().ok()?.checked_sub(1)?;
+    Some((index, parameter))
+}
+
+fn valid_waveform(value: &str) -> bool {
+    matches!(value, "sine" | "triangle" | "sawtooth" | "square")
 }
 
 fn parse_range(value: &str, minimum: f32, maximum: f32) -> Result<f32, StudioError> {
@@ -1655,6 +1741,25 @@ fn modulation_targets(track: &Track) -> Vec<ModulationTarget> {
             mode: "multiply",
         },
     ];
+    for (index, _) in track.instrument.oscillators.iter().enumerate() {
+        let number = index + 1;
+        targets.push(ModulationTarget {
+            id: format!("instrument.oscillator{number}.tuning"),
+            label: format!("Oscillator {number} tuning"),
+            minimum: -24.0,
+            maximum: 24.0,
+            scale: 12.0,
+            mode: "add",
+        });
+        targets.push(ModulationTarget {
+            id: format!("instrument.oscillator{number}.level"),
+            label: format!("Oscillator {number} level"),
+            minimum: 0.0,
+            maximum: 1.0,
+            scale: 1.0,
+            mode: "add",
+        });
+    }
     targets.extend(track.effects.iter().map(|effect| ModulationTarget {
         id: format!("effect:{}.mix", effect.id),
         label: format!("{} mix", effect.name),
@@ -1666,7 +1771,7 @@ fn modulation_targets(track: &Track) -> Vec<ModulationTarget> {
     targets
 }
 
-fn valid_modulator_target(track: &Track, value: &str) -> bool {
+pub(crate) fn valid_modulator_target(track: &Track, value: &str) -> bool {
     modulation_targets(track)
         .iter()
         .any(|target| target.id == value)
@@ -1789,6 +1894,22 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
             id: instrument_id,
             engine: engine.to_owned(),
             waveform: waveform.to_owned(),
+            oscillators: vec![
+                Oscillator {
+                    waveform: waveform.to_owned(),
+                    tuning: 0.0,
+                    level: 0.72,
+                },
+                Oscillator {
+                    waveform: secondary_waveform(waveform).to_owned(),
+                    tuning: match role {
+                        TrackRole::Bass => -12.0,
+                        TrackRole::Chords | TrackRole::Texture => 12.0,
+                        _ => 0.0,
+                    },
+                    level: 0.28,
+                },
+            ],
             attack,
             release,
             tone,
@@ -1799,6 +1920,12 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
             name: modulator.0.to_owned(),
             shape: modulator.1.to_owned(),
             rate: modulator.2,
+            rate_mode: "hz".to_owned(),
+            trigger: if modulator.1 == "envelope" {
+                "midi".to_owned()
+            } else {
+                "free".to_owned()
+            },
             depth: modulator.3,
             target: modulator.4.to_owned(),
             enabled: true,
@@ -1808,6 +1935,15 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
             output: "master".to_owned(),
         },
         clips: Vec::new(),
+    }
+}
+
+fn secondary_waveform(primary: &str) -> &'static str {
+    match primary {
+        "sine" => "triangle",
+        "triangle" => "sine",
+        "sawtooth" => "square",
+        _ => "sawtooth",
     }
 }
 
@@ -1943,6 +2079,7 @@ mod tests {
         assert!(project.tracks.iter().all(|track| {
             !track.clips[0].events.is_empty()
                 && !track.modulators.is_empty()
+                && track.instrument.oscillators.len() >= 2
                 && track.routing.effect_order.len() == track.effects.len()
         }));
         let json = project.to_json();
@@ -1958,6 +2095,9 @@ mod tests {
         assert!(json.contains(
             "\"source\":\"modulator:150\",\"target\":\"instrument.tone\",\"type\":\"control\""
         ));
+        assert!(
+            json.contains("\"source\":\"clips\",\"target\":\"modulator:150\",\"type\":\"midi\"")
+        );
     }
 
     #[test]
@@ -2016,6 +2156,36 @@ mod tests {
             )
             .expect("configurable instrument");
         studio
+            .configure_sound_tool(
+                bass_id,
+                "instrument",
+                instrument_id,
+                None,
+                "oscillator1.tuning",
+                "7",
+            )
+            .expect("configurable primary oscillator tuning");
+        studio
+            .configure_sound_tool(
+                bass_id,
+                "instrument",
+                instrument_id,
+                None,
+                "oscillator2.waveform",
+                "triangle",
+            )
+            .expect("configurable secondary oscillator waveform");
+        studio
+            .configure_sound_tool(
+                bass_id,
+                "instrument",
+                instrument_id,
+                None,
+                "oscillator2.level",
+                "0.41",
+            )
+            .expect("configurable secondary oscillator level");
+        studio
             .configure_sound_tool(bass_id, "effect", effect_id, None, "mix", "0.72")
             .expect("configurable effect");
         studio
@@ -2028,6 +2198,19 @@ mod tests {
                 "track.volume",
             )
             .expect("configurable modulator");
+        studio
+            .configure_sound_tool(
+                bass_id,
+                "modulator",
+                modulator_id,
+                None,
+                "rateMode",
+                "tempo",
+            )
+            .expect("tempo-synced modulator");
+        studio
+            .configure_sound_tool(bass_id, "modulator", modulator_id, None, "trigger", "midi")
+            .expect("MIDI-triggered modulator");
         studio
             .configure_sound_tool(bass_id, "event", event_id, Some(clip_id), "pitch", "40")
             .expect("configurable clip event");
@@ -2047,11 +2230,20 @@ mod tests {
 
         let bass = &studio.project().tracks[1];
         assert_eq!(bass.instrument.waveform, "sawtooth");
+        assert_eq!(bass.instrument.oscillators[0].waveform, "sawtooth");
+        assert_eq!(bass.instrument.oscillators[0].tuning, 7.0);
+        assert_eq!(bass.instrument.oscillators[1].waveform, "triangle");
+        assert_eq!(bass.instrument.oscillators[1].level, 0.41);
         assert_eq!(bass.effects[0].mix, 0.72);
         assert_eq!(bass.modulators[0].target, "track.volume");
+        assert_eq!(bass.modulators[0].rate_mode, "tempo");
+        assert_eq!(bass.modulators[0].trigger, "midi");
         assert_eq!(bass.clips[0].events[0].pitch, 40);
         assert_eq!(bass.clips[0].events[0].duration, 0.0625);
         assert!(studio.to_json().contains("\"duration\":0.0625"));
+        assert!(studio.to_json().contains(&format!(
+            "\"source\":\"clips\",\"target\":\"modulator:{modulator_id}\",\"type\":\"midi\""
+        )));
         assert_eq!(
             studio.project().tracks[2].routing.effect_order[0],
             later_effect_id
@@ -2078,6 +2270,8 @@ mod tests {
         assert!(targets.contains(&"instrument.release".to_owned()));
         assert!(targets.contains(&"instrument.tone".to_owned()));
         assert!(targets.contains(&"instrument.pitch".to_owned()));
+        assert!(targets.contains(&"instrument.oscillator1.tuning".to_owned()));
+        assert!(targets.contains(&"instrument.oscillator2.level".to_owned()));
         assert!(targets.contains(&"track.volume".to_owned()));
         assert!(targets.iter().any(|target| target.starts_with("effect:")));
 

@@ -96,6 +96,7 @@ struct Router {
     store: Option<ProjectStore>,
     planner: Planner,
     edit_jobs: Arc<EditJobs>,
+    codex_ephemeral: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -360,6 +361,7 @@ impl Router {
             store: Some(store),
             planner,
             edit_jobs: Arc::new(EditJobs::new()),
+            codex_ephemeral: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -370,6 +372,7 @@ impl Router {
             store: None,
             planner: Planner::Demo,
             edit_jobs: Arc::new(EditJobs::new()),
+            codex_ephemeral: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -410,6 +413,8 @@ impl Router {
                 let studio = self.lock_studio();
                 Response::json(200, studio.to_json())
             }
+            ("GET", "/api/settings") => self.settings(),
+            ("POST", "/api/settings") => self.change_settings(&request.body),
             ("POST", "/api/edits") => self.start_edit(&request.body),
             ("POST", "/api/channels") => self.change_channel(&request.body),
             ("POST", "/api/mix") => self.change_mix(&request.body),
@@ -422,6 +427,8 @@ impl Router {
                 "/api/edits" | "/api/channels" | "/api/mix" | "/api/sound-tools" | "/api/logs"
                 | "/api/undo" | "/api/reset",
             ) => Response::json(405, error_json("method not allowed")).with_header("Allow", "POST"),
+            (_, "/api/settings") => Response::json(405, error_json("method not allowed"))
+                .with_header("Allow", "GET, POST"),
             (_, "/api/project" | "/api/health") => {
                 Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
             }
@@ -588,11 +595,12 @@ impl Router {
     fn perform_codex_edit(&self, job_id: u64, edit: EditRequest) -> Result<String, EditFailure> {
         let mut expected_version = edit.project.version;
         let mut published_update = false;
-        let completed = CodexPlanner::interpret_with_updates(
+        let completed = CodexPlanner::interpret_with_session_mode(
             &edit.prompt,
             edit.start,
             edit.end,
             &edit.project,
+            self.codex_ephemeral.load(Ordering::SeqCst),
             |graph_edit| {
                 self.commit_codex_update(
                     job_id,
@@ -852,6 +860,30 @@ impl Router {
         }
     }
 
+    fn settings(&self) -> Response {
+        let ephemeral = self.codex_ephemeral.load(Ordering::SeqCst);
+        Response::json(
+            200,
+            format!(
+                "{{\"ephemeralCodexSessions\":{ephemeral},\"codexSessionMode\":{}}}",
+                json_string(if ephemeral { "ephemeral" } else { "persistent" })
+            ),
+        )
+    }
+
+    fn change_settings(&self, body: &str) -> Response {
+        let form = parse_form(body);
+        let ephemeral = match form.get("ephemeral").map(String::as_str) {
+            Some("true") => true,
+            Some("false") => false,
+            _ => {
+                return Response::json(422, error_json("ephemeral must be true or false"));
+            }
+        };
+        self.codex_ephemeral.store(ephemeral, Ordering::SeqCst);
+        self.settings()
+    }
+
     fn client_log(body: &str) -> Response {
         let form = parse_form(body);
         let Some(level) = form.get("level").map(String::as_str) else {
@@ -1029,6 +1061,7 @@ impl Request {
                     | "/api/sound-tools"
                     | "/api/channels"
                     | "/api/logs"
+                    | "/api/settings"
                     | "/api/undo"
                     | "/api/reset"
             ) || self.path.starts_with("/api/edits/"))
@@ -1490,6 +1523,7 @@ mod tests {
                 store: Some(store),
                 planner: Planner::Demo,
                 edit_jobs: Arc::new(EditJobs::new()),
+                codex_ephemeral: Arc::new(AtomicBool::new(true)),
             },
             path,
         )
@@ -1505,6 +1539,31 @@ mod tests {
         let project = router.handle(&request("GET", "/api/project", ""));
         assert_eq!(project.status, 200);
         assert!(project.body.contains("\"tracks\""));
+    }
+
+    #[test]
+    fn codex_sessions_are_ephemeral_by_default_and_debuggable_when_requested() {
+        let router = Router::demo();
+        let defaults: serde_json::Value =
+            serde_json::from_str(&router.handle(&request("GET", "/api/settings", "")).body)
+                .expect("default settings JSON");
+        assert_eq!(defaults["ephemeralCodexSessions"], true);
+        assert_eq!(defaults["codexSessionMode"], "ephemeral");
+
+        let changed = router.handle(&request("POST", "/api/settings", "ephemeral=false"));
+        assert_eq!(changed.status, 200);
+        let changed: serde_json::Value =
+            serde_json::from_str(&changed.body).expect("changed settings JSON");
+        assert_eq!(changed["ephemeralCodexSessions"], false);
+        assert_eq!(changed["codexSessionMode"], "persistent");
+        assert!(!router.codex_ephemeral.load(Ordering::SeqCst));
+
+        assert_eq!(
+            router
+                .handle(&request("POST", "/api/settings", "ephemeral=maybe"))
+                .status,
+            422
+        );
     }
 
     #[test]
@@ -1852,6 +1911,7 @@ mod tests {
             store: None,
             planner: Planner::Demo,
             edit_jobs: Arc::new(EditJobs::new()),
+            codex_ephemeral: Arc::new(AtomicBool::new(true)),
         };
         let retried = restarted.handle(&request(
             "POST",
@@ -2013,8 +2073,18 @@ mod tests {
             "track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth",
         ));
         assert_eq!(response.status, 200);
+        let response = router.handle(&request(
+            "POST",
+            "/api/sound-tools",
+            "track_id=2&tool=modulator&tool_id=250&parameter=target&value=instrument.oscillator2.level",
+        ));
+        assert_eq!(response.status, 200);
         let saved = ProjectStore::open(path.clone()).expect("saved project").1;
         assert_eq!(saved.project().tracks[1].instrument.waveform, "sawtooth");
+        assert_eq!(
+            saved.project().tracks[1].modulators[0].target,
+            "instrument.oscillator2.level"
+        );
         std::fs::remove_file(path).expect("remove test graph");
     }
 
@@ -2225,8 +2295,8 @@ mod tests {
             "track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth".to_owned();
         assert_eq!(router.handle(&hostile).status, 403);
         let project = router.handle(&request("GET", "/api/project", ""));
-        assert!(project.body.contains("\"waveform\":\"square\""));
-        assert!(!project.body.contains("\"waveform\":\"sawtooth\""));
+        let project: serde_json::Value = serde_json::from_str(&project.body).expect("project JSON");
+        assert_eq!(project["tracks"][1]["instrument"]["waveform"], "square");
 
         hostile
             .headers

@@ -94,6 +94,17 @@ impl CodexPlanner {
         start: f32,
         end: f32,
         project: &Project,
+        on_update: impl FnMut(CodexEdit) -> Result<(), PlannerError>,
+    ) -> Result<CodexEdit, PlannerError> {
+        Self::interpret_with_session_mode(prompt, start, end, project, true, on_update)
+    }
+
+    pub(crate) fn interpret_with_session_mode(
+        prompt: &str,
+        start: f32,
+        end: f32,
+        project: &Project,
+        ephemeral: bool,
         mut on_update: impl FnMut(CodexEdit) -> Result<(), PlannerError>,
     ) -> Result<CodexEdit, PlannerError> {
         let session = EditSession::create(project, prompt, start, end).map_err(PlannerError::Io)?;
@@ -112,9 +123,9 @@ impl CodexPlanner {
             json_string(ANALYZE_TOOL_NAME)
         );
         let mut command = Command::new("codex");
+        command.arg("exec");
+        configure_session_mode(&mut command, ephemeral);
         command
-            .arg("exec")
-            .arg("--ephemeral")
             .arg("--ignore-user-config")
             .arg("--model")
             .arg(CODEX_MODEL)
@@ -223,6 +234,12 @@ impl CodexPlanner {
             .finish(delivered_plans)
             .map_err(|message| invalid(&message))?;
         Ok(CodexEdit { plan, project })
+    }
+}
+
+fn configure_session_mode(command: &mut Command, ephemeral: bool) {
+    if ephemeral {
+        command.arg("--ephemeral");
     }
 }
 
@@ -622,7 +639,14 @@ fn waveform_name(name: &str) -> Result<&'static str, PlannerError> {
 
 fn modulator_parameter(name: &str) -> Result<String, PlannerError> {
     match name {
-        "instrument.attack" | "instrument.release" | "instrument.tone" | "instrument.pitch"
+        "instrument.attack"
+        | "instrument.release"
+        | "instrument.tone"
+        | "instrument.pitch"
+        | "instrument.oscillator1.tuning"
+        | "instrument.oscillator1.level"
+        | "instrument.oscillator2.tuning"
+        | "instrument.oscillator2.level"
         | "track.volume" => Ok(name.to_owned()),
         _ if effect_modulation_target(name).is_some() => Ok(name.to_owned()),
         _ => Err(invalid("unknown modulation target")),
@@ -670,6 +694,12 @@ fn sound_tool_name(name: &str) -> Result<&'static str, PlannerError> {
 fn sound_parameter_name(name: &str) -> Result<&'static str, PlannerError> {
     match name {
         "waveform" => Ok("waveform"),
+        "oscillator1.waveform" => Ok("oscillator1.waveform"),
+        "oscillator1.tuning" => Ok("oscillator1.tuning"),
+        "oscillator1.level" => Ok("oscillator1.level"),
+        "oscillator2.waveform" => Ok("oscillator2.waveform"),
+        "oscillator2.tuning" => Ok("oscillator2.tuning"),
+        "oscillator2.level" => Ok("oscillator2.level"),
         "attack" => Ok("attack"),
         "release" => Ok("release"),
         "tone" => Ok("tone"),
@@ -677,6 +707,8 @@ fn sound_parameter_name(name: &str) -> Result<&'static str, PlannerError> {
         "enabled" => Ok("enabled"),
         "shape" => Ok("shape"),
         "rate" => Ok("rate"),
+        "rateMode" => Ok("rateMode"),
+        "trigger" => Ok("trigger"),
         "depth" => Ok("depth"),
         "target" => Ok("target"),
         "time" => Ok("time"),
@@ -721,6 +753,27 @@ fn invalid(message: &str) -> PlannerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_session_mode_only_adds_ephemeral_flag_by_default() {
+        let mut ephemeral = Command::new("codex");
+        ephemeral.arg("exec");
+        configure_session_mode(&mut ephemeral, true);
+        assert!(
+            ephemeral
+                .get_args()
+                .any(|argument| argument == "--ephemeral")
+        );
+
+        let mut persistent = Command::new("codex");
+        persistent.arg("exec");
+        configure_session_mode(&mut persistent, false);
+        assert!(
+            !persistent
+                .get_args()
+                .any(|argument| argument == "--ephemeral")
+        );
+    }
 
     fn write_test_session_update(session: &EditSession, summary: &str) {
         let progress = session.path().join("edit-progress");

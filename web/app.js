@@ -46,6 +46,7 @@
     debugReport: document.querySelector("#debug-report"),
     copyDebug: document.querySelector("#copy-debug"),
     clearDebug: document.querySelector("#clear-debug"),
+    persistentCodexSessions: document.querySelector("#persistent-codex-sessions"),
     toast: document.querySelector("#toast"),
   };
 
@@ -63,6 +64,7 @@
     toastTimer: null,
     activeView: "ai",
     clientIssues: [],
+    ephemeralCodexSessions: true,
   };
 
   let projectMutationQueue = Promise.resolve();
@@ -333,7 +335,7 @@
         for (const modulator of track.modulators) {
           if (
             !modulator.enabled ||
-            ["instrument.attack", "instrument.release", "instrument.pitch"].includes(modulator.target)
+            this.isVoiceModulationTarget(modulator.target)
           ) continue;
           const interval = this.modulationInterval([modulator]);
           for (let time = this.projectStartedAt; time <= state.project.duration; time += interval) {
@@ -360,16 +362,15 @@
           graph.reverbSend.gain.setValueAtTime(Math.min(0.6, reverbMix * 0.7), audioTime);
           graph.chorusSend.gain.setValueAtTime(Math.min(0.5, automation.chorus * 0.5), audioTime);
           graph.compressorSend.gain.setValueAtTime(Math.min(0.5, automation.compression * 0.45), audioTime);
-          graph.toneFilter.frequency.setValueAtTime(
-            clamp(
-              this.baseFilterForRole(track.role) *
-                (0.7 + automation.instrumentTone * 0.6) *
-                (1 + automation.filter),
-              180,
-              9000,
-            ),
-            audioTime,
+          const toneFrequency = clamp(
+            this.baseFilterForRole(track.role) *
+              (0.7 + automation.instrumentTone * 0.6) *
+              (1 + automation.filter),
+            180,
+            9000,
           );
+          graph.toneFilter.frequency.dawAiProjectTime = boundary;
+          graph.toneFilter.frequency.setValueAtTime(toneFrequency, audioTime);
           graph.effectFilter.frequency.setValueAtTime(
             this.effectFilterFrequency(track, automation),
             audioTime,
@@ -414,8 +415,17 @@
       return automation;
     }
 
-    modulatorValue(modulator, time) {
-      const phase = time * modulator.parameters.rate * Math.PI * 2;
+    modulatorValue(track, modulator, time) {
+      let phaseTime = time;
+      if (modulator.trigger === "midi") {
+        const onset = this.lastMidiOnset(track, time);
+        if (onset === null) return 0;
+        phaseTime -= onset;
+      }
+      const rate = modulator.rateMode === "tempo"
+        ? modulator.parameters.rate * state.project.bpm / 60
+        : modulator.parameters.rate;
+      const phase = phaseTime * rate * Math.PI * 2;
       let value;
       if (modulator.shape === "triangle") {
         value = (2 / Math.PI) * Math.asin(Math.sin(phase));
@@ -424,7 +434,7 @@
       } else if (modulator.shape === "envelope") {
         value = Math.abs(Math.sin(phase)) * 2 - 1;
       } else if (modulator.shape === "random") {
-        value = Math.sin(Math.floor(time * modulator.parameters.rate * 8) * 91.17 + modulator.id) * 0.8;
+        value = Math.sin(Math.floor(phaseTime * rate * 8) * 91.17 + modulator.id) * 0.8;
       } else {
         value = Math.sin(phase);
       }
@@ -432,8 +442,39 @@
     }
 
     modulationInterval(modulators) {
-      const fastestRate = Math.max(...modulators.map((modulator) => modulator.parameters.rate), 0.01);
+      const fastestRate = Math.max(
+        ...modulators.map((modulator) =>
+          modulator.rateMode === "tempo"
+            ? modulator.parameters.rate * state.project.bpm / 60
+            : modulator.parameters.rate,
+        ),
+        0.01,
+      );
       return clamp(1 / (fastestRate * 8), 0.0025, 0.025);
+    }
+
+    isVoiceModulationTarget(target) {
+      return ["instrument.attack", "instrument.release", "instrument.pitch"].includes(target) ||
+        (target.startsWith("instrument.oscillator") &&
+          (target.endsWith(".tuning") || target.endsWith(".level")));
+    }
+
+    lastMidiOnset(track, time) {
+      const beatDuration = 60 / state.project.bpm;
+      let latest = null;
+      for (const clip of track.clips) {
+        if (time < clip.start) continue;
+        const loopDuration = clip.loopBeats * beatDuration;
+        if (loopDuration <= 0) continue;
+        const windowEnd = Math.min(time, clip.end) + 0.000002;
+        const windowStart = Math.max(clip.start, windowEnd - loopDuration * 2);
+        for (const occurrence of this.clipEventsInWindow(clip, track, windowStart, windowEnd)) {
+          if (occurrence.time <= time && (latest === null || occurrence.time > latest)) {
+            latest = occurrence.time;
+          }
+        }
+      }
+      return latest;
     }
 
     parameterAt(track, targetId, baseValue, time) {
@@ -441,7 +482,7 @@
       if (!target) return baseValue;
       const amount = track.modulators
         .filter((modulator) => modulator.enabled && modulator.target === targetId)
-        .reduce((total, modulator) => total + this.modulatorValue(modulator, time), 0);
+        .reduce((total, modulator) => total + this.modulatorValue(track, modulator, time), 0);
       const value = target.mode === "multiply"
         ? baseValue * (1 + amount * target.scale)
         : baseValue + amount * target.scale;
@@ -701,7 +742,6 @@
         time,
         event.duration * beatDuration,
         velocity * roleLevel,
-        track.instrument.waveform,
         track.id,
         elapsed,
         instrument,
@@ -775,15 +815,36 @@
       return "percussion";
     }
 
-    schedulePitchModulation(parameter, track, audioTime, projectTime, duration) {
-      const modulators = track.modulators.filter(
-        (modulator) => modulator.enabled && modulator.target === "instrument.pitch",
+    scheduleOscillatorTuning(parameter, track, oscillator, oscillatorIndex, audioTime, projectTime, duration) {
+      const tuningTarget = `instrument.oscillator${oscillatorIndex + 1}.tuning`;
+      const modulators = track.modulators.filter((modulator) =>
+        modulator.enabled && ["instrument.pitch", tuningTarget].includes(modulator.target),
       );
       if (modulators.length === 0) return;
       const interval = this.modulationInterval(modulators);
       for (let offset = 0; offset <= duration; offset += interval) {
-        const semitones = this.parameterAt(track, "instrument.pitch", 0, projectTime + offset);
+        const semitones =
+          this.parameterAt(track, "instrument.pitch", 0, projectTime + offset) +
+          this.parameterAt(track, tuningTarget, oscillator.tuning, projectTime + offset);
         parameter.setValueAtTime(semitones * 100, audioTime + offset);
+      }
+    }
+
+    scheduleOscillatorLevel(parameter, track, oscillator, oscillatorIndex, audioTime, projectTime, duration) {
+      const target = `instrument.oscillator${oscillatorIndex + 1}.level`;
+      const modulators = track.modulators.filter(
+        (modulator) => modulator.enabled && modulator.target === target,
+      );
+      if (modulators.length === 0) {
+        parameter.setValueAtTime(oscillator.level, audioTime);
+        return;
+      }
+      const interval = this.modulationInterval(modulators);
+      for (let offset = 0; offset <= duration; offset += interval) {
+        parameter.setValueAtTime(
+          this.parameterAt(track, target, oscillator.level, projectTime + offset),
+          audioTime + offset,
+        );
       }
     }
 
@@ -796,35 +857,7 @@
       const attack = instrument.attack;
       const velocity = clamp(event.velocity, 0.01, 1);
       const frequency = 440 * 2 ** ((event.pitch - 69) / 12);
-      const oscillator = this.context.createOscillator();
       const tonalEnvelope = this.context.createGain();
-      oscillator.type = track.instrument.waveform;
-      oscillator.dawAiTrackId = track.id;
-      oscillator.dawAiChased = elapsed > 0;
-      oscillator.dawAiDrumType = event.type;
-      oscillator.dawAiEventId = event.id;
-      oscillator.dawAiEventPitch = event.pitch;
-      oscillator.dawAiEventDuration = event.duration;
-      oscillator.dawAiInstrumentAttack = instrument.attack;
-      oscillator.dawAiInstrumentRelease = instrument.release;
-      if (event.type === "kick" || event.type === "tom") {
-        const startFrequency = frequency * (event.type === "kick" ? 3.2 : 1.8);
-        const endFrequency = Math.max(event.type === "kick" ? 20 : 35, frequency * (event.type === "kick" ? 1 : 0.78));
-        if (elapsed < bodyDuration) {
-          const progress = elapsed / bodyDuration;
-          const currentFrequency = startFrequency * (endFrequency / startFrequency) ** progress;
-          oscillator.frequency.setValueAtTime(currentFrequency, time);
-          oscillator.frequency.exponentialRampToValueAtTime(
-            endFrequency,
-            time + bodyDuration - elapsed,
-          );
-        } else {
-          oscillator.frequency.setValueAtTime(endFrequency, time);
-        }
-      } else {
-        oscillator.frequency.setValueAtTime(frequency, time);
-      }
-      this.schedulePitchModulation(oscillator.detune, track, time, projectTime, remaining);
       const tonalLevel = velocity * ({
         kick: 0.58,
         snare: 0.055,
@@ -846,11 +879,68 @@
       tonalEnvelope.dawAiVoiceKind = "tonal";
       tonalEnvelope.dawAiTrackId = track.id;
       tonalEnvelope.dawAiEventId = event.id;
-      oscillator.connect(tonalEnvelope);
       this.routeVoice(tonalEnvelope, track.id);
-      this.trackSource(oscillator);
-      oscillator.start(time);
-      oscillator.stop(time + remaining + 0.01);
+      track.instrument.oscillators.forEach((oscillatorConfig, oscillatorIndex) => {
+        const oscillator = this.context.createOscillator();
+        const oscillatorLevel = this.context.createGain();
+        oscillatorLevel.dawAiAutomation = "oscillator-level";
+        oscillatorLevel.dawAiTrackId = track.id;
+        oscillatorLevel.dawAiOscillatorIndex = oscillatorIndex;
+        oscillator.type = oscillatorConfig.waveform;
+        oscillator.dawAiTrackId = track.id;
+        oscillator.dawAiChased = elapsed > 0;
+        oscillator.dawAiDrumType = event.type;
+        oscillator.dawAiEventId = event.id;
+        oscillator.dawAiEventPitch = event.pitch;
+        oscillator.dawAiEventDuration = event.duration;
+        oscillator.dawAiInstrumentAttack = instrument.attack;
+        oscillator.dawAiInstrumentRelease = instrument.release;
+        oscillator.dawAiOscillatorIndex = oscillatorIndex;
+        if (event.type === "kick" || event.type === "tom") {
+          const startFrequency = frequency * (event.type === "kick" ? 3.2 : 1.8);
+          const endFrequency = Math.max(
+            event.type === "kick" ? 20 : 35,
+            frequency * (event.type === "kick" ? 1 : 0.78),
+          );
+          if (elapsed < bodyDuration) {
+            const progress = elapsed / bodyDuration;
+            const currentFrequency = startFrequency * (endFrequency / startFrequency) ** progress;
+            oscillator.frequency.setValueAtTime(currentFrequency, time);
+            oscillator.frequency.exponentialRampToValueAtTime(
+              endFrequency,
+              time + bodyDuration - elapsed,
+            );
+          } else {
+            oscillator.frequency.setValueAtTime(endFrequency, time);
+          }
+        } else {
+          oscillator.frequency.setValueAtTime(frequency, time);
+        }
+        oscillator.detune.setValueAtTime(oscillatorConfig.tuning * 100, time);
+        this.scheduleOscillatorTuning(
+          oscillator.detune,
+          track,
+          oscillatorConfig,
+          oscillatorIndex,
+          time,
+          projectTime,
+          remaining,
+        );
+        this.scheduleOscillatorLevel(
+          oscillatorLevel.gain,
+          track,
+          oscillatorConfig,
+          oscillatorIndex,
+          time,
+          projectTime,
+          remaining,
+        );
+        oscillator.connect(oscillatorLevel);
+        oscillatorLevel.connect(tonalEnvelope);
+        this.trackSource(oscillator);
+        oscillator.start(time);
+        oscillator.stop(time + remaining + 0.01);
+      });
 
       if (event.type === "kick" || event.type === "tom") return;
       const source = this.context.createBufferSource();
@@ -930,7 +1020,6 @@
       time,
       duration,
       level,
-      type,
       trackId,
       elapsed,
       instrument,
@@ -941,19 +1030,7 @@
       const soundingDuration = duration + instrument.release;
       const remaining = soundingDuration - elapsed;
       if (remaining <= 0.01) return;
-      const oscillator = this.context.createOscillator();
       const envelope = this.context.createGain();
-      oscillator.type = type;
-      oscillator.dawAiTrackId = trackId;
-      oscillator.dawAiChased = elapsed > 0;
-      oscillator.dawAiBaseFrequency = frequency;
-      oscillator.dawAiEventId = event.id;
-      oscillator.dawAiEventTime = event.time;
-      oscillator.dawAiEventDuration = event.duration;
-      oscillator.dawAiInstrumentAttack = instrument.attack;
-      oscillator.dawAiInstrumentRelease = instrument.release;
-      oscillator.frequency.setValueAtTime(frequency, time);
-      this.schedulePitchModulation(oscillator.detune, track, time, projectTime, remaining);
       this.scheduleVoiceEnvelope(
         envelope.gain,
         time,
@@ -966,11 +1043,49 @@
       envelope.dawAiVoiceEnvelope = true;
       envelope.dawAiTrackId = trackId;
       envelope.dawAiEventId = event.id;
-      oscillator.connect(envelope);
       this.routeVoice(envelope, trackId);
-      this.trackSource(oscillator);
-      oscillator.start(time);
-      oscillator.stop(time + remaining + 0.03);
+      track.instrument.oscillators.forEach((oscillatorConfig, oscillatorIndex) => {
+        const oscillator = this.context.createOscillator();
+        const oscillatorLevel = this.context.createGain();
+        oscillatorLevel.dawAiAutomation = "oscillator-level";
+        oscillatorLevel.dawAiTrackId = track.id;
+        oscillatorLevel.dawAiOscillatorIndex = oscillatorIndex;
+        oscillator.type = oscillatorConfig.waveform;
+        oscillator.dawAiTrackId = trackId;
+        oscillator.dawAiChased = elapsed > 0;
+        oscillator.dawAiBaseFrequency = frequency;
+        oscillator.dawAiEventId = event.id;
+        oscillator.dawAiEventTime = event.time;
+        oscillator.dawAiEventDuration = event.duration;
+        oscillator.dawAiInstrumentAttack = instrument.attack;
+        oscillator.dawAiInstrumentRelease = instrument.release;
+        oscillator.dawAiOscillatorIndex = oscillatorIndex;
+        oscillator.frequency.setValueAtTime(frequency, time);
+        oscillator.detune.setValueAtTime(oscillatorConfig.tuning * 100, time);
+        this.scheduleOscillatorTuning(
+          oscillator.detune,
+          track,
+          oscillatorConfig,
+          oscillatorIndex,
+          time,
+          projectTime,
+          remaining,
+        );
+        this.scheduleOscillatorLevel(
+          oscillatorLevel.gain,
+          track,
+          oscillatorConfig,
+          oscillatorIndex,
+          time,
+          projectTime,
+          remaining,
+        );
+        oscillator.connect(oscillatorLevel);
+        oscillatorLevel.connect(envelope);
+        this.trackSource(oscillator);
+        oscillator.start(time);
+        oscillator.stop(time + remaining + 0.03);
+      });
     }
 
     routeVoice(output, trackId) {
@@ -1247,12 +1362,10 @@
           </label>
           <div class="sound-tool instrument-tool">
             <div class="tool-heading"><div><span>Instrument</span><strong>${escapeHtml(track.instrument.engine)}</strong></div><code>#${track.instrument.id}</code></div>
-            <div class="tool-controls">
-              <label class="tool-control">Waveform
-                <select data-sound-tool="instrument" data-track-id="${track.id}" data-tool-id="${track.instrument.id}" data-parameter="waveform" data-control-key="${track.id}-instrument-${track.instrument.id}-waveform" aria-label="${escapeHtml(`${track.name} instrument #${track.instrument.id} waveform`)}">
-                  ${selectOptions(["sine", "triangle", "sawtooth", "square"], track.instrument.waveform)}
-                </select>
-              </label>
+            <div class="oscillator-stack">
+              ${track.instrument.oscillators.map((oscillator, index) => renderOscillator(track, oscillator, index)).join("")}
+            </div>
+            <div class="tool-controls instrument-envelope-controls">
               ${soundRange(track, "instrument", track.instrument.id, "instrument", "attack", track.instrument.parameters.attack, 0.001, 2, "s")}
               ${soundRange(track, "instrument", track.instrument.id, "instrument", "release", track.instrument.parameters.release, 0.02, 5, "s")}
               ${soundRange(track, "instrument", track.instrument.id, "instrument", "tone", track.instrument.parameters.tone, 0, 1, "%")}
@@ -1343,14 +1456,44 @@
     }
   }
 
-  function soundRange(track, tool, toolId, ownerName, parameter, value, minimum, maximum, unit, clipId = "") {
+  function soundRange(
+    track,
+    tool,
+    toolId,
+    ownerName,
+    parameter,
+    value,
+    minimum,
+    maximum,
+    unit,
+    clipId = "",
+    label = parameter,
+  ) {
     const key = `${track.id}-${tool}-${toolId}-${parameter}`;
     const clipAttribute = clipId === "" ? "" : ` data-clip-id="${clipId}"`;
     const owner = tool === "instrument" ? "instrument" : `${ownerName} ${tool}`;
     const accessibleName = `${track.name} ${owner} #${toolId} ${parameter}`;
-    return `<label class="tool-control">${escapeHtml(parameter)}
+    return `<label class="tool-control">${escapeHtml(label)}
       <span class="range-with-output"><input type="range" min="${minimum}" max="${maximum}" step="any" value="${value}" data-sound-tool="${tool}" data-track-id="${track.id}" data-tool-id="${toolId}" data-parameter="${parameter}" data-unit="${unit}" data-control-key="${key}"${clipAttribute} aria-label="${escapeHtml(accessibleName)}"><output>${formatSoundValue(value, unit)}</output></span>
     </label>`;
+  }
+
+  function renderOscillator(track, oscillator, index) {
+    const number = index + 1;
+    const prefix = `oscillator${number}`;
+    const waveformParameter = index === 0 ? "waveform" : `${prefix}.waveform`;
+    return `<div class="oscillator-card">
+      <strong>Oscillator ${number}</strong>
+      <div class="tool-controls">
+        <label class="tool-control">Waveform
+          <select data-sound-tool="instrument" data-track-id="${track.id}" data-tool-id="${track.instrument.id}" data-parameter="${waveformParameter}" data-control-key="${track.id}-instrument-${track.instrument.id}-${waveformParameter}" aria-label="${escapeHtml(`${track.name} instrument #${track.instrument.id} oscillator ${number} waveform`)}">
+            ${selectOptions(["sine", "triangle", "sawtooth", "square"], oscillator.waveform)}
+          </select>
+        </label>
+        ${soundRange(track, "instrument", track.instrument.id, "instrument", `${prefix}.tuning`, oscillator.tuning, -24, 24, "st", "", "Tuning")}
+        ${soundRange(track, "instrument", track.instrument.id, "instrument", `${prefix}.level`, oscillator.level, 0, 1, "%", "", "Level")}
+      </div>
+    </div>`;
   }
 
   function soundToggle(track, tool, toolId, name, enabled) {
@@ -1375,6 +1518,7 @@
     const targets = track.modulationTargets.map((target) => [target.id, target.label]);
     return `<div class="modulator-card ${modulator.enabled ? "" : "is-disabled"}">
       <div class="effect-card-heading"><strong>${escapeHtml(modulator.name)}</strong><code>#${modulator.id}</code></div>
+      ${modulator.enabled && modulator.trigger === "midi" ? '<div class="modulator-route"><b>MIDI Clips</b><i aria-hidden="true">MIDI &rarr;</i><b>Modulator</b></div>' : ""}
       <div class="tool-controls">
         <label class="tool-control">Shape
           <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="shape" data-control-key="${track.id}-modulator-${modulator.id}-shape" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} shape`)}">${selectOptions(["sine", "triangle", "square", "random", "envelope"], modulator.shape)}</select>
@@ -1382,7 +1526,13 @@
         <label class="tool-control">Target
           <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="target" data-control-key="${track.id}-modulator-${modulator.id}-target" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} target`)}">${targets.map(([value, label]) => `<option value="${value}" ${value === modulator.target ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select>
         </label>
-        ${soundRange(track, "modulator", modulator.id, modulator.name, "rate", modulator.parameters.rate, 0.01, 20, "Hz")}
+        <label class="tool-control">Rate mode
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="rateMode" data-control-key="${track.id}-modulator-${modulator.id}-rateMode" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} rate mode`)}">${selectOptions(["hz", "tempo"], modulator.rateMode)}</select>
+        </label>
+        <label class="tool-control">Trigger
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="trigger" data-control-key="${track.id}-modulator-${modulator.id}-trigger" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} trigger`)}">${selectOptions(["free", "midi"], modulator.trigger)}</select>
+        </label>
+        ${soundRange(track, "modulator", modulator.id, modulator.name, "rate", modulator.parameters.rate, 0.01, 20, modulator.rateMode === "tempo" ? "x/beat" : "Hz")}
         ${soundRange(track, "modulator", modulator.id, modulator.name, "depth", modulator.parameters.depth, 0, 1, "%")}
       </div>
       <div class="tool-actions">${soundToggle(track, "modulator", modulator.id, modulator.name, modulator.enabled)}</div>
@@ -2362,6 +2512,7 @@
       `View: ${state.activeView}`,
       `Audio: ${audio.playbackState}; context ${audio.context?.state || "not initialized"}`,
       `AI edit: ${state.promptPending ? "pending" : "idle"}`,
+      `Codex sessions: ${state.ephemeralCodexSessions ? "ephemeral" : "persistent"}`,
       `Selection: ${state.selectionStart.toFixed(1)}s - ${state.selectionEnd.toFixed(1)}s`,
     ];
     if (project) {
@@ -2410,6 +2561,38 @@
     state.clientIssues = [];
     renderDebug();
     showToast("Browser issues cleared");
+  }
+
+  async function loadSettings() {
+    try {
+      const settings = await api("/api/settings");
+      state.ephemeralCodexSessions = settings.ephemeralCodexSessions !== false;
+      elements.persistentCodexSessions.checked = !state.ephemeralCodexSessions;
+      renderDebug();
+    } catch (error) {
+      showError(error, "loading Codex session settings");
+    }
+  }
+
+  async function changeCodexSessionMode() {
+    const persistent = elements.persistentCodexSessions.checked;
+    elements.persistentCodexSessions.disabled = true;
+    try {
+      const settings = await api("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ ephemeral: String(!persistent) }),
+      });
+      state.ephemeralCodexSessions = settings.ephemeralCodexSessions !== false;
+      elements.persistentCodexSessions.checked = !state.ephemeralCodexSessions;
+      renderDebug();
+      showToast(`Codex sessions are now ${state.ephemeralCodexSessions ? "ephemeral" : "persistent"}`);
+    } catch (error) {
+      elements.persistentCodexSessions.checked = !state.ephemeralCodexSessions;
+      showError(error, "changing Codex session settings");
+    } finally {
+      elements.persistentCodexSessions.disabled = false;
+    }
   }
 
   function showToast(message, isError = false) {
@@ -2476,6 +2659,7 @@
   });
   elements.copyDebug.addEventListener("click", () => void copyDebugReport());
   elements.clearDebug.addEventListener("click", clearDebugIssues);
+  elements.persistentCodexSessions.addEventListener("change", () => void changeCodexSessionMode());
   document.querySelectorAll("[data-prompt]").forEach((button) => {
     button.addEventListener("click", () => {
       elements.promptInput.value = button.dataset.prompt;
@@ -2516,6 +2700,7 @@
       showPendingEdit("Reconnecting to the active AI edit");
     }
     await loadProject();
+    await loadSettings();
     if (pending && state.project) await runPendingEdit(pending, false);
   }
 
