@@ -605,7 +605,7 @@ fn adler32(data: &[u8]) -> u32 {
         first = (first + u32::from(byte)) % 65_521;
         second = (second + first) % 65_521;
     }
-    second << 16 | first
+    (second << 16) | first
 }
 
 fn crc32(data: &[u8]) -> u32 {
