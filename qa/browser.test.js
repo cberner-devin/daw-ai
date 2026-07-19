@@ -508,6 +508,32 @@ async function run() {
       { activeTab: "ai-mode-button", focused: "timeline-panel", aiHidden: false },
       "the skip link must reveal and focus the timeline from another tab",
     );
+    const restoredOverlays = await evaluate(cdp, appSession, `(() => {
+      const selection = document.querySelector('#timeline-selection');
+      const playhead = document.querySelector('#playhead');
+      const layout = () => ({
+        selectionLeft: selection.style.left,
+        selectionWidth: selection.style.width,
+        playheadLeft: playhead.style.left,
+      });
+      const before = layout();
+      document.querySelector('#advanced-button').click();
+      window.dispatchEvent(new Event('resize'));
+      const hidden = layout();
+      document.querySelector('#ai-mode-button').click();
+      const after = layout();
+      return { before, hidden, after };
+    })()`);
+    assert.notDeepEqual(
+      restoredOverlays.hidden,
+      restoredOverlays.before,
+      "hidden layout must exercise the zero-width regression",
+    );
+    assert.deepEqual(
+      restoredOverlays.after,
+      restoredOverlays.before,
+      `returning to AI Mode must restore timeline overlays (${JSON.stringify(restoredOverlays)})`,
+    );
 
     await cdp.send(
       "Emulation.setDeviceMetricsOverride",
