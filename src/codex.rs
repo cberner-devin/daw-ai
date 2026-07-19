@@ -159,10 +159,10 @@ impl CodexPlanner {
         let stdout_reader = thread::spawn(move || read_stream(stdout));
         let stderr_reader = thread::spawn(move || read_stream(stderr));
         let started = Instant::now();
-        let mut delivered_updates = 0;
+        let mut delivered_plans = Vec::new();
         let status = loop {
             if let Err(error) =
-                publish_session_updates(&session, &mut delivered_updates, &mut on_update)
+                publish_session_updates(&session, &mut delivered_plans, &mut on_update)
             {
                 terminate_process_group(&mut child);
                 let _ = stdin_writer.join();
@@ -190,8 +190,7 @@ impl CodexPlanner {
             }
             thread::sleep(Duration::from_millis(50));
         };
-        if let Err(error) =
-            publish_session_updates(&session, &mut delivered_updates, &mut on_update)
+        if let Err(error) = publish_session_updates(&session, &mut delivered_plans, &mut on_update)
         {
             let _ = stdin_writer.join();
             let _ = stdout_reader.join();
@@ -221,22 +220,24 @@ impl CodexPlanner {
         String::from_utf8(output)
             .map_err(|_| PlannerError::InvalidOutput("response was not UTF-8".to_owned()))?;
         log_codex_warnings(&stderr);
-        let (plan, project) = session.finish().map_err(|message| invalid(&message))?;
+        let (plan, project) = session
+            .finish(delivered_plans)
+            .map_err(|message| invalid(&message))?;
         Ok(CodexEdit { plan, project })
     }
 }
 
 fn publish_session_updates(
     session: &EditSession,
-    delivered: &mut usize,
+    delivered_plans: &mut Vec<EditPlan>,
     on_update: &mut impl FnMut(CodexEdit) -> Result<(), PlannerError>,
 ) -> Result<(), PlannerError> {
-    for (plan, project) in session
-        .updates_after(*delivered)
-        .map_err(|message| invalid(&message))?
-    {
-        on_update(CodexEdit { plan, project })?;
-        *delivered += 1;
+    while let Some((plan, project)) = session.take_update().map_err(|message| invalid(&message))? {
+        on_update(CodexEdit {
+            plan: plan.clone(),
+            project,
+        })?;
+        delivered_plans.push(plan);
     }
     Ok(())
 }
@@ -365,12 +366,15 @@ fn planner_task(prompt: &str, start: f32, end: f32) -> String {
     format!(
         concat!(
             "You are the sound-graph editing engine inside DAW-AI. Read sound-graph.json in ",
-            "the current directory before deciding what to change. First form a musical plan, ",
-            "using the registered read-only listening tools to inspect relevant channels when ",
-            "frequency balance, dynamics, or density would help evaluate the request. ",
-            "Then use the registered daw_ai {tool} tool for every intended graph change. ",
-            "You may work iteratively, but use no more than eight actions in total. The tool ",
-            "validates each batch, updates sound-graph.json, and gives errors you must correct. ",
+            "the current directory before deciding what to change. Operate in an implementation ",
+            "loop: form or refine a musical plan from the request, current graph, and registered ",
+            "read-only listening tools; use the registered daw_ai {tool} tool to apply the next ",
+            "coherent graph batch; use the listening tools on the updated graph; then compare the ",
+            "result with the request and repeat when it is not yet complete. At least one listening ",
+            "call after a successful edit batch is required before you decide the work is complete. ",
+            "There is no predetermined iteration, tool-call, or request-wide action limit; the ",
+            "overall session timeout is the only loop limit. The edit tool validates each focused ",
+            "batch, updates sound-graph.json, and gives errors you must correct. ",
             "Do not stop after merely describing or manually editing the graph: at least one ",
             "successful {tool} call is required. After the graph is complete, reply briefly.\n\n",
             "{contract}\n\n",
@@ -717,6 +721,18 @@ fn invalid(message: &str) -> PlannerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planner_task_requires_an_unbounded_edit_listen_evaluate_loop() {
+        let task = planner_task("make the bass hit harder", 4.0, 8.0);
+        assert!(task.contains("Operate in an implementation loop"));
+        assert!(task.contains("listening tools on the updated graph"));
+        assert!(task.contains("compare the result with the request and repeat"));
+        assert!(
+            task.contains("no predetermined iteration, tool-call, or request-wide action limit")
+        );
+        assert!(task.contains("overall session timeout is the only loop limit"));
+    }
 
     #[test]
     fn parses_a_compound_structured_edit() {
