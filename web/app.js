@@ -2,12 +2,14 @@
   "use strict";
 
   const elements = {
+    skipLink: document.querySelector(".skip-link"),
     projectName: document.querySelector("#project-name"),
     tempo: document.querySelector("#tempo"),
     currentTime: document.querySelector("#current-time"),
     totalTime: document.querySelector("#total-time"),
     playButton: document.querySelector("#play-button"),
     rewindButton: document.querySelector("#rewind-button"),
+    timelinePanel: document.querySelector("#timeline-panel"),
     timelineContent: document.querySelector("#timeline-content"),
     timelineScroll: document.querySelector("#timeline-scroll"),
     rulerLane: document.querySelector("#ruler-lane"),
@@ -30,11 +32,17 @@
     savedState: document.querySelector("#saved-state"),
     editLog: document.querySelector("#edit-log"),
     editCount: document.querySelector("#edit-count"),
+    aiModeButton: document.querySelector("#ai-mode-button"),
+    aiModePanel: document.querySelector("#ai-mode-panel"),
     advancedButton: document.querySelector("#advanced-button"),
     closeAdvanced: document.querySelector("#close-advanced"),
     advancedDrawer: document.querySelector("#advanced-drawer"),
-    drawerBackdrop: document.querySelector("#drawer-backdrop"),
     channelList: document.querySelector("#channel-list"),
+    debugButton: document.querySelector("#debug-button"),
+    debugPanel: document.querySelector("#debug-panel"),
+    debugReport: document.querySelector("#debug-report"),
+    copyDebug: document.querySelector("#copy-debug"),
+    clearDebug: document.querySelector("#clear-debug"),
     toast: document.querySelector("#toast"),
   };
 
@@ -48,7 +56,8 @@
     promptPending: false,
     centeredInitialSelection: false,
     toastTimer: null,
-    drawerHideTimer: null,
+    activeView: "ai",
+    clientIssues: [],
   };
 
   let projectMutationQueue = Promise.resolve();
@@ -1038,6 +1047,14 @@
   function reportClientIssue(level, error, context) {
     const message = errorMessage(error);
     const stack = error instanceof Error && error.stack ? `\n${error.stack}` : "";
+    state.clientIssues.push({
+      time: new Date().toISOString(),
+      level,
+      context: String(context || "browser").slice(0, 160),
+      message: `${message}${stack}`.slice(0, 4096),
+    });
+    state.clientIssues = state.clientIssues.slice(-20);
+    renderDebug();
     const body = new URLSearchParams({
       level,
       context: String(context || "browser").slice(0, 160),
@@ -1082,6 +1099,7 @@
     renderPlayhead();
     renderEditLog();
     renderAdvanced();
+    renderDebug();
     updateTransport();
     if (!state.centeredInitialSelection) {
       state.centeredInitialSelection = true;
@@ -2030,57 +2048,121 @@
     }
   }
 
+  function setView(view) {
+    const views = [
+      { name: "ai", button: elements.aiModeButton, panel: elements.aiModePanel },
+      { name: "advanced", button: elements.advancedButton, panel: elements.advancedDrawer },
+      { name: "debug", button: elements.debugButton, panel: elements.debugPanel },
+    ];
+    if (!views.some((entry) => entry.name === view)) return;
+    state.activeView = view;
+    for (const entry of views) {
+      const active = entry.name === view;
+      entry.button.classList.toggle("is-active", active);
+      entry.button.setAttribute("aria-selected", String(active));
+      entry.button.tabIndex = active ? 0 : -1;
+      entry.panel.hidden = !active;
+      entry.panel.inert = !active;
+    }
+    elements.advancedDrawer.classList.toggle("is-open", view === "advanced");
+    if (view === "debug") renderDebug();
+    window.scrollTo(0, 0);
+  }
+
   function openAdvanced() {
-    window.clearTimeout(state.drawerHideTimer);
-    elements.drawerBackdrop.hidden = false;
-    elements.advancedDrawer.hidden = false;
-    elements.advancedDrawer.inert = false;
-    elements.advancedDrawer.setAttribute("aria-hidden", "false");
-    elements.advancedButton.setAttribute("aria-expanded", "true");
-    document.body.style.overflow = "hidden";
-    window.requestAnimationFrame(() => {
-      elements.advancedDrawer.classList.add("is-open");
-      elements.closeAdvanced.focus();
-    });
+    setView("advanced");
   }
 
   function closeAdvanced() {
-    elements.advancedDrawer.classList.remove("is-open");
-    elements.advancedDrawer.inert = true;
-    elements.advancedDrawer.setAttribute("aria-hidden", "true");
-    elements.advancedButton.setAttribute("aria-expanded", "false");
-    elements.drawerBackdrop.hidden = true;
-    document.body.style.overflow = "";
-    state.drawerHideTimer = window.setTimeout(() => {
-      elements.advancedDrawer.hidden = true;
-    }, 230);
-    elements.advancedButton.focus();
+    setView("ai");
+    elements.aiModeButton.focus();
   }
 
-  function trapAdvancedFocus(event) {
-    if (event.key !== "Tab") return;
-    const focusable = [...elements.advancedDrawer.querySelectorAll("button, input, select, summary, [href], [tabindex]")].filter(
-      isActuallyTabbable,
-    );
-    if (focusable.length === 0) return;
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    const active = document.activeElement;
-    if (event.shiftKey && (active === first || !elements.advancedDrawer.contains(active))) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && (active === last || !elements.advancedDrawer.contains(active))) {
-      event.preventDefault();
-      first.focus();
+  function openDebug() {
+    setView("debug");
+  }
+
+  function skipToTimeline(event) {
+    event.preventDefault();
+    setView("ai");
+    elements.timelinePanel.focus({ preventScroll: true });
+    elements.timelinePanel.scrollIntoView({ block: "start" });
+  }
+
+  function handleViewTabKey(event) {
+    const tabs = [elements.aiModeButton, elements.advancedButton, elements.debugButton];
+    const current = tabs.indexOf(event.currentTarget);
+    let next = current;
+    if (event.key === "ArrowRight") next = (current + 1) % tabs.length;
+    else if (event.key === "ArrowLeft") next = (current + tabs.length - 1) % tabs.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = tabs.length - 1;
+    else return;
+    event.preventDefault();
+    tabs[next].click();
+    tabs[next].focus();
+  }
+
+  function debugReport() {
+    const project = state.project;
+    const lines = [
+      "DAW-AI debug report",
+      `Generated: ${new Date().toISOString()}`,
+      `URL: ${window.location.href}`,
+      `User agent: ${navigator.userAgent}`,
+      `Viewport: ${window.innerWidth}x${window.innerHeight} at ${window.devicePixelRatio || 1}x`,
+      `Network: ${navigator.onLine ? "online" : "offline"}`,
+      `View: ${state.activeView}`,
+      `Audio: ${audio.playbackState}; context ${audio.context?.state || "not initialized"}`,
+      `AI edit: ${state.promptPending ? "pending" : "idle"}`,
+      `Selection: ${state.selectionStart.toFixed(1)}s - ${state.selectionEnd.toFixed(1)}s`,
+    ];
+    if (project) {
+      lines.push(
+        `Project: ${project.name}`,
+        `Project version: ${project.version}`,
+        `Arrangement: ${project.bpm} BPM; ${project.duration}s; ${project.tracks.length} tracks; ${project.edits.length} edits`,
+      );
+    } else {
+      lines.push("Project: unavailable");
     }
+    lines.push("", "Recent browser errors and warnings:");
+    if (state.clientIssues.length === 0) {
+      lines.push("None recorded in this browser session.");
+    } else {
+      for (const issue of state.clientIssues) {
+        lines.push(`${issue.time} [${issue.level.toUpperCase()}] ${issue.context}: ${issue.message}`);
+      }
+    }
+    lines.push("", "Backend warnings and errors are written to the DAW-AI server's stderr.");
+    return lines.join("\n");
   }
 
-  function isActuallyTabbable(element) {
-    if (element.disabled || element.tabIndex < 0 || element.closest("[inert]")) return false;
-    const closedDisclosure = element.closest("details:not([open])");
-    if (closedDisclosure && element !== closedDisclosure.querySelector("summary")) return false;
-    const style = window.getComputedStyle(element);
-    return style.display !== "none" && style.visibility !== "hidden" && element.getClientRects().length > 0;
+  function renderDebug() {
+    elements.debugReport.value = debugReport();
+  }
+
+  async function copyDebugReport() {
+    renderDebug();
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
+      await navigator.clipboard.writeText(elements.debugReport.value);
+    } catch (_error) {
+      elements.debugReport.focus();
+      elements.debugReport.select();
+      if (!document.execCommand("copy")) {
+        showToast("Select the diagnostic report and copy it manually.", true);
+        return;
+      }
+      elements.debugReport.setSelectionRange(0, 0);
+    }
+    showToast("Diagnostic report copied");
+  }
+
+  function clearDebugIssues() {
+    state.clientIssues = [];
+    renderDebug();
+    showToast("Browser issues cleared");
   }
 
   function showToast(message, isError = false) {
@@ -2133,9 +2215,16 @@
   elements.undoButton.addEventListener("click", () => void undo());
   elements.resetButton.addEventListener("click", () => void reset());
   elements.selectionModeButton.addEventListener("click", () => setTouchSelectionMode(!state.touchSelectionMode));
+  elements.skipLink.addEventListener("click", skipToTimeline);
+  elements.aiModeButton.addEventListener("click", () => setView("ai"));
   elements.advancedButton.addEventListener("click", openAdvanced);
+  elements.debugButton.addEventListener("click", openDebug);
+  [elements.aiModeButton, elements.advancedButton, elements.debugButton].forEach((button) => {
+    button.addEventListener("keydown", handleViewTabKey);
+  });
   elements.closeAdvanced.addEventListener("click", closeAdvanced);
-  elements.drawerBackdrop.addEventListener("click", closeAdvanced);
+  elements.copyDebug.addEventListener("click", () => void copyDebugReport());
+  elements.clearDebug.addEventListener("click", clearDebugIssues);
   document.querySelectorAll("[data-prompt]").forEach((button) => {
     button.addEventListener("click", () => {
       elements.promptInput.value = button.dataset.prompt;
@@ -2157,12 +2246,9 @@
   window.addEventListener("resize", () => {
     renderSelection();
     renderPlayhead();
+    renderDebug();
   });
   document.addEventListener("keydown", (event) => {
-    if (elements.advancedDrawer.classList.contains("is-open")) {
-      if (event.key === "Escape") closeAdvanced();
-      trapAdvancedFocus(event);
-    }
     const nativeSpaceSelector = "textarea, input, button, select, summary, a[href], [contenteditable='true']";
     const nativeSpaceControl =
       event.target.closest?.(nativeSpaceSelector) ?? document.activeElement?.closest?.(nativeSpaceSelector);
