@@ -92,6 +92,17 @@ the track to determine whether it meets the user's request. One of these should 
 takes a channel(s) and a time range and renders a Mel Spectrogram as a PNG and returns it to Codex.
 Other useful analysis tools are available as well.
 
+#### Codex loop
+Codex is told to operate in an implementation loop. It should:
+* Make edits to the sound graph
+* Use the "listening" tool(s)
+* Consider whether the request has been completed
+* Repeat, if necessary
+
+DAW AI MUST NOT limit the number of iterations or tools calls, except with a long timeout on the whole request.
+
+DAW AI should display incremental updates to the progress bar as Codex progresses.
+
 ### Deployment
 
 The expected deployment is either as a local webserver, or on a private network where a gateway handles authentication.
