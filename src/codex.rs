@@ -368,7 +368,7 @@ fn planner_task(prompt: &str, start: f32, end: f32) -> String {
             "the current directory before deciding what to change. First form a musical plan, ",
             "using the registered read-only listening tools to inspect relevant channels when ",
             "frequency balance, dynamics, or density would help evaluate the request. ",
-            "then use the registered daw_ai {tool} tool for every intended graph change. ",
+            "Then use the registered daw_ai {tool} tool for every intended graph change. ",
             "You may work iteratively, but use no more than eight actions in total. The tool ",
             "validates each batch, updates sound-graph.json, and gives errors you must correct. ",
             "Do not stop after merely describing or manually editing the graph: at least one ",
