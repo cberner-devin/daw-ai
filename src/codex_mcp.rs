@@ -2,6 +2,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use serde_json::Value as JsonValue;
 
@@ -9,7 +11,7 @@ use crate::audio_analysis::{self, MAX_REGION_SECONDS};
 use crate::codex::{EDIT_SCHEMA, plan_from_json};
 use crate::model::{Project, StudioError, json_string};
 use crate::prompt::{Action, EditPlan};
-use crate::storage::{ProjectStore, replace_text_file};
+use crate::storage::ProjectStore;
 
 pub(crate) const MCP_SESSION_ENV: &str = "DAW_AI_MCP_SESSION";
 pub(crate) const MCP_TOOL_NAME: &str = "apply_sound_graph_edits";
@@ -17,9 +19,10 @@ pub(crate) const MEL_TOOL_NAME: &str = "render_mel_spectrogram";
 pub(crate) const ANALYZE_TOOL_NAME: &str = "analyze_audio_region";
 const GRAPH_FILE: &str = "sound-graph.json";
 const REQUEST_FILE: &str = "request.json";
-const OPERATIONS_FILE: &str = "edit-operations.jsonl";
-const PROGRESS_FILE_PREFIX: &str = "edit-progress-";
-const MAX_OPERATIONS_BYTES: u64 = 1024 * 1024;
+const PROGRESS_DIRECTORY: &str = "edit-progress";
+const PENDING_PROGRESS_DIRECTORY: &str = ".edit-progress.pending";
+const PROGRESS_PLAN_FILE: &str = "plan.json";
+const PROGRESS_GRAPH_FILE: &str = "project.json";
 const AUDIO_REGION_SCHEMA: &str = r#"{
   "type": "object",
   "additionalProperties": false,
@@ -60,7 +63,6 @@ impl EditSession {
                     json_string(prompt)
                 ),
             )?;
-            write_new(&path.join(OPERATIONS_FILE), "")?;
             Ok(Self { path: path.clone() })
         })();
         if result.is_err() {
@@ -73,8 +75,7 @@ impl EditSession {
         &self.path
     }
 
-    pub(crate) fn finish(&self) -> Result<(EditPlan, Project), String> {
-        let plans = read_plans(&self.path)?;
+    pub(crate) fn finish(&self, plans: Vec<EditPlan>) -> Result<(EditPlan, Project), String> {
         let mut actions = Vec::new();
         let mut summary = None;
         for plan in plans {
@@ -85,9 +86,6 @@ impl EditSession {
             return Err(format!(
                 "Codex did not use the registered {MCP_TOOL_NAME} tool"
             ));
-        }
-        if actions.len() > 8 {
-            return Err("Codex applied more than eight sound-graph actions".to_owned());
         }
         let action = if actions.len() == 1 {
             actions.pop().expect("one action")
@@ -107,26 +105,24 @@ impl EditSession {
         ))
     }
 
-    pub(crate) fn updates_after(
-        &self,
-        delivered: usize,
-    ) -> Result<Vec<(EditPlan, Project)>, String> {
-        let plans = read_plans(&self.path)?;
-        if delivered > plans.len() {
-            return Err("Codex edit progress moved backwards".to_owned());
+    pub(crate) fn take_update(&self) -> Result<Option<(EditPlan, Project)>, String> {
+        let path = progress_path(&self.path);
+        if !path.exists() {
+            return Ok(None);
         }
-        plans
-            .into_iter()
-            .enumerate()
-            .skip(delivered)
-            .map(|(index, plan)| {
-                let source = fs::read_to_string(progress_path(&self.path, index + 1))
-                    .map_err(|error| format!("could not read Codex edit progress: {error}"))?;
-                let project = Project::from_json(&source)
-                    .map_err(|error| format!("Codex edit progress is invalid: {error}"))?;
-                Ok((plan, project))
-            })
-            .collect()
+        if !path.is_dir() {
+            return Err("Codex edit progress handoff is not a directory".to_owned());
+        }
+        let plan_source = fs::read_to_string(path.join(PROGRESS_PLAN_FILE))
+            .map_err(|error| format!("could not read Codex edit plan progress: {error}"))?;
+        let graph_source = fs::read_to_string(path.join(PROGRESS_GRAPH_FILE))
+            .map_err(|error| format!("could not read Codex sound graph progress: {error}"))?;
+        let plan = plan_from_json(&plan_source).map_err(|error| error.to_string())?;
+        let project = Project::from_json(&graph_source)
+            .map_err(|error| format!("Codex edit progress is invalid: {error}"))?;
+        fs::remove_dir_all(&path)
+            .map_err(|error| format!("could not consume Codex edit progress: {error}"))?;
+        Ok(Some((plan, project)))
     }
 }
 
@@ -214,7 +210,7 @@ fn initialize_response(id: &str, params: Option<&JsonValue>) -> String {
             json_string(protocol),
             json_string(env!("CARGO_PKG_VERSION")),
             json_string(
-                "Read sound-graph.json before editing. Use the read-only listening tools to inspect relevant channels when useful. Use apply_sound_graph_edits for every intended change; it validates and rewrites the graph. Keep all batches to eight actions total."
+                "Read sound-graph.json before editing. Work in an edit, listen, and evaluate loop: apply each intended change through apply_sound_graph_edits, use the read-only listening tools on the updated graph, compare the result with the request, and repeat until complete. There is no predetermined iteration or tool-call limit; only the overall session timeout limits the loop."
             )
         ),
     )
@@ -231,7 +227,7 @@ fn tools_response(id: &str) -> String {
             "tools": [
                 {
                     "name": MCP_TOOL_NAME,
-                    "description": "Apply one validated batch of generic MIDI clip, instrument, effect, modulator, routing, mix, arrangement, or tempo operations to sound-graph.json. Returns a precise validation error without changing the graph when the batch is invalid. Call iteratively when useful, with no more than eight actions across the full edit.",
+                    "description": "Apply one validated batch of generic MIDI clip, instrument, effect, modulator, routing, mix, arrangement, or tempo operations to sound-graph.json. Returns a precise validation error without changing the graph when the batch is invalid. Use as many focused batches as needed in an edit, listen, and evaluate loop.",
                     "inputSchema": edit_schema,
                     "annotations": {
                         "title": "Apply sound graph edits",
@@ -482,17 +478,8 @@ fn base64(bytes: &[u8]) -> String {
 
 fn apply_graph_edits(session_path: &Path, source: &str) -> Result<String, String> {
     let plan = plan_from_json(source).map_err(|error| error.to_string())?;
-    let prior_plans = read_plans(session_path)?;
-    let prior_action_count = prior_plans
-        .iter()
-        .map(|plan| action_count(&plan.action))
-        .sum::<usize>();
     let new_action_count = action_count(&plan.action);
-    if prior_action_count + new_action_count > 8 {
-        return Err(format!(
-            "This batch would exceed the eight-action edit limit ({prior_action_count} already applied, {new_action_count} requested)."
-        ));
-    }
+    wait_for_progress_handoff(session_path);
     let (start, end, prompt) = read_request(session_path)?;
     let graph_path = session_path.join(GRAPH_FILE);
     if !graph_path.is_file() {
@@ -507,18 +494,7 @@ fn apply_graph_edits(session_path: &Path, source: &str) -> Result<String, String
     store
         .save(studio.project())
         .map_err(|error| format!("Could not write sound-graph.json: {error}"))?;
-    let progress_path = progress_path(session_path, prior_plans.len() + 1);
-    if let Err(error) = write_new(&progress_path, &studio.project().to_json()) {
-        let _ = fs::remove_file(&progress_path);
-        return match store.save(&original_project) {
-            Ok(()) => Err(format!("could not record Codex edit progress: {error}")),
-            Err(rollback_error) => Err(format!(
-                "could not record Codex edit progress: {error}; also could not restore sound-graph.json: {rollback_error}"
-            )),
-        };
-    }
-    if let Err(error) = append_operation(session_path, source) {
-        let _ = fs::remove_file(progress_path);
+    if let Err(error) = publish_progress(session_path, source, studio.project()) {
         return match store.save(&original_project) {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(format!(
@@ -532,8 +508,35 @@ fn apply_graph_edits(session_path: &Path, source: &str) -> Result<String, String
     ))
 }
 
-fn progress_path(session_path: &Path, sequence: usize) -> PathBuf {
-    session_path.join(format!("{PROGRESS_FILE_PREFIX}{sequence}.json"))
+fn wait_for_progress_handoff(session_path: &Path) {
+    let path = progress_path(session_path);
+    // The single slot transfers ownership in order and bounds temporary graph storage.
+    while path.exists() {
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn publish_progress(session_path: &Path, plan: &str, project: &Project) -> Result<(), String> {
+    let pending = session_path.join(PENDING_PROGRESS_DIRECTORY);
+    let published = progress_path(session_path);
+    let result = (|| {
+        fs::create_dir(&pending)
+            .map_err(|error| format!("could not prepare Codex edit progress: {error}"))?;
+        write_new(&pending.join(PROGRESS_PLAN_FILE), plan)
+            .map_err(|error| format!("could not record Codex edit plan progress: {error}"))?;
+        write_new(&pending.join(PROGRESS_GRAPH_FILE), &project.to_json())
+            .map_err(|error| format!("could not record Codex sound graph progress: {error}"))?;
+        fs::rename(&pending, &published)
+            .map_err(|error| format!("could not publish Codex edit progress: {error}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&pending);
+    }
+    result
+}
+
+fn progress_path(session_path: &Path) -> PathBuf {
+    session_path.join(PROGRESS_DIRECTORY)
 }
 
 fn read_request(session_path: &Path) -> Result<(f32, f32, String), String> {
@@ -558,37 +561,6 @@ fn read_request(session_path: &Path) -> Result<(f32, f32, String), String> {
         .ok_or_else(|| "edit request prompt must be a string".to_owned())?
         .to_owned();
     Ok((number("start")?, number("end")?, prompt))
-}
-
-fn read_plans(session_path: &Path) -> Result<Vec<EditPlan>, String> {
-    let path = session_path.join(OPERATIONS_FILE);
-    let metadata = fs::metadata(&path)
-        .map_err(|error| format!("could not inspect edit operations: {error}"))?;
-    if metadata.len() > MAX_OPERATIONS_BYTES {
-        return Err("edit operations exceeded the session limit".to_owned());
-    }
-    let source = fs::read_to_string(path)
-        .map_err(|error| format!("could not read edit operations: {error}"))?;
-    source
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| plan_from_json(line).map_err(|error| error.to_string()))
-        .collect()
-}
-
-fn append_operation(session_path: &Path, source: &str) -> Result<(), String> {
-    let value = serde_json::from_str::<JsonValue>(source)
-        .map_err(|error| format!("could not record invalid tool arguments: {error}"))?;
-    let path = session_path.join(OPERATIONS_FILE);
-    let mut operations = fs::read_to_string(&path)
-        .map_err(|error| format!("could not read edit operations: {error}"))?;
-    operations.push_str(&value.to_string());
-    operations.push('\n');
-    if operations.len() as u64 > MAX_OPERATIONS_BYTES {
-        return Err("edit operations exceeded the session limit".to_owned());
-    }
-    replace_text_file(&path, &operations)
-        .map_err(|error| format!("could not record edit operations: {error}"))
 }
 
 fn append_actions(action: Action, actions: &mut Vec<Action>) {
@@ -699,6 +671,7 @@ fn json_rpc_error(id: &str, code: i32, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::io::{BufReader, Cursor};
+    use std::sync::mpsc::{self, RecvTimeoutError};
 
     use super::*;
 
@@ -739,6 +712,21 @@ mod tests {
         .to_string()
     }
 
+    fn session_entries(session: &EditSession) -> Vec<String> {
+        let mut entries = fs::read_dir(session.path())
+            .expect("session directory")
+            .map(|entry| {
+                entry
+                    .expect("session entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
     #[test]
     fn serves_and_applies_registered_graph_tools() {
         let session = EditSession::create(&Project::demo(), "brighten the bass", 4.0, 8.0)
@@ -765,22 +753,113 @@ mod tests {
         assert!(output.contains(MCP_TOOL_NAME));
         assert!(output.contains(MEL_TOOL_NAME));
         assert!(output.contains(ANALYZE_TOOL_NAME));
+        assert!(output.contains("edit, listen, and evaluate loop"));
+        assert!(output.contains("no predetermined iteration or tool-call limit"));
         assert!(output.contains("\"isError\":false"));
 
-        let first_update = session.updates_after(0).expect("first published update");
-        assert_eq!(first_update.len(), 1);
-        assert_eq!(first_update[0].0.summary, "Changed the bass waveform");
-        assert_eq!(first_update[0].1.tracks[1].instrument.waveform, "sawtooth");
+        let first_update = session
+            .take_update()
+            .expect("first published update")
+            .expect("first update");
+        assert_eq!(first_update.0.summary, "Changed the bass waveform");
+        assert_eq!(first_update.1.tracks[1].instrument.waveform, "sawtooth");
+        assert!(!progress_path(session.path()).exists());
 
         let second = handle_message(&tool_call(4, 201, "triangle"), session.path())
             .expect("second tool response");
         assert!(second.contains("\"isError\":false"));
-        let second_update = session.updates_after(1).expect("second published update");
-        assert_eq!(second_update.len(), 1);
-        assert_eq!(second_update[0].1.tracks[1].instrument.waveform, "triangle");
+        let second_update = session
+            .take_update()
+            .expect("second published update")
+            .expect("second update");
+        assert_eq!(second_update.1.tracks[1].instrument.waveform, "triangle");
+        assert!(!progress_path(session.path()).exists());
 
-        let (plan, graph) = session.finish().expect("completed graph edit");
+        let (plan, graph) = session
+            .finish(vec![first_update.0, second_update.0])
+            .expect("completed graph edit");
         assert_eq!(plan.summary, "Changed the bass waveform");
+        assert_eq!(graph.tracks[1].instrument.waveform, "triangle");
+    }
+
+    #[test]
+    fn permits_more_than_eight_actions_across_iterative_tool_calls() {
+        let session = EditSession::create(&Project::demo(), "iterate on the bass", 4.0, 8.0)
+            .expect("edit session");
+        let mut plans = Vec::new();
+        for iteration in 1..=9 {
+            let waveform = if iteration % 2 == 0 {
+                "triangle"
+            } else {
+                "sawtooth"
+            };
+            let response = handle_message(&tool_call(iteration, 201, waveform), session.path())
+                .expect("tool response");
+            assert!(response.contains("\"isError\":false"));
+            assert!(progress_path(session.path()).is_dir());
+            let (plan, _) = session
+                .take_update()
+                .expect("published update")
+                .expect("update");
+            plans.push(plan);
+            assert!(!progress_path(session.path()).exists());
+            assert_eq!(session_entries(&session), [REQUEST_FILE, GRAPH_FILE]);
+        }
+
+        let (plan, graph) = session.finish(plans).expect("completed iterative edit");
+        assert_eq!(action_count(&plan.action), 9);
+        assert_eq!(graph.tracks[1].instrument.waveform, "sawtooth");
+    }
+
+    #[test]
+    fn progress_handoff_applies_backpressure_and_reclaims_each_snapshot() {
+        let session = EditSession::create(&Project::demo(), "iterate on the bass", 4.0, 8.0)
+            .expect("edit session");
+        let first = handle_message(&tool_call(1, 201, "sawtooth"), session.path())
+            .expect("first tool response");
+        assert!(first.contains("\"isError\":false"));
+
+        let path = session.path().to_owned();
+        let (sender, receiver) = mpsc::channel();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let producer = thread::spawn(move || {
+            started_sender.send(()).expect("signal second producer");
+            sender
+                .send(handle_message(&tool_call(2, 201, "triangle"), &path))
+                .expect("send second response");
+        });
+        started_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second producer started");
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(
+            session_entries(&session),
+            [PROGRESS_DIRECTORY, REQUEST_FILE, GRAPH_FILE]
+        );
+
+        let first_update = session
+            .take_update()
+            .expect("first update handoff")
+            .expect("first update");
+        let second = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second batch unblocked")
+            .expect("second tool response");
+        producer.join().expect("second producer");
+        assert!(second.contains("\"isError\":false"));
+        let second_update = session
+            .take_update()
+            .expect("second update handoff")
+            .expect("second update");
+        assert_eq!(session_entries(&session), [REQUEST_FILE, GRAPH_FILE]);
+
+        let (plan, graph) = session
+            .finish(vec![first_update.0, second_update.0])
+            .expect("completed backpressured edit");
+        assert_eq!(action_count(&plan.action), 2);
         assert_eq!(graph.tracks[1].instrument.waveform, "triangle");
     }
 
@@ -793,7 +872,7 @@ mod tests {
             handle_message(&tool_call(1, 999, "sawtooth"), session.path()).expect("tool response");
         assert!(response.contains("\"isError\":true"));
         assert!(response.contains("stable IDs"));
-        assert!(session.finish().is_err());
+        assert!(session.finish(Vec::new()).is_err());
         let graph = fs::read_to_string(session.path().join(GRAPH_FILE)).unwrap();
         assert_eq!(
             Project::from_json(&graph).unwrap().to_json(),

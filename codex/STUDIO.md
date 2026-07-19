@@ -32,9 +32,20 @@ Use `all` when an edit should affect the complete mix. Use a role name for a tar
 
 ## Plan first
 
-For each edit-tool call, write `musicalPlan`: a concise description of the rhythm, harmony, orchestration, and sound design that will fulfill the request in the selected region. Inspect the existing composition and use the listening tools when useful before deciding whether to replace a MIDI clip, configure an existing tool by stable ID, or add a track. Then provide the smallest ordered `actions` list that realizes that part of the plan. `summary` describes the completed change to the user. You may call the edit tool iteratively, but the entire request may contain at most eight actions.
+For each edit-tool call, write `musicalPlan`: a concise description of the rhythm, harmony, orchestration, and sound design that will fulfill the request in the selected region. Inspect the existing composition and use the listening tools before deciding whether to replace a MIDI clip, configure an existing tool by stable ID, or add a track. Then provide the smallest ordered `actions` list that realizes that part of the plan. `summary` describes the completed change to the user. Each call is a focused batch of at most eight actions; that batch size does not limit how many edit or listening calls the request may use.
 
 Do not invent a niche arrangement action. Terms such as drop, chorus, build, breakdown, and fill are musical goals that must be composed from MIDI clips, instruments, effects, modulators, routing, and level changes.
+
+## Implementation loop
+
+Work in an edit, listen, and evaluate loop:
+
+1. Form or refine the musical plan from the request, selected region, current graph, and listening results.
+2. Apply the next coherent sound-graph batch with `apply_sound_graph_edits`.
+3. Use one or more listening tools on the updated graph and relevant channels.
+4. Compare what the listening result and current graph show with the user's request. If anything is missing or weak, repeat the loop with another batch.
+
+Do not decide that the request is complete immediately after an edit call. Listen to the edited graph and explicitly evaluate it first. There is no predetermined limit on iterations, edit calls, listening calls, or total actions across batches; continue until the request is fulfilled or the overall session timeout ends.
 
 ## Actions
 

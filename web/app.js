@@ -57,6 +57,7 @@
     dragAnchor: 0,
     touchSelectionMode: false,
     promptPending: false,
+    editProgressPercent: 0,
     channelMutationPending: false,
     centeredInitialSelection: false,
     toastTimer: null,
@@ -1762,13 +1763,31 @@
     const elapsed = Math.max(0, Number(job.elapsedSeconds) || 0);
     const timeout = Math.max(1, Number(job.timeoutSeconds) || 20 * 60);
     const detail = job.detail || "Codex is working on the edit";
-    const percent = clamp((elapsed / timeout) * 100, 0, 100);
+    const appliedSteps = Math.max(0, Number(job.appliedSteps) || 0);
+    let nextActivityPercent = 5;
+    if (job.status === "completed") {
+      nextActivityPercent = 100;
+    } else if (job.phase === "syncing") {
+      nextActivityPercent = state.editProgressPercent;
+    } else if (job.phase === "finalizing") {
+      nextActivityPercent = 94;
+    } else if (job.phase === "applying") {
+      nextActivityPercent = 88;
+    } else if (appliedSteps > 0) {
+      nextActivityPercent = 90 - 70 / (appliedSteps + 1);
+    } else if (job.phase === "planning") {
+      nextActivityPercent = 14;
+    }
+    state.editProgressPercent = Math.max(state.editProgressPercent, nextActivityPercent);
     elements.editProgress.hidden = false;
     if (elements.editProgressLabel.textContent !== detail) elements.editProgressLabel.textContent = detail;
     elements.editProgressTime.textContent = `${formatTime(elapsed, false)} / ${formatTime(timeout, false)}`;
-    elements.editProgressFill.style.width = `${percent}%`;
-    elements.editProgressTrack.setAttribute("aria-valuemax", String(timeout));
-    elements.editProgressTrack.setAttribute("aria-valuenow", String(Math.min(elapsed, timeout)));
+    elements.editProgressFill.style.width = `${state.editProgressPercent}%`;
+    elements.editProgressTrack.setAttribute(
+      "aria-valuetext",
+      appliedSteps > 0 ? `${appliedSteps} edit ${appliedSteps === 1 ? "step" : "steps"} applied. ${detail}` : detail,
+    );
+    elements.editProgressTrack.removeAttribute("aria-valuenow");
     elements.savedState.textContent = `${detail} - ${formatTime(elapsed, false)} elapsed`;
     elements.composeButton.querySelector("span").textContent =
       job.phase === "syncing"
@@ -1780,6 +1799,7 @@
 
   function hideEditProgress() {
     elements.editProgress.hidden = true;
+    state.editProgressPercent = 0;
     elements.editProgressFill.style.width = "0%";
   }
 

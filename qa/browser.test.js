@@ -339,9 +339,18 @@ async function run() {
         labelRole: document.querySelector('#edit-progress-label').getAttribute('role'),
         labelLive: document.querySelector('#edit-progress-label').getAttribute('aria-live'),
         timerHidden: document.querySelector('#edit-progress-time').getAttribute('aria-hidden'),
+        progressLabel: document.querySelector('#edit-progress-track').getAttribute('aria-label'),
+        progressValue: document.querySelector('#edit-progress-track').getAttribute('aria-valuenow'),
       })`),
-      { containerRole: null, labelRole: "status", labelLive: "polite", timerHidden: "true" },
-      "elapsed edit time must remain outside the progress live region",
+      {
+        containerRole: null,
+        labelRole: "status",
+        labelLive: "polite",
+        timerHidden: "true",
+        progressLabel: "AI edit activity",
+        progressValue: null,
+      },
+      "open-ended edit activity and elapsed time must have accurate accessibility semantics",
     );
     const { identifier: resumeEditScript } = await cdp.send(
       "Page.addScriptToEvaluateOnNewDocument",
@@ -925,7 +934,9 @@ async function run() {
           cdp,
           appSession,
           `document.querySelector('#edit-progress-label').textContent === 'Codex is arranging the requested change' &&
-            document.querySelector('#edit-progress-time').textContent === '1:13 / 20:00'`,
+            document.querySelector('#edit-progress-time').textContent === '1:13 / 20:00' &&
+            document.querySelector('#edit-progress-fill').style.width === '14%' &&
+            document.querySelector('#edit-progress-track').getAttribute('aria-valuenow') === null`,
         ),
       "running Codex progress",
     );
@@ -1340,7 +1351,10 @@ async function run() {
       const originalFetch = window.fetch;
       window.__incrementalFailed = false;
       window.__incrementalPolls = 0;
+      window.__incrementalProjectPending = false;
+      window.__incrementalProjectReleased = false;
       window.__incrementalBaseEditCount = project.edits.length;
+      const deferredProjectResponses = [];
       const published = structuredClone(project);
       published.version += 1;
       published.canUndo = true;
@@ -1385,12 +1399,24 @@ async function run() {
           });
         }
         if (resource === '/api/project') {
-          return new Response(JSON.stringify(published), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' },
-          });
+          if (window.__incrementalProjectReleased) {
+            return new Response(JSON.stringify(published), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          window.__incrementalProjectPending = true;
+          return new Promise((resolve) => deferredProjectResponses.push(() => resolve(new Response(
+            JSON.stringify(published),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          ))));
         }
         return originalFetch(resource, options);
+      };
+      window.__releaseIncrementalProject = () => {
+        window.__incrementalProjectReleased = true;
+        window.__incrementalProjectPending = false;
+        for (const resolve of deferredProjectResponses.splice(0)) resolve();
       };
       window.__restoreIncrementalFetch = () => { window.fetch = originalFetch; };
       const input = document.querySelector('#prompt-input');
@@ -1402,12 +1428,33 @@ async function run() {
       async () => evaluate(
         cdp,
         appSession,
+        `window.__incrementalProjectPending &&
+          document.querySelector('#edit-progress-label').textContent === 'Showing Codex step 1'`,
+      ),
+      "delayed incremental Codex project refresh",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `({
+        width: document.querySelector('#edit-progress-fill').style.width,
+        ariaText: document.querySelector('#edit-progress-track').getAttribute('aria-valuetext'),
+      })`),
+      { width: "55%", ariaText: "Showing Codex step 1" },
+      "project syncing must preserve the current edit activity progress",
+    );
+    await evaluate(cdp, appSession, "window.__releaseIncrementalProject()");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
         `window.__incrementalPolls >= 1 &&
           document.querySelectorAll('.edit-item').length === window.__incrementalBaseEditCount + 1 &&
           document.querySelector('.edit-item strong').textContent === 'Added the first staged layer' &&
           document.querySelector('#compose-button').disabled &&
           document.querySelector('#edit-progress-label').textContent ===
-            'Applied step 1 of 2: Added the first staged layer'`,
+            'Applied step 1 of 2: Added the first staged layer' &&
+          document.querySelector('#edit-progress-fill').style.width === '55%' &&
+          document.querySelector('#edit-progress-track').getAttribute('aria-valuetext') ===
+            '1 edit step applied. Applied step 1 of 2: Added the first staged layer'`,
       ),
       "incremental Codex project publication",
     );
