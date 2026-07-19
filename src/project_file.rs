@@ -4,8 +4,8 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::model::{
     ChannelOperation, ChannelOperationAction, Clip, ClipEvent, Edit, EditOperation, Effect,
-    Instrument, MAX_PROMPT_CHARACTERS, Modulator, Project, ProjectFileError, Routing, Track,
-    TrackRole,
+    Instrument, MAX_PROMPT_CHARACTERS, Modulator, Oscillator, Project, ProjectFileError, Routing,
+    Track, TrackRole,
 };
 use crate::prompt::{Action, MAX_COMPOUND_ACTIONS, MidiNote};
 
@@ -207,13 +207,36 @@ fn parse_track(
     let instrument_id = unique_id(instrument_object, "id", ids, "instrument")?;
     expect_type(instrument_object, "instrument")?;
     let engine = limited_string(instrument_object, "engine", 1, 64)?;
-    let waveform = limited_string(instrument_object, "waveform", 1, 32)?;
-    if !matches!(
-        waveform.as_str(),
-        "sine" | "triangle" | "sawtooth" | "square"
-    ) {
-        return Err(invalid("instrument waveform is unsupported"));
-    }
+    let legacy_waveform = limited_string(instrument_object, "waveform", 1, 32)?;
+    validate_waveform(&legacy_waveform)?;
+    let oscillators = match instrument_object.get("oscillators") {
+        Some(value) => {
+            let values = value
+                .as_array()
+                .ok_or_else(|| invalid("instrument oscillators must be an array"))?;
+            if values.len() != 2 {
+                return Err(invalid("instrument must contain exactly 2 oscillators"));
+            }
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| parse_oscillator(value, index))
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        None => vec![
+            Oscillator {
+                waveform: legacy_waveform.clone(),
+                tuning: 0.0,
+                level: 0.72,
+            },
+            Oscillator {
+                waveform: legacy_waveform.clone(),
+                tuning: 0.0,
+                level: 0.28,
+            },
+        ],
+    };
+    let waveform = oscillators[0].waveform.clone();
     let instrument_parameters = object(
         field(instrument_object, "parameters")?,
         "instrument parameters",
@@ -222,6 +245,7 @@ fn parse_track(
         id: instrument_id,
         engine,
         waveform,
+        oscillators,
         attack: range(instrument_parameters, "attack", 0.001, 2.0)?,
         release: range(instrument_parameters, "release", 0.02, 5.0)?,
         tone: range(instrument_parameters, "tone", 0.0, 1.0)?,
@@ -295,6 +319,25 @@ fn parse_track(
     Ok(parsed)
 }
 
+fn parse_oscillator(value: &JsonValue, index: usize) -> Result<Oscillator, ProjectFileError> {
+    let oscillator = object(value, &format!("oscillator {}", index + 1))?;
+    let waveform = limited_string(oscillator, "waveform", 1, 32)?;
+    validate_waveform(&waveform)?;
+    Ok(Oscillator {
+        waveform,
+        tuning: range(oscillator, "tuning", -24.0, 24.0)?,
+        level: range(oscillator, "level", 0.0, 1.0)?,
+    })
+}
+
+fn validate_waveform(value: &str) -> Result<(), ProjectFileError> {
+    if matches!(value, "sine" | "triangle" | "sawtooth" | "square") {
+        Ok(())
+    } else {
+        Err(invalid("instrument waveform is unsupported"))
+    }
+}
+
 fn parse_effect(value: &JsonValue, ids: &mut HashSet<u64>) -> Result<Effect, ProjectFileError> {
     let effect = object(value, "effect")?;
     let id = unique_id(effect, "id", ids, "effect")?;
@@ -332,6 +375,8 @@ fn parse_modulator(
         name: limited_string(modulator, "name", 1, 64)?,
         shape,
         rate: range(parameters, "rate", 0.01, 20.0)?,
+        rate_mode: optional_enum(modulator, "rateMode", "hz", &["hz", "tempo"])?,
+        trigger: optional_enum(modulator, "trigger", "free", &["free", "midi"])?,
         depth: range(parameters, "depth", 0.0, 1.0)?,
         target: limited_string(modulator, "target", 1, 64)?,
         enabled: boolean(modulator, "enabled")?,
@@ -422,6 +467,18 @@ fn validate_routing_edges(
 ) -> Result<(), ProjectFileError> {
     let instrument = format!("instrument:{instrument_id}");
     let mut expected = HashSet::from([("clips".to_owned(), instrument.clone(), "midi".to_owned())]);
+    expected.extend(
+        modulators
+            .iter()
+            .filter(|modulator| modulator.enabled && modulator.trigger == "midi")
+            .map(|modulator| {
+                (
+                    "clips".to_owned(),
+                    format!("modulator:{}", modulator.id),
+                    "midi".to_owned(),
+                )
+            }),
+    );
     let mut audio_source = instrument;
     for effect_id in effect_order {
         let effect = format!("effect:{effect_id}");
@@ -807,21 +864,8 @@ fn parse_midi_note(value: &JsonValue, loop_beats: f32) -> Result<MidiNote, Proje
 }
 
 fn validate_modulator_targets(track: &Track) -> Result<(), ProjectFileError> {
-    let effect_targets = track
-        .effects
-        .iter()
-        .map(|effect| format!("effect:{}.mix", effect.id))
-        .collect::<HashSet<_>>();
     for modulator in &track.modulators {
-        if !matches!(
-            modulator.target.as_str(),
-            "instrument.attack"
-                | "instrument.release"
-                | "instrument.tone"
-                | "instrument.pitch"
-                | "track.volume"
-        ) && !effect_targets.contains(&modulator.target)
-        {
+        if !crate::model::valid_modulator_target(track, &modulator.target) {
             return Err(invalid(format!(
                 "modulator {} targets an unknown parameter",
                 modulator.id
@@ -888,6 +932,12 @@ fn sound_tool(value: &str) -> Result<&'static str, ProjectFileError> {
 fn sound_parameter(value: &str) -> Result<&'static str, ProjectFileError> {
     match value {
         "waveform" => Ok("waveform"),
+        "oscillator1.waveform" => Ok("oscillator1.waveform"),
+        "oscillator1.tuning" => Ok("oscillator1.tuning"),
+        "oscillator1.level" => Ok("oscillator1.level"),
+        "oscillator2.waveform" => Ok("oscillator2.waveform"),
+        "oscillator2.tuning" => Ok("oscillator2.tuning"),
+        "oscillator2.level" => Ok("oscillator2.level"),
         "attack" => Ok("attack"),
         "release" => Ok("release"),
         "tone" => Ok("tone"),
@@ -895,6 +945,8 @@ fn sound_parameter(value: &str) -> Result<&'static str, ProjectFileError> {
         "enabled" => Ok("enabled"),
         "shape" => Ok("shape"),
         "rate" => Ok("rate"),
+        "rateMode" => Ok("rateMode"),
+        "trigger" => Ok("trigger"),
         "depth" => Ok("depth"),
         "target" => Ok("target"),
         "time" => Ok("time"),
@@ -971,6 +1023,24 @@ fn limited_string(
         )));
     }
     Ok(value.to_owned())
+}
+
+fn optional_enum(
+    object: &Object,
+    name: &str,
+    default: &str,
+    allowed: &[&str],
+) -> Result<String, ProjectFileError> {
+    let value = object.get(name).map_or(Ok(default), |value| {
+        value
+            .as_str()
+            .ok_or_else(|| invalid(format!("{name} must be a string")))
+    })?;
+    if allowed.contains(&value) {
+        Ok(value.to_owned())
+    } else {
+        Err(invalid(format!("{name} is unsupported")))
+    }
 }
 
 fn boolean(object: &Object, name: &str) -> Result<bool, ProjectFileError> {
@@ -1096,6 +1166,46 @@ mod tests {
             .set_mix(1, Some(0.75), None)
             .expect("mutation after legacy load");
         parse_project(&reloaded.project().to_json()).expect("saveable mutated project");
+    }
+
+    #[test]
+    fn legacy_single_oscillator_and_free_running_modulators_are_migrated() {
+        let mut legacy: JsonValue = serde_json::from_str(&Project::demo().to_json()).unwrap();
+        for track in legacy["tracks"].as_array_mut().expect("tracks") {
+            track["instrument"]
+                .as_object_mut()
+                .expect("instrument")
+                .remove("oscillators");
+            for modulator in track["modulators"].as_array_mut().expect("modulators") {
+                let modulator = modulator.as_object_mut().expect("modulator");
+                modulator.remove("rateMode");
+                modulator.remove("trigger");
+            }
+            track["routing"]["edges"]
+                .as_array_mut()
+                .expect("routing edges")
+                .retain(|edge| {
+                    edge["type"] != "midi"
+                        || !edge["target"]
+                            .as_str()
+                            .is_some_and(|target| target.starts_with("modulator:"))
+                });
+        }
+
+        let parsed = parse_project(&legacy.to_string()).expect("legacy sound graph");
+        assert!(
+            parsed
+                .tracks
+                .iter()
+                .all(|track| track.instrument.oscillators.len() == 2)
+        );
+        assert!(parsed.tracks.iter().all(|track| {
+            track
+                .modulators
+                .iter()
+                .all(|modulator| modulator.rate_mode == "hz" && modulator.trigger == "free")
+        }));
+        parse_project(&parsed.to_json()).expect("migrated graph remains saveable");
     }
 
     #[test]

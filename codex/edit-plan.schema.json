@@ -30,7 +30,7 @@
             "type": "string",
             "anyOf": [
               {
-                "enum": ["None", "MIDI Clip", "sine", "triangle", "sawtooth", "square", "instrument.attack", "instrument.release", "instrument.tone", "instrument.pitch", "track.volume", "Reverb", "Room", "Echo", "Chorus", "Low-pass filter", "Punch compressor", "Shimmer", "Effects"]
+                "enum": ["None", "MIDI Clip", "sine", "triangle", "sawtooth", "square", "instrument.attack", "instrument.release", "instrument.tone", "instrument.pitch", "instrument.oscillator1.tuning", "instrument.oscillator1.level", "instrument.oscillator2.tuning", "instrument.oscillator2.level", "track.volume", "Reverb", "Room", "Echo", "Chorus", "Low-pass filter", "Punch compressor", "Shimmer", "Effects"]
               },
               {
                 "pattern": "^effect:[1-9][0-9]*\\.mix$"
@@ -58,7 +58,7 @@
           },
           "parameter": {
             "type": "string",
-            "enum": ["None", "waveform", "attack", "release", "tone", "mix", "enabled", "shape", "rate", "depth", "target", "time", "duration", "pitch", "velocity", "position"]
+            "enum": ["None", "waveform", "oscillator1.waveform", "oscillator1.tuning", "oscillator1.level", "oscillator2.waveform", "oscillator2.tuning", "oscillator2.level", "attack", "release", "tone", "mix", "enabled", "shape", "rate", "rateMode", "trigger", "depth", "target", "time", "duration", "pitch", "velocity", "position"]
           },
           "setting": {
             "type": "string",

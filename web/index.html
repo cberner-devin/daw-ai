@@ -176,6 +176,16 @@
           </div>
         </div>
         <p class="debug-intro">Copy this report into a coding assistant when you need help. Backend warnings and errors are also written to the server's stderr.</p>
+        <section class="debug-settings" aria-labelledby="codex-session-setting">
+          <div>
+            <strong id="codex-session-setting">Keep Codex sessions</strong>
+            <span>Disable ephemeral mode so Codex retains session transcripts for debugging.</span>
+          </div>
+          <label class="switch-control">
+            <input id="persistent-codex-sessions" type="checkbox" role="switch">
+            <span>Persistent</span>
+          </label>
+        </section>
         <label class="debug-report-label" for="debug-report">Diagnostic report</label>
         <textarea class="debug-report" id="debug-report" readonly spellcheck="false" aria-live="polite"></textarea>
       </section>

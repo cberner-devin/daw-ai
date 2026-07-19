@@ -1123,6 +1123,50 @@ main {
   text-transform: uppercase;
 }
 
+.debug-settings {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  max-width: 760px;
+  margin: -12px 0 24px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.debug-settings strong,
+.debug-settings span {
+  display: block;
+}
+
+.debug-settings strong {
+  margin-bottom: 4px;
+  font-size: 11px;
+}
+
+.debug-settings span {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.switch-control {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.switch-control input {
+  width: 34px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
 .debug-report {
   width: 100%;
   min-height: min(540px, calc(100vh - 365px));
@@ -1359,6 +1403,29 @@ input[type="range"]::-moz-range-thumb {
   gap: 9px;
 }
 
+.oscillator-stack {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.oscillator-card {
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.oscillator-card > strong {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 9px;
+}
+
+.oscillator-card .tool-controls {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 .tool-control {
   display: grid;
   gap: 6px;
@@ -1498,6 +1565,20 @@ input[type="range"]::-moz-range-thumb {
 
 .modulator-card .tool-controls {
   margin-top: 8px;
+}
+
+.modulator-route {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 7px;
+  color: var(--faint);
+  font-size: 7px;
+}
+
+.modulator-route i {
+  color: var(--track-color);
+  font-style: normal;
 }
 
 .clip-editor {
@@ -1767,6 +1848,10 @@ input[type="range"]::-moz-range-thumb {
   }
 
   .tool-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .oscillator-card .tool-controls {
     grid-template-columns: minmax(0, 1fr);
   }
 
