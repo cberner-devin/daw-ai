@@ -47,7 +47,7 @@ cargo run -- --port 8888
 1. Drag over any part of the arrangement to set the edit region. On touch devices, swipe to pan normally or tap **Select region** before dragging a selection.
 2. Enter a request such as `increase the volume`, `add a bass`, `make the chords warm and spacious`, or `turn this section into a dubstep drop`.
 3. Press **Make change**, then use the transport to hear the result.
-4. Open **Advanced** to edit clip notes/drums, synth envelopes and waveforms, ordered effect chains, modulators, routing, levels, and mute states.
+4. Switch to **Advanced** to edit clip notes/drums, synth envelopes and waveforms, ordered effect chains, modulators, routing, levels, and mute states. The **Debug** tab provides a copyable environment and browser-error report for troubleshooting with a coding assistant.
 
 The current project is stored as `sound-graph.json` in the working directory. Set `DAW_AI_PROJECT_PATH` to use another path. DAW-AI validates an existing file at startup, creates the demo graph when it is missing, and safely saves every accepted prompt, mixer change, Advanced edit, undo, and reset. This makes the graph directly inspectable and editable while the server is stopped.
 
@@ -65,7 +65,7 @@ Run formatting checks, Clippy with warnings denied, Rust tests, and the headless
 just test
 ```
 
-The server binds only to `127.0.0.1`, requires no web authentication, and embeds the client assets in the executable. Its same-origin API lives under `/api`. Server warnings and errors go to stderr; handled and unhandled browser errors are forwarded to the same log with bounded messages. Reverse proxies can publish any hostname without DAW-AI configuration by keeping the upstream `Host` loopback-only and sending the public authority as `X-Forwarded-Host`. If a proxy preserves the public `Host`, set `DAW_AI_TRUSTED_HOSTS` to a comma-separated allowlist such as `studio.example,preview.example:8443`; entries without a port accept that hostname on any port. Arbitrary public hosts remain rejected to preserve DNS-rebinding protection. The test suite injects the deterministic demo planner with `DAW_AI_PROMPT_ENGINE=demo` and an isolated project path, so CI never needs Codex credentials or model usage.
+The server binds only to `127.0.0.1`, requires no web authentication, and embeds the client assets in the executable. Its same-origin API lives under `/api`. Server warnings and errors go to stderr; handled and unhandled browser errors are forwarded to the same log with bounded messages and retained in the Debug report for the current page session. Reverse proxies can publish any valid hostname without DAW-AI configuration, whether they preserve `Host` or provide the public authority as `X-Forwarded-Host`. Cross-origin mutations remain rejected. The test suite injects the deterministic demo planner with `DAW_AI_PROMPT_ENGINE=demo` and an isolated project path, so CI never needs Codex credentials or model usage.
 
 ### Dependency policy
 

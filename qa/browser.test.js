@@ -170,12 +170,6 @@ async function touch(cdp, sessionId, type, touchPoints) {
   await new Promise((resolve) => setTimeout(resolve, 35));
 }
 
-async function pressTab(cdp, sessionId) {
-  const key = { key: "Tab", code: "Tab", windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9 };
-  await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...key }, sessionId);
-  await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...key }, sessionId);
-}
-
 async function pressKey(cdp, sessionId, key, code, virtualKey, modifiers = 0) {
   const values = {
     key,
@@ -456,6 +450,63 @@ async function run() {
       ),
       true,
       "closed advanced controls must be inert",
+    );
+    const debugView = await evaluate(cdp, appSession, `(() => {
+      document.querySelector('#debug-button').click();
+      return {
+        tabs: [...document.querySelectorAll('[role="tab"]')].map((tab) => ({
+          name: tab.textContent.trim(),
+          selected: tab.getAttribute('aria-selected'),
+        })),
+        debugVisible: !document.querySelector('#debug-panel').hidden && !document.querySelector('#debug-panel').inert,
+        aiHidden: document.querySelector('#ai-mode-panel').hidden && document.querySelector('#ai-mode-panel').inert,
+        report: document.querySelector('#debug-report').value,
+      };
+    })()`);
+    assert.deepEqual(
+      debugView.tabs,
+      [
+        { name: "AI Mode", selected: "false" },
+        { name: "Advanced", selected: "false" },
+        { name: "Debug", selected: "true" },
+      ],
+      "the three chartered studio views must be exposed as tabs",
+    );
+    assert.equal(debugView.debugVisible && debugView.aiHidden, true, "Debug must replace the AI Mode panel");
+    assert.match(debugView.report, /Synthetic browser failure/);
+    assert.match(debugView.report, /Backend warnings and errors are written/);
+    await evaluate(cdp, appSession, `(() => {
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText: (value) => { window.__copiedDebugReport = value; return Promise.resolve(); } },
+      });
+      document.querySelector('#copy-debug').click();
+    })()`);
+    await waitFor(
+      async () => evaluate(cdp, appSession, "window.__copiedDebugReport?.includes('Synthetic browser failure')"),
+      "copyable Debug report",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, `(() => {
+        const tab = document.querySelector('#debug-button');
+        tab.focus();
+        tab.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true, cancelable: true }));
+        return document.activeElement.id;
+      })()`),
+      "advanced-button",
+      "arrow keys must move between and activate studio tabs",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(() => {
+        document.querySelector('.skip-link').click();
+        return {
+          activeTab: document.querySelector('[role="tab"][aria-selected="true"]').id,
+          focused: document.activeElement.id,
+          aiHidden: document.querySelector('#ai-mode-panel').hidden,
+        };
+      })()`),
+      { activeTab: "ai-mode-button", focused: "timeline-panel", aiHidden: false },
+      "the skip link must reveal and focus the timeline from another tab",
     );
 
     await cdp.send(
@@ -1268,19 +1319,13 @@ async function run() {
       await evaluate(
         cdp,
         appSession,
-        "!document.querySelector('#advanced-drawer').hidden && !document.querySelector('#advanced-drawer').inert",
+        `!document.querySelector('#advanced-drawer').hidden &&
+          !document.querySelector('#advanced-drawer').inert &&
+          document.querySelector('#ai-mode-panel').hidden &&
+          document.querySelector('#advanced-button').getAttribute('aria-selected') === 'true'`,
       ),
       true,
-    );
-    await evaluate(cdp, appSession, `(() => {
-      const controls = [...document.querySelector('#advanced-drawer').querySelectorAll('button, input')];
-      controls[controls.length - 1].focus();
-    })()`);
-    await pressTab(cdp, appSession);
-    assert.equal(
-      await evaluate(cdp, appSession, "document.activeElement.id"),
-      "close-advanced",
-      "focus must wrap within the modal drawer",
+      "Advanced must replace AI Mode as the active full-page tab",
     );
     const summarySpace = await evaluate(cdp, appSession, `(() => {
       const finalClip = [...document.querySelectorAll('.clip-editor')].at(-1);
@@ -1316,16 +1361,14 @@ async function run() {
       { allowed: true, playing: false },
       "Space on a select must remain available to the native control",
     );
-    await evaluate(cdp, appSession, `(() => {
-      const finalClip = [...document.querySelectorAll('.clip-editor')].at(-1);
-      finalClip.open = false;
-      finalClip.querySelector('summary').focus();
-    })()`);
-    await pressTab(cdp, appSession);
     assert.equal(
-      await evaluate(cdp, appSession, "document.activeElement.id"),
-      "close-advanced",
-      "collapsed clip controls must not escape the modal focus order",
+      await evaluate(cdp, appSession, `(() => {
+        const finalClip = [...document.querySelectorAll('.clip-editor')].at(-1);
+        finalClip.open = false;
+        return finalClip.open;
+      })()`),
+      false,
+      "clip event disclosures must remain collapsible in the Advanced tab",
     );
     await evaluate(cdp, appSession, "[...document.querySelectorAll('.clip-editor')].at(-1).open = true");
     assert.deepEqual(
@@ -3733,7 +3776,7 @@ async function run() {
     assert.equal(consoleErrors.length, 0, "application emitted browser console errors");
 
     console.log(
-      "Browser workflows passed: mobile layout/panning, keyboard selection, serialized transport, exact event/envelope playback, voice chase, AI-authored MIDI composition, regional effects/filtering, short clips, targeted rhythm, complete modulation routing, advanced sound tools, prompt single-flight/undo, mixer focus/transport, modal, cross-origin guard",
+      "Browser workflows passed: mobile layout/panning, keyboard selection, serialized transport, exact event/envelope playback, voice chase, AI-authored MIDI composition, regional effects/filtering, short clips, targeted rhythm, complete modulation routing, studio tabs/debug report, advanced sound tools, prompt single-flight/undo, mixer focus/transport, cross-origin guard",
     );
   } finally {
     if (attacker) await new Promise((resolve) => attacker.close(resolve));
