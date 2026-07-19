@@ -86,6 +86,12 @@ be represented a way that is friendly for Codex:
   modifications to the sound graph and return useful error messages to Codex.
 * Codex my perform multiple edits to fulfil a request, which show to the user incrementally
 
+#### Codex "Listening"
+Codex is not able to take audio as input, so DAW AI should register a few tools to help Codex analyze
+the track to determine whether it meets the user's request. One of these should be a tool that
+takes a channel(s) and a time range and renders a Mel Spectrogram as a PNG and returns it to Codex.
+Other useful analysis tools are available as well.
+
 ### Deployment
 
 The expected deployment is either as a local webserver, or on a private network where a gateway handles authentication.
