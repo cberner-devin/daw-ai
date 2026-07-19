@@ -150,6 +150,17 @@
           <button class="text-button close-button" id="close-advanced" type="button">Back to AI Mode</button>
         </div>
         <p class="drawer-intro">Shape clip events, instruments, effect chains, modulators, and routing. Codex sees the same sound graph.</p>
+        <form class="channel-creator" id="channel-creator">
+          <label for="channel-role">New channel</label>
+          <select id="channel-role" name="role">
+            <option value="drums">Drums</option>
+            <option value="bass">Bass</option>
+            <option value="chords">Chords</option>
+            <option value="lead">Lead</option>
+            <option value="texture">Texture</option>
+          </select>
+          <button class="secondary-button" id="add-channel" type="submit">Add channel</button>
+        </form>
         <div class="channel-list" id="channel-list"></div>
       </section>
 

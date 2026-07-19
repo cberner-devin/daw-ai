@@ -3,6 +3,7 @@ use std::fmt::{self, Write};
 use crate::prompt::{Action, PromptEngine};
 
 const HISTORY_LIMIT: usize = 50;
+const TRACK_LIMIT: usize = 128;
 pub(crate) const EDIT_LOG_LIMIT: usize = 256;
 pub(crate) const MAX_PROMPT_CHARACTERS: usize = 2_000;
 
@@ -25,6 +26,18 @@ pub enum TrackRole {
 }
 
 impl TrackRole {
+    #[must_use]
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "drums" => Some(Self::Drums),
+            "bass" => Some(Self::Bass),
+            "chords" => Some(Self::Chords),
+            "lead" => Some(Self::Lead),
+            "texture" => Some(Self::Texture),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -132,6 +145,30 @@ pub struct Edit {
 }
 
 #[derive(Clone, Debug)]
+pub struct EditOperation {
+    pub operation_id: String,
+    pub completed: bool,
+    pub applied_steps: usize,
+    pub project_version: u64,
+    pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelOperationAction {
+    Add,
+    Delete,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChannelOperation {
+    pub operation_id: String,
+    pub action: ChannelOperationAction,
+    pub track_id: u64,
+    pub role: Option<TrackRole>,
+    pub project_version: u64,
+}
+
+#[derive(Clone, Debug)]
 pub struct Project {
     pub name: String,
     pub bpm: u16,
@@ -139,6 +176,8 @@ pub struct Project {
     pub version: u64,
     pub tracks: Vec<Track>,
     pub edits: Vec<Edit>,
+    pub edit_operations: Vec<EditOperation>,
+    pub channel_operations: Vec<ChannelOperation>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -170,6 +209,8 @@ impl Project {
                 demo_track(3, TrackRole::Chords, "Glass Chords", "#8ca9ff"),
             ],
             edits: Vec::new(),
+            edit_operations: Vec::new(),
+            channel_operations: Vec::new(),
         }
     }
 
@@ -178,7 +219,17 @@ impl Project {
     }
 
     fn highest_id(&self) -> u64 {
-        let mut highest = self.edits.iter().map(|edit| edit.id).max().unwrap_or(0);
+        let mut highest = self
+            .edits
+            .iter()
+            .map(|edit| edit.id)
+            .chain(
+                self.channel_operations
+                    .iter()
+                    .map(|operation| operation.track_id),
+            )
+            .max()
+            .unwrap_or(0);
         for track in &self.tracks {
             highest = highest.max(track.id).max(track.instrument.id);
             for effect in &track.effects {
@@ -207,6 +258,20 @@ impl Project {
                 output.push(',');
             }
             edit.write_json(&mut output);
+        }
+        output.push_str("],\"editOperations\":[");
+        for (index, operation) in self.edit_operations.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            operation.write_json(&mut output);
+        }
+        output.push_str("],\"channelOperations\":[");
+        for (index, operation) in self.channel_operations.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            operation.write_json(&mut output);
         }
         output.push_str("]}");
         output
@@ -250,6 +315,14 @@ impl Project {
         });
         if excess > 0 {
             self.edits.drain(..excess);
+        }
+        if self.edit_operations.len() > EDIT_LOG_LIMIT {
+            self.edit_operations
+                .drain(..self.edit_operations.len() - EDIT_LOG_LIMIT);
+        }
+        if self.channel_operations.len() > EDIT_LOG_LIMIT {
+            self.channel_operations
+                .drain(..self.channel_operations.len() - EDIT_LOG_LIMIT);
         }
     }
 
@@ -498,6 +571,51 @@ impl Edit {
     }
 }
 
+impl EditOperation {
+    fn write_json(&self, output: &mut String) {
+        write!(
+            output,
+            concat!(
+                "{{\"operationId\":{},\"status\":{},\"appliedSteps\":{},",
+                "\"projectVersion\":{},\"message\":{}}}"
+            ),
+            json_string(&self.operation_id),
+            json_string(if self.completed {
+                "completed"
+            } else {
+                "partial"
+            }),
+            self.applied_steps,
+            self.project_version,
+            json_string(&self.message)
+        )
+        .expect("writing to a string cannot fail");
+    }
+}
+
+impl ChannelOperation {
+    fn write_json(&self, output: &mut String) {
+        let action = match self.action {
+            ChannelOperationAction::Add => "add",
+            ChannelOperationAction::Delete => "delete",
+        };
+        write!(
+            output,
+            concat!(
+                "{{\"operationId\":{},\"action\":{},\"trackId\":{},",
+                "\"role\":{},\"projectVersion\":{}}}"
+            ),
+            json_string(&self.operation_id),
+            json_string(action),
+            self.track_id,
+            self.role
+                .map_or_else(|| "null".to_owned(), |role| json_string(role.as_str())),
+            self.project_version
+        )
+        .expect("writing to a string cannot fail");
+    }
+}
+
 impl Action {
     fn has_regional_state(&self) -> bool {
         match self {
@@ -706,6 +824,7 @@ pub enum StudioError {
     InvalidSelection,
     UnknownTrack,
     InvalidMix,
+    InvalidChannel,
     UnknownSoundTool,
     InvalidSoundTool,
 }
@@ -840,7 +959,7 @@ impl Studio {
         let edit_id = self.take_id();
         self.project.edits.push(Edit {
             id: edit_id,
-            operation_id,
+            operation_id: operation_id.clone(),
             start,
             end,
             prompt: prompt.to_owned(),
@@ -849,43 +968,31 @@ impl Studio {
         });
         self.project.compact_edit_log();
         self.project.version += 1;
+        if let Some(operation_id) = operation_id {
+            self.project.edit_operations.push(EditOperation {
+                operation_id,
+                completed: true,
+                applied_steps: 1,
+                project_version: self.project.version,
+                message: summary.clone(),
+            });
+            self.project.compact_edit_log();
+        }
         Ok(summary)
     }
 
     pub fn replace_graph(
         &mut self,
-        project: Project,
-        start: f32,
-        end: f32,
-        prompt: &str,
-        plan: crate::prompt::EditPlan,
-    ) -> Result<String, StudioError> {
-        self.replace_graph_inner(project, start, end, prompt, None, plan)
-    }
-
-    pub(crate) fn replace_graph_for_operation(
-        &mut self,
-        project: Project,
-        start: f32,
-        end: f32,
-        prompt: &str,
-        operation_id: String,
-        plan: crate::prompt::EditPlan,
-    ) -> Result<String, StudioError> {
-        self.replace_graph_inner(project, start, end, prompt, Some(operation_id), plan)
-    }
-
-    fn replace_graph_inner(
-        &mut self,
         mut project: Project,
         start: f32,
         end: f32,
         prompt: &str,
-        operation_id: Option<String>,
         plan: crate::prompt::EditPlan,
     ) -> Result<String, StudioError> {
         self.validate_edit(start, end, prompt)?;
         project.edits = self.project.edits.clone();
+        project.edit_operations = self.project.edit_operations.clone();
+        project.channel_operations = self.project.channel_operations.clone();
         project.version = self.project.version;
         let next_id = project
             .highest_id()
@@ -900,7 +1007,7 @@ impl Studio {
         let edit_id = self.take_id();
         self.project.edits.push(Edit {
             id: edit_id,
-            operation_id,
+            operation_id: None,
             start,
             end,
             prompt: prompt.to_owned(),
@@ -912,6 +1019,48 @@ impl Studio {
         Ok(summary)
     }
 
+    pub(crate) fn record_operation_step(&mut self, operation_id: &str, message: &str) -> bool {
+        if let Some(operation) = self
+            .project
+            .edit_operations
+            .iter_mut()
+            .find(|operation| operation.operation_id == operation_id)
+        {
+            if operation.completed {
+                return false;
+            }
+            operation.applied_steps += 1;
+            operation.project_version = self.project.version;
+            operation.message = message.to_owned();
+        } else {
+            self.project.edit_operations.push(EditOperation {
+                operation_id: operation_id.to_owned(),
+                completed: false,
+                applied_steps: 1,
+                project_version: self.project.version,
+                message: message.to_owned(),
+            });
+        }
+        self.project.compact_edit_log();
+        true
+    }
+
+    pub(crate) fn mark_operation_complete(&mut self, operation_id: &str, message: &str) -> bool {
+        let Some(index) =
+            self.project.edit_operations.iter().position(|operation| {
+                operation.operation_id == operation_id && !operation.completed
+            })
+        else {
+            return false;
+        };
+        self.project.version += 1;
+        let operation = &mut self.project.edit_operations[index];
+        operation.completed = true;
+        operation.project_version = self.project.version;
+        operation.message = message.to_owned();
+        true
+    }
+
     fn apply_action(&mut self, action: &Action, start: f32, end: f32) -> Result<(), StudioError> {
         match action {
             Action::Compound { actions } => {
@@ -921,6 +1070,9 @@ impl Studio {
                 Ok(())
             }
             Action::AddTrack { role } => {
+                if self.project.tracks.len() >= TRACK_LIMIT {
+                    return Err(StudioError::InvalidChannel);
+                }
                 self.add_track(*role, start, end, "AI variation");
                 Ok(())
             }
@@ -1028,6 +1180,61 @@ impl Studio {
         Ok(())
     }
 
+    pub fn add_channel(&mut self, role: TrackRole) -> Result<u64, StudioError> {
+        if self.project.tracks.len() >= TRACK_LIMIT {
+            return Err(StudioError::InvalidChannel);
+        }
+        self.remember();
+        let track_id = self.add_track(role, 0.0, self.project.duration, "New channel");
+        self.project.version += 1;
+        Ok(track_id)
+    }
+
+    pub fn delete_channel(&mut self, track_id: u64) -> Result<(), StudioError> {
+        let Some(index) = self
+            .project
+            .tracks
+            .iter()
+            .position(|track| track.id == track_id)
+        else {
+            return Err(StudioError::UnknownTrack);
+        };
+        if self.project.tracks.len() == 1 {
+            return Err(StudioError::InvalidChannel);
+        }
+
+        self.remember();
+        self.project.tracks.remove(index);
+        self.project.version += 1;
+        Ok(())
+    }
+
+    pub(crate) fn record_channel_operation(
+        &mut self,
+        operation_id: &str,
+        action: ChannelOperationAction,
+        track_id: u64,
+        role: Option<TrackRole>,
+    ) -> bool {
+        if self
+            .project
+            .channel_operations
+            .iter()
+            .any(|operation| operation.operation_id == operation_id)
+        {
+            return false;
+        }
+        self.project.channel_operations.push(ChannelOperation {
+            operation_id: operation_id.to_owned(),
+            action,
+            track_id,
+            role,
+            project_version: self.project.version,
+        });
+        self.project.compact_edit_log();
+        true
+    }
+
     pub fn configure_sound_tool(
         &mut self,
         track_id: u64,
@@ -1083,7 +1290,7 @@ impl Studio {
         id
     }
 
-    fn add_track(&mut self, role: TrackRole, start: f32, end: f32, label: &str) {
+    fn add_track(&mut self, role: TrackRole, start: f32, end: f32, label: &str) -> u64 {
         let track_id = self.take_id();
         let mut track = generated_track(track_id, role);
         track.instrument.id = self.take_id();
@@ -1096,6 +1303,7 @@ impl Studio {
         }
         track.clips = vec![self.generated_clip(label, start, end, "generated", role)];
         self.project.tracks.push(track);
+        track_id
     }
 
     fn generated_clip(
@@ -1750,6 +1958,38 @@ mod tests {
         assert!(json.contains(
             "\"source\":\"modulator:150\",\"target\":\"instrument.tone\",\"type\":\"control\""
         ));
+    }
+
+    #[test]
+    fn advanced_channels_are_playable_undoable_and_keep_one_output_path() {
+        let mut studio = Studio::new();
+        let original = studio.project().to_json();
+        let track_id = studio.add_channel(TrackRole::Lead).expect("new channel");
+        let added = studio.project().tracks.last().expect("added track");
+        assert_eq!(added.id, track_id);
+        assert_eq!(added.role, TrackRole::Lead);
+        assert_eq!(added.clips[0].start, 0.0);
+        assert_eq!(added.clips[0].end, studio.project().duration);
+        assert_eq!(added.routing.output, "master");
+
+        studio.delete_channel(track_id).expect("delete channel");
+        assert_eq!(studio.project().tracks.len(), 3);
+        assert!(studio.undo());
+        assert!(
+            studio
+                .project()
+                .tracks
+                .iter()
+                .any(|track| track.id == track_id)
+        );
+        assert!(studio.undo());
+        let mut restored = studio.project().clone();
+        restored.version = 1;
+        assert_eq!(restored.to_json(), original);
+
+        studio.delete_channel(2).expect("delete bass");
+        studio.delete_channel(3).expect("delete chords");
+        assert_eq!(studio.delete_channel(1), Err(StudioError::InvalidChannel));
     }
 
     #[test]

@@ -1052,6 +1052,30 @@ main {
   line-height: 1.6;
 }
 
+.channel-creator {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0 0 18px;
+}
+
+.channel-creator label {
+  color: var(--faint);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.channel-creator select {
+  min-height: 38px;
+  padding: 0 30px 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  color: var(--text);
+  background: #191b23;
+}
+
 .channel-list {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 390px), 1fr));
@@ -1127,6 +1151,26 @@ main {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 15px;
+}
+
+.channel-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.delete-channel-button {
+  padding: 5px 8px;
+  border: 1px solid rgba(255, 142, 158, 0.3);
+  border-radius: 5px;
+  color: var(--danger);
+  background: rgba(255, 142, 158, 0.04);
+  font-size: 8px;
+  font-weight: 800;
+}
+
+.delete-channel-button:hover {
+  background: rgba(255, 142, 158, 0.1);
 }
 
 .channel-name {
@@ -1701,6 +1745,15 @@ input[type="range"]::-moz-range-thumb {
   .close-button {
     margin-top: 10px;
     padding-left: 0;
+  }
+
+  .channel-creator {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .channel-creator label {
+    align-self: flex-start;
   }
 
   .channel-card {

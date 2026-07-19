@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value as JsonValue};
 
-use crate::codex_mcp::{EditSession, MCP_SESSION_ENV, MCP_TOOL_NAME};
+use crate::codex_mcp::{
+    ANALYZE_TOOL_NAME, EditSession, MCP_SESSION_ENV, MCP_TOOL_NAME, MEL_TOOL_NAME,
+};
 use crate::model::{Project, TrackRole, json_string};
 use crate::prompt::{Action, EditPlan, MidiNote};
 
@@ -42,6 +44,8 @@ pub enum PlannerError {
     Unavailable,
     TimedOut,
     Failed,
+    ProjectChanged,
+    SaveFailed,
     InvalidOutput(String),
     Io(std::io::Error),
 }
@@ -58,6 +62,8 @@ impl fmt::Display for PlannerError {
                 formatter,
                 "Codex could not plan the edit; run `codex login status` and try again"
             ),
+            Self::ProjectChanged => write!(formatter, "the project changed; submit the edit again"),
+            Self::SaveFailed => write!(formatter, "could not save the sound graph"),
             Self::InvalidOutput(message) => {
                 write!(formatter, "Codex returned an invalid synth edit: {message}")
             }
@@ -80,18 +86,30 @@ impl CodexPlanner {
         end: f32,
         project: &Project,
     ) -> Result<CodexEdit, PlannerError> {
+        Self::interpret_with_updates(prompt, start, end, project, |_| Ok(()))
+    }
+
+    pub(crate) fn interpret_with_updates(
+        prompt: &str,
+        start: f32,
+        end: f32,
+        project: &Project,
+        mut on_update: impl FnMut(CodexEdit) -> Result<(), PlannerError>,
+    ) -> Result<CodexEdit, PlannerError> {
         let session = EditSession::create(project, prompt, start, end).map_err(PlannerError::Io)?;
         let task = planner_task(prompt, start, end);
         let executable = std::env::current_exe().map_err(PlannerError::Io)?;
         let mcp_config = format!(
             concat!(
                 "mcp_servers={{daw_ai={{command={},args=[\"--mcp\"],",
-                "env_vars=[\"{}\"],required=true,enabled_tools=[\"{}\"],",
+                "env_vars=[\"{}\"],required=true,enabled_tools=[{},{},{}],",
                 "default_tools_approval_mode=\"approve\"}}}}"
             ),
             json_string(&executable.to_string_lossy()),
             MCP_SESSION_ENV,
-            MCP_TOOL_NAME
+            json_string(MCP_TOOL_NAME),
+            json_string(MEL_TOOL_NAME),
+            json_string(ANALYZE_TOOL_NAME)
         );
         let mut command = Command::new("codex");
         command
@@ -141,7 +159,17 @@ impl CodexPlanner {
         let stdout_reader = thread::spawn(move || read_stream(stdout));
         let stderr_reader = thread::spawn(move || read_stream(stderr));
         let started = Instant::now();
+        let mut delivered_updates = 0;
         let status = loop {
+            if let Err(error) =
+                publish_session_updates(&session, &mut delivered_updates, &mut on_update)
+            {
+                terminate_process_group(&mut child);
+                let _ = stdin_writer.join();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(error);
+            }
             if let Some(status) = child.try_wait().map_err(PlannerError::Io)? {
                 break status;
             }
@@ -162,6 +190,14 @@ impl CodexPlanner {
             }
             thread::sleep(Duration::from_millis(50));
         };
+        if let Err(error) =
+            publish_session_updates(&session, &mut delivered_updates, &mut on_update)
+        {
+            let _ = stdin_writer.join();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(error);
+        }
         let output = stdout_reader
             .join()
             .map_err(|_| PlannerError::InvalidOutput("stdout reader stopped".to_owned()))??;
@@ -188,6 +224,21 @@ impl CodexPlanner {
         let (plan, project) = session.finish().map_err(|message| invalid(&message))?;
         Ok(CodexEdit { plan, project })
     }
+}
+
+fn publish_session_updates(
+    session: &EditSession,
+    delivered: &mut usize,
+    on_update: &mut impl FnMut(CodexEdit) -> Result<(), PlannerError>,
+) -> Result<(), PlannerError> {
+    for (plan, project) in session
+        .updates_after(*delivered)
+        .map_err(|message| invalid(&message))?
+    {
+        on_update(CodexEdit { plan, project })?;
+        *delivered += 1;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -315,6 +366,8 @@ fn planner_task(prompt: &str, start: f32, end: f32) -> String {
         concat!(
             "You are the sound-graph editing engine inside DAW-AI. Read sound-graph.json in ",
             "the current directory before deciding what to change. First form a musical plan, ",
+            "using the registered read-only listening tools to inspect relevant channels when ",
+            "frequency balance, dynamics, or density would help evaluate the request. ",
             "then use the registered daw_ai {tool} tool for every intended graph change. ",
             "You may work iteratively, but use no more than eight actions in total. The tool ",
             "validates each batch, updates sound-graph.json, and gives errors you must correct. ",

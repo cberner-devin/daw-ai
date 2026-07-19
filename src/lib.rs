@@ -1,3 +1,4 @@
+mod audio_analysis;
 pub mod codex;
 mod codex_mcp;
 pub mod model;

@@ -14,7 +14,11 @@ The `sound-graph.json` file in the current directory is the source of truth for 
 
 Prefer these exact field names when reasoning about the current sound. The project is deliberately code- and configuration-friendly, with stable IDs and no opaque binary state.
 
-`regionalEdits` is a bounded projection of active time-bounded gain, mute, filter, rhythm, and effect state. Prior graph mutations are already represented by the current tracks, clips, and sound tools, so prompts and superseded action payloads are deliberately omitted. Treat regional state as read-only. The DAW-AI tool records accepted operations, and the live server commits the completed session as one edit.
+`regionalEdits` is a bounded projection of active time-bounded gain, mute, filter, rhythm, and effect state. Prior graph mutations are already represented by the current tracks, clips, and sound tools, so prompts and superseded action payloads are deliberately omitted. Treat regional state as read-only. The DAW-AI tool records each accepted batch, and the live server publishes it immediately as an incremental edit. The operation is marked complete only after Codex exits successfully.
+
+## Listening tools
+
+Use `render_mel_spectrogram` with one or more stable `trackIds` and a time range of at most 16 seconds when a visual frequency-time view would help evaluate tone, transients, density, or separation. It returns a PNG built from DAW-AI's deterministic 16 kHz sound-graph render. Use `analyze_audio_region` for complementary peak, RMS, zero-crossing, spectral-centroid, and low/mid/high energy measurements. Both tools are read-only and always inspect the latest graph produced by prior edit batches. They approximate the browser synth deterministically; use them for comparison and musical diagnosis, not mastering-grade metering.
 
 ## Track roles
 
@@ -28,7 +32,7 @@ Use `all` when an edit should affect the complete mix. Use a role name for a tar
 
 ## Plan first
 
-For each tool call, write `musicalPlan`: a concise description of the rhythm, harmony, orchestration, and sound design that will fulfill the request in the selected region. Inspect the existing composition before deciding whether to replace a MIDI clip, configure an existing tool by stable ID, or add a track. Then provide the smallest ordered `actions` list that realizes that part of the plan. `summary` describes the completed change to the user. You may call the tool iteratively, but the entire request may contain at most eight actions.
+For each edit-tool call, write `musicalPlan`: a concise description of the rhythm, harmony, orchestration, and sound design that will fulfill the request in the selected region. Inspect the existing composition and use the listening tools when useful before deciding whether to replace a MIDI clip, configure an existing tool by stable ID, or add a track. Then provide the smallest ordered `actions` list that realizes that part of the plan. `summary` describes the completed change to the user. You may call the edit tool iteratively, but the entire request may contain at most eight actions.
 
 Do not invent a niche arrangement action. Terms such as drop, chorus, build, breakdown, and fill are musical goals that must be composed from MIDI clips, instruments, effects, modulators, routing, and level changes.
 

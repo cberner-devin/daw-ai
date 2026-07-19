@@ -37,6 +37,9 @@
     advancedButton: document.querySelector("#advanced-button"),
     closeAdvanced: document.querySelector("#close-advanced"),
     advancedDrawer: document.querySelector("#advanced-drawer"),
+    channelCreator: document.querySelector("#channel-creator"),
+    channelRole: document.querySelector("#channel-role"),
+    addChannel: document.querySelector("#add-channel"),
     channelList: document.querySelector("#channel-list"),
     debugButton: document.querySelector("#debug-button"),
     debugPanel: document.querySelector("#debug-panel"),
@@ -54,6 +57,7 @@
     dragAnchor: 0,
     touchSelectionMode: false,
     promptPending: false,
+    channelMutationPending: false,
     centeredInitialSelection: false,
     toastTimer: null,
     activeView: "ai",
@@ -1228,10 +1232,13 @@
             return `<span>${escapeHtml(node)}</span>${edge}`;
           })
           .join("");
-        return `<section class="channel-card" style="--track-color:${track.color}">
+        return `<section class="channel-card" data-channel-track="${track.id}" tabindex="-1" style="--track-color:${track.color}">
           <div class="channel-heading">
             <div class="channel-name"><i></i>${escapeHtml(track.name)}</div>
-            <button class="mute-button ${track.muted ? "is-muted" : ""}" type="button" data-mute-track="${track.id}" data-muted="${track.muted}">${track.muted ? "MUTED" : "MUTE"}</button>
+            <div class="channel-actions">
+              <button class="mute-button ${track.muted ? "is-muted" : ""}" type="button" data-mute-track="${track.id}" data-muted="${track.muted}">${track.muted ? "MUTED" : "MUTE"}</button>
+              <button class="delete-channel-button" type="button" data-delete-track="${track.id}" data-track-name="${escapeHtml(track.name)}" aria-label="${escapeHtml(`Delete ${track.name} channel`)}" ${state.channelMutationPending ? "disabled" : ""}>Delete</button>
+            </div>
           </div>
           <label class="volume-control">LEVEL
             <input type="range" min="0" max="1.5" step="0.01" value="${track.volume}" data-volume-track="${track.id}" aria-label="${escapeHtml(track.name)} volume">
@@ -1280,6 +1287,12 @@
     elements.channelList.querySelectorAll("[data-mute-track]").forEach((button) => {
       button.addEventListener("click", () => {
         void changeMix(button.dataset.muteTrack, { muted: String(button.dataset.muted !== "true") }, "mute");
+      });
+    });
+    elements.channelList.querySelectorAll("[data-delete-track]").forEach((button) => {
+      button.addEventListener("click", () => {
+        if (!window.confirm(`Delete the ${button.dataset.trackName} channel and all of its sound tools?`)) return;
+        void changeChannel("delete", { track_id: button.dataset.deleteTrack });
       });
     });
     elements.channelList.querySelectorAll("[data-sound-tool]").forEach((control) => {
@@ -1465,6 +1478,98 @@
 
   function changeMix(trackId, values, focusControl) {
     return enqueueProjectMutation(() => applyMixChange(trackId, values, focusControl));
+  }
+
+  function setChannelMutationPending(pending) {
+    state.channelMutationPending = pending;
+    elements.addChannel.disabled = pending;
+    elements.channelList.querySelectorAll("[data-delete-track]").forEach((button) => {
+      button.disabled = pending;
+    });
+  }
+
+  function channelMutationRecord(project, clientOperationId, action, values) {
+    const record = project.channelOperations?.find(
+      (operation) => operation.operationId === clientOperationId,
+    );
+    if (!record || record.action !== action) return null;
+    if (action === "add" && record.role !== values.role) return null;
+    if (action === "delete" && String(record.trackId) !== String(values.track_id)) return null;
+    return record;
+  }
+
+  function focusChannelMutation(operation) {
+    if (operation.action === "add") {
+      elements.channelList
+        .querySelector(`[data-channel-track="${operation.trackId}"]`)
+        ?.focus({ preventScroll: true });
+    } else {
+      elements.addChannel.focus({ preventScroll: true });
+    }
+  }
+
+  function changeChannel(action, values) {
+    if (state.channelMutationPending) return Promise.resolve();
+    const clientOperationId = operationId();
+    setChannelMutationPending(true);
+    return enqueueProjectMutation(async () => {
+      let reconciled = true;
+      let confirmedOperation = null;
+      try {
+        await replaceProject(async () => {
+          const project = await api("/api/channels", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({ operation_id: clientOperationId, action, ...values }),
+          });
+          confirmedOperation = channelMutationRecord(
+            project,
+            clientOperationId,
+            action,
+            values,
+          );
+          if (!confirmedOperation) throw new Error("The channel response did not identify this mutation.");
+          state.project = project;
+          renderProject();
+        });
+        showToast(action === "add" ? "Channel added" : "Channel deleted");
+      } catch (error) {
+        if (isRetryableApiError(error)) {
+          try {
+            await replaceProject(async () => {
+              state.project = await api("/api/project", {}, RECONCILED_REQUEST_TIMEOUT_MS);
+              renderProject();
+            });
+            confirmedOperation = channelMutationRecord(
+              state.project,
+              clientOperationId,
+              action,
+              values,
+            );
+            if (confirmedOperation) {
+              showToast(action === "add" ? "Channel added" : "Channel deleted");
+            } else {
+              showError(error, action === "add" ? "adding a channel" : "deleting a channel");
+            }
+          } catch (refreshError) {
+            reconciled = false;
+            showError(
+              new Error(
+                `The channel result could not be confirmed. Reload before trying again. ${errorMessage(refreshError)}`,
+              ),
+              action === "add" ? "adding a channel" : "deleting a channel",
+            );
+          }
+        } else {
+          showError(error, action === "add" ? "adding a channel" : "deleting a channel");
+        }
+      } finally {
+        if (reconciled) {
+          setChannelMutationPending(false);
+          if (confirmedOperation) focusChannelMutation(confirmedOperation);
+        }
+      }
+    });
   }
 
   function changeSoundTool(control, value) {
@@ -1811,28 +1916,53 @@
     const visibilityDeadline = performance.now() + remainingSeconds * 1000 + 30_000;
     for (;;) {
       showEditProgress(job);
+      const publishedVersion = Number(job.projectVersion);
+      if (Number.isFinite(publishedVersion) && publishedVersion > (state.project?.version ?? 0)) {
+        try {
+          await refreshAuthoritativeProject(
+            `Showing Codex step ${Number(job.appliedSteps) || 1}`,
+            Math.min(visibilityDeadline, performance.now() + RECONCILED_REQUEST_TIMEOUT_MS),
+          );
+          showEditProgress(job);
+        } catch (_error) {
+          job = { ...job, detail: "Codex applied a step; retrying the project refresh" };
+          showEditProgress(job);
+        }
+      }
       if (job.status === "completed") return job;
       if (job.status === "failed") return job;
       if (job.status !== "queued" && job.status !== "running") {
-        return { status: "unavailable", error: new Error("The studio returned an unknown edit status.") };
+        return {
+          ...job,
+          status: "unavailable",
+          error: new Error("The studio returned an unknown edit status."),
+        };
       }
       const serverPollAfter = clamp(Number(job.pollAfterMs) || 1000, 20, 5000);
       const pollAfter = clamp(serverPollAfter * 2 ** consecutivePollFailures, 20, 5000);
       await wait(pollAfter);
       const timeout = requestTimeout(visibilityDeadline);
       if (timeout === 0) {
-        return { status: "unavailable", error: new Error("The edit status polling deadline expired.") };
+        return {
+          ...job,
+          status: "unavailable",
+          error: new Error("The edit status polling deadline expired."),
+        };
       }
       try {
         const nextJob = await api(`/api/edits/${encodeURIComponent(job.id)}`, {}, timeout);
         if (nextJob.operationId !== initialJob.operationId) {
-          return { status: "unavailable", error: new Error("The edit job identity changed.") };
+          return {
+            ...job,
+            status: "unavailable",
+            error: new Error("The edit job identity changed."),
+          };
         }
         job = nextJob;
         consecutivePollFailures = 0;
       } catch (error) {
         if (!isRetryableApiError(error) || performance.now() >= visibilityDeadline) {
-          return { status: "unavailable", error };
+          return { ...job, status: "unavailable", error };
         }
         consecutivePollFailures += 1;
         job = {
@@ -1873,9 +2003,40 @@
     }
   }
 
-  async function reconcileUnavailableEdit(operationId) {
+  function persistedOperationOutcome(operation) {
+    const completed = operation.status === "completed";
+    return {
+      id: "recovered",
+      operationId: operation.operationId,
+      status: completed ? "completed" : "failed",
+      phase: completed ? "completed" : "failed",
+      message: completed ? operation.message : undefined,
+      error: completed ? undefined : "Codex stopped before completing the edit.",
+      errorStatus: completed ? undefined : 500,
+      appliedSteps: Number(operation.appliedSteps) || 0,
+      projectVersion: Number(operation.projectVersion) || null,
+    };
+  }
+
+  async function reconcileUnavailableOperation(operationId) {
     const deadline = performance.now() + 2_000;
     for (;;) {
+      try {
+        const outcome = await api(
+          `/api/edit-operations/${encodeURIComponent(operationId)}`,
+          {},
+          requestTimeout(deadline),
+        );
+        const publishedVersion = Number(outcome.projectVersion);
+        if (Number.isFinite(publishedVersion) && publishedVersion > (state.project?.version ?? 0)) {
+          await refreshAuthoritativeProject("Edit status recovered; refreshing the project", deadline);
+        }
+        return outcome;
+      } catch (error) {
+        if (!(error instanceof ApiError && error.status === 404) && !isRetryableApiError(error)) {
+          throw error;
+        }
+      }
       let project;
       try {
         project = await refreshAuthoritativeProject(
@@ -1886,11 +2047,78 @@
         if (performance.now() >= deadline) return null;
         throw error;
       }
+      const operation = project.editOperations?.find(
+        (candidate) => candidate.operationId === operationId,
+      );
+      if (operation) return persistedOperationOutcome(operation);
       const committedEdit = project.edits.find((edit) => edit.operationId === operationId);
-      if (committedEdit) return committedEdit;
+      if (committedEdit) {
+        return persistedOperationOutcome({
+          operationId,
+          status: "completed",
+          appliedSteps: 1,
+          projectVersion: project.version,
+          message: committedEdit.summary,
+        });
+      }
       if (performance.now() >= deadline) return null;
       await wait(100);
     }
+  }
+
+  function appliedEditSteps(outcome) {
+    const steps = Number(outcome.appliedSteps);
+    return Number.isFinite(steps) ? Math.max(0, Math.floor(steps)) : 0;
+  }
+
+  function partialEditError(outcome, refreshError = null) {
+    const steps = appliedEditSteps(outcome);
+    const rawReason =
+      outcome.status === "unavailable"
+        ? "The edit status was lost."
+        : `${outcome.error || "Codex could not complete the edit."}`.trim();
+    const reason = /[.!?]$/.test(rawReason) ? rawReason : `${rawReason}.`;
+    const savedChanges = steps === 1 ? "1 partial change was saved" : `${steps} partial changes were saved`;
+    const refreshWarning = refreshError
+      ? ` Reload to see the latest saved state. ${errorMessage(refreshError)}`
+      : "";
+    return new Error(`${reason} ${savedChanges}; review the project before retrying.${refreshWarning}`);
+  }
+
+  async function resolveEditOutcome(outcome) {
+    if (outcome.status === "completed") {
+      return { kind: "completed", message: outcome.message, refresh: true };
+    }
+
+    const hasPublishedChanges = appliedEditSteps(outcome) > 0;
+    if (outcome.status === "unavailable") {
+      if (hasPublishedChanges) return { kind: "partial", error: partialEditError(outcome) };
+      return {
+        kind: "failed",
+        error: new Error("The edit status was lost. The current project was refreshed; review it before retrying."),
+      };
+    }
+
+    if (outcome.status === "failed") {
+      if (hasPublishedChanges) {
+        let refreshError = null;
+        try {
+          await refreshAuthoritativeProject("Codex stopped; refreshing its partial changes");
+        } catch (error) {
+          refreshError = error;
+        }
+        return { kind: "partial", error: partialEditError(outcome, refreshError) };
+      }
+      if (Number(outcome.errorStatus) === 409) {
+        await refreshAuthoritativeProject("The project changed; loading its current version");
+      }
+      return {
+        kind: "failed",
+        error: new Error(outcome.error || "Codex could not complete the edit."),
+      };
+    }
+
+    return { kind: "failed", error: new Error("The studio returned an unknown edit status.") };
   }
 
   function showPendingEdit(detail) {
@@ -1914,7 +2142,7 @@
       end: selectionEnd,
       submittedText,
     } = pending;
-    let editCommitted = false;
+    let clearSubmittedPrompt = false;
     let restorePlayback = false;
     let playbackStateCaptured = false;
     showPendingEdit(pending.acceptedJob ? "Reconnecting to the active AI edit" : "Starting the AI edit");
@@ -1941,42 +2169,37 @@
           persistPendingEdit(pending);
         }
       }
-      const outcome = accepted.status === "unavailable" ? accepted : await pollAcceptedEdit(accepted);
-      let result;
-      if (outcome.status === "failed") {
-        if (Number(outcome.errorStatus) === 409) {
-          await refreshAuthoritativeProject("The project changed; loading its current version");
-          result = { error: new Error(outcome.error || "The project changed while Codex was working.") };
-        } else {
-          throw new Error(outcome.error || "Codex could not complete the edit.");
+      let outcome = accepted.status === "unavailable" ? accepted : await pollAcceptedEdit(accepted);
+      if (outcome.status === "unavailable") {
+        const recovered = await reconcileUnavailableOperation(clientOperationId);
+        if (recovered) {
+          if (recovered.status === "queued" || recovered.status === "running") {
+            pending.acceptedJob = recovered;
+            persistPendingEdit(pending);
+            outcome = await pollAcceptedEdit(recovered);
+          } else {
+            outcome = recovered;
+          }
         }
-      } else if (outcome.status === "unavailable") {
-        const committedEdit = await reconcileUnavailableEdit(clientOperationId);
-        if (!committedEdit) {
-          result = {
-            error: new Error(
-              "The edit status was lost. The current project was refreshed; review it before retrying.",
-            ),
-          };
-        } else {
-          editCommitted = true;
-          if (elements.promptInput.value === submittedText) elements.promptInput.value = "";
-          result = { message: committedEdit.summary || "Edit completed" };
-        }
-      } else {
-        editCommitted = true;
+      }
+      const result = await resolveEditOutcome(outcome);
+      clearSubmittedPrompt = result.kind === "completed" || result.kind === "partial";
+      if (result.kind === "completed" && result.refresh) {
         try {
           await refreshAuthoritativeProject("Edit completed; refreshing the project");
         } catch (error) {
           throw new CommittedEditSyncError(error);
         }
-        if (elements.promptInput.value === submittedText) elements.promptInput.value = "";
-        result = outcome;
       }
-      if (result.error) throw result.error;
+      if (clearSubmittedPrompt && elements.promptInput.value === submittedText) {
+        elements.promptInput.value = "";
+      }
+      if (result.kind !== "completed") throw result.error;
       showToast(result.message);
     } catch (error) {
-      if (editCommitted && elements.promptInput.value === submittedText) elements.promptInput.value = "";
+      if (clearSubmittedPrompt && elements.promptInput.value === submittedText) {
+        elements.promptInput.value = "";
+      }
       showError(error, "applying a prompted edit");
       elements.savedState.textContent = state.project ? `Version ${state.project.version}` : "Offline";
     } finally {
@@ -2227,6 +2450,10 @@
     button.addEventListener("keydown", handleViewTabKey);
   });
   elements.closeAdvanced.addEventListener("click", closeAdvanced);
+  elements.channelCreator.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void changeChannel("add", { role: elements.channelRole.value });
+  });
   elements.copyDebug.addEventListener("click", () => void copyDebugReport());
   elements.clearDebug.addEventListener("click", clearDebugIssues);
   document.querySelectorAll("[data-prompt]").forEach((button) => {

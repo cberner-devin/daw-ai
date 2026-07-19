@@ -1335,6 +1335,192 @@ async function run() {
       "operation identity test cleanup",
     );
 
+    const incrementalBase = await evaluate(cdp, appSession, `(async () => {
+      const project = await fetch('/api/project').then((response) => response.json());
+      const originalFetch = window.fetch;
+      window.__incrementalFailed = false;
+      window.__incrementalPolls = 0;
+      window.__incrementalBaseEditCount = project.edits.length;
+      const published = structuredClone(project);
+      published.version += 1;
+      published.canUndo = true;
+      published.edits.push({
+        id: 900000,
+        start: 8,
+        end: 16,
+        prompt: 'build this in stages',
+        summary: 'Added the first staged layer',
+        action: { type: 'gain', value: 1.1, target: 'all' },
+      });
+      window.fetch = async function fetch(resource, options) {
+        if (resource === '/api/edits') {
+          window.__incrementalOperationId = new URLSearchParams(options.body).get('operation_id');
+          return new Response(JSON.stringify({
+            id: 'incremental-job', operationId: window.__incrementalOperationId, status: 'queued', phase: 'queued',
+            detail: 'Waiting for the edit worker', elapsedSeconds: 0, timeoutSeconds: 1200, pollAfterMs: 20,
+            appliedSteps: 0, projectVersion: null,
+          }), { status: 202, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (resource === '/api/edits/incremental-job') {
+          window.__incrementalPolls += 1;
+          if (window.__incrementalFailed) {
+            return new Response(JSON.stringify({
+              id: 'incremental-job', operationId: window.__incrementalOperationId, status: 'failed',
+              phase: 'failed', detail: 'Codex stopped unexpectedly', elapsedSeconds: 2,
+              timeoutSeconds: 1200, pollAfterMs: 20, appliedSteps: 1, projectVersion: published.version,
+              error: 'Codex stopped unexpectedly',
+            }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          const job = {
+            id: 'incremental-job', operationId: window.__incrementalOperationId, status: 'running',
+            phase: 'editing', detail: 'Applied step 1 of 2: Added the first staged layer', elapsedSeconds: 1,
+            timeoutSeconds: 1200, pollAfterMs: 20, appliedSteps: 1, projectVersion: published.version,
+          };
+          return new Response(JSON.stringify(job), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (resource === '/api/project') {
+          return new Response(JSON.stringify(published), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return originalFetch(resource, options);
+      };
+      window.__restoreIncrementalFetch = () => { window.fetch = originalFetch; };
+      const input = document.querySelector('#prompt-input');
+      input.value = 'build this in stages';
+      document.querySelector('#prompt-form').requestSubmit();
+      return { version: project.version, edits: project.edits.length };
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `window.__incrementalPolls >= 1 &&
+          document.querySelectorAll('.edit-item').length === window.__incrementalBaseEditCount + 1 &&
+          document.querySelector('.edit-item strong').textContent === 'Added the first staged layer' &&
+          document.querySelector('#compose-button').disabled &&
+          document.querySelector('#edit-progress-label').textContent ===
+            'Applied step 1 of 2: Added the first staged layer'`,
+      ),
+      "incremental Codex project publication",
+    );
+    assert.equal(
+      await evaluate(
+        cdp,
+        appSession,
+        "fetch('/api/project').then((response) => response.json()).then((project) => project.edits.at(-1).operationId ?? null)",
+      ),
+      null,
+      "an intermediate batch must not expose the terminal operation marker",
+    );
+    await evaluate(cdp, appSession, "window.__incrementalFailed = true");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `!document.querySelector('#compose-button').disabled &&
+          document.querySelector('#toast').textContent ===
+            'Codex stopped unexpectedly. 1 partial change was saved; review the project before retrying.' &&
+          document.querySelector('#toast').classList.contains('is-error') &&
+          document.querySelector('#prompt-input').value === '' &&
+          document.querySelectorAll('.edit-item').length === window.__incrementalBaseEditCount + 1 &&
+          localStorage.getItem('daw-ai.pending-edit.v1') === null`,
+      ),
+      "partial edit warning after terminal failure",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(() => {
+        window.__restoreIncrementalFetch();
+        return {
+          version: Number(document.querySelector('#saved-state').textContent.replace('Version ', '')),
+          edits: document.querySelectorAll('.edit-item').length,
+        };
+      })()`),
+      { version: incrementalBase.version + 1, edits: incrementalBase.edits + 1 },
+      "a failed partial edit must remain visible without leaving its prompt ready to resubmit",
+    );
+
+    const acceptanceLossBase = await evaluate(cdp, appSession, `(async () => {
+      const project = await fetch('/api/project').then((response) => response.json());
+      const originalFetch = window.fetch;
+      const published = structuredClone(project);
+      published.version += 1;
+      published.canUndo = true;
+      published.edits.push({
+        id: 900001,
+        start: 8,
+        end: 16,
+        prompt: 'add a layer after uncertain acceptance',
+        summary: 'Added a layer before acceptance was confirmed',
+        action: { type: 'gain', value: 1.05, target: 'all' },
+      });
+      window.__acceptanceLossPosts = 0;
+      window.fetch = async function fetch(resource, options) {
+        if (resource === '/api/edits') {
+          window.__acceptanceLossPosts += 1;
+          window.__acceptanceLossOperationId = new URLSearchParams(options.body).get('operation_id');
+          if (!published.editOperations.some(
+            (operation) => operation.operationId === window.__acceptanceLossOperationId
+          )) {
+            published.editOperations.push({
+              operationId: window.__acceptanceLossOperationId,
+              status: 'partial',
+              appliedSteps: 1,
+              projectVersion: published.version,
+              message: 'Added a layer before acceptance was confirmed',
+            });
+          }
+          const status = window.__acceptanceLossPosts === 1 ? 504 : 404;
+          return new Response(JSON.stringify({ error: 'Simulated lost edit acceptance response' }), {
+            status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (typeof resource === 'string' && resource.startsWith('/api/edit-operations/')) {
+          return new Response(JSON.stringify({
+            id: 'recovered', operationId: window.__acceptanceLossOperationId, status: 'failed', phase: 'failed',
+            errorStatus: 500, error: 'Codex stopped before completing the edit.', elapsedSeconds: 0,
+            timeoutSeconds: 1200, appliedSteps: 1, projectVersion: published.version,
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (resource === '/api/project') {
+          return new Response(JSON.stringify(published), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return originalFetch(resource, options);
+      };
+      window.__restoreFetchAfterAcceptanceLoss = () => { window.fetch = originalFetch; };
+      const input = document.querySelector('#prompt-input');
+      input.value = 'add a layer after uncertain acceptance';
+      document.querySelector('#prompt-form').requestSubmit();
+      return { version: project.version, edits: project.edits.length };
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `!document.querySelector('#compose-button').disabled &&
+          window.__acceptanceLossPosts === 2 &&
+          document.querySelector('#toast').textContent ===
+            'Codex stopped before completing the edit. 1 partial change was saved; review the project before retrying.' &&
+          document.querySelector('#toast').classList.contains('is-error') &&
+          document.querySelector('#prompt-input').value === '' &&
+          document.querySelectorAll('.edit-item').length === ${acceptanceLossBase.edits + 1} &&
+          localStorage.getItem('daw-ai.pending-edit.v1') === null`,
+      ),
+      "partial publication recovery after edit acceptance loss",
+    );
+    await evaluate(cdp, appSession, "window.__restoreFetchAfterAcceptanceLoss()");
+
     await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
     await waitFor(
       async () =>
@@ -1352,6 +1538,140 @@ async function run() {
       ),
       true,
       "Advanced must replace AI Mode as the active full-page tab",
+    );
+    const channelsBefore = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json()).then((project) => project.tracks.length)",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const originalFetch = window.fetch;
+      window.__unrelatedChannelInjected = false;
+      window.fetch = async function fetch(resource, options) {
+        if (resource === '/api/channels' && !window.__unrelatedChannelInjected) {
+          const request = new URLSearchParams(options.body);
+          window.__lostChannelOperationId = request.get('operation_id');
+          window.__unrelatedChannelInjected = true;
+          await originalFetch('/api/channels', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ action: 'add', role: 'bass' }),
+          });
+          return new Response('not valid JSON', {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return originalFetch(resource, options);
+      };
+      window.__restoreFetchAfterUnrelatedChannel = () => { window.fetch = originalFetch; };
+      const role = document.querySelector('#channel-role');
+      role.value = 'lead';
+      document.querySelector('#channel-creator').requestSubmit();
+    })()`);
+    const unrelatedChannel = await waitFor(
+      async () => evaluate(cdp, appSession, `(async () => {
+        if (document.querySelectorAll('.channel-card').length !== ${channelsBefore + 1} ||
+            document.querySelector('#add-channel').disabled ||
+            !document.querySelector('#toast').classList.contains('is-error')) return false;
+        const project = await fetch('/api/project').then((response) => response.json());
+        const unrelated = project.tracks.at(-1);
+        const card = document.querySelector('[data-channel-track="' + unrelated.id + '"]');
+        if (unrelated.role !== 'bass' || document.activeElement === card ||
+            project.channelOperations.some(
+              (operation) => operation.operationId === window.__lostChannelOperationId
+            )) return false;
+        return { id: unrelated.id, toast: document.querySelector('#toast').textContent };
+      })()`),
+      "unrelated concurrent channel must not confirm a lost add",
+    );
+    assert.notEqual(unrelatedChannel.toast, "Channel added");
+    await evaluate(cdp, appSession, `(() => {
+      window.__restoreFetchAfterUnrelatedChannel();
+      window.confirm = () => true;
+      document.querySelector('[data-delete-track="${unrelatedChannel.id}"]').click();
+    })()`);
+    await waitFor(
+      async () => evaluate(cdp, appSession, `document.querySelectorAll('.channel-card').length === ${channelsBefore}`),
+      "unrelated channel test cleanup",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const originalFetch = window.fetch;
+      window.__ambiguousChannelResponses = 0;
+      window.fetch = async function fetch(resource, options) {
+        const response = await originalFetch(resource, options);
+        if (resource === '/api/channels' && response.ok) {
+          window.__ambiguousChannelResponses += 1;
+          return new Response('not valid JSON', {
+            status: response.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return response;
+      };
+      window.__restoreFetchAfterChannels = () => { window.fetch = originalFetch; };
+    })()`);
+    await evaluate(cdp, appSession, `(() => {
+      const role = document.querySelector('#channel-role');
+      role.value = 'lead';
+      document.querySelector('#channel-creator').requestSubmit();
+    })()`);
+    const addedChannel = await waitFor(
+      async () => evaluate(cdp, appSession, `(async () => {
+        const project = await fetch('/api/project').then((response) => response.json());
+        if (project.tracks.length !== ${channelsBefore + 1}) return false;
+        const lead = project.tracks.at(-1);
+        const card = document.querySelector('[data-channel-track="' + lead.id + '"]');
+        if (!card || document.activeElement !== card) return false;
+        return {
+          id: lead.id,
+          role: lead.role,
+          clipStart: lead.clips[0].start,
+          clipEnd: lead.clips[0].end,
+          duration: project.duration,
+        };
+      })()`),
+      "Advanced channel creation",
+    );
+    assert.deepEqual(
+      addedChannel,
+      {
+        id: addedChannel.id,
+        role: "lead",
+        clipStart: 0,
+        clipEnd: addedChannel.duration,
+        duration: addedChannel.duration,
+      },
+      "a new Advanced channel must be a complete playable graph path",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      window.confirm = () => true;
+      document.querySelector('[data-delete-track="${addedChannel.id}"]').click();
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.querySelectorAll('.channel-card').length === ${channelsBefore} &&
+          document.activeElement === document.querySelector('#add-channel')`,
+      ),
+      "Advanced channel deletion",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "window.__ambiguousChannelResponses"),
+      2,
+      "ambiguous add and delete responses must reconcile without duplicate submissions",
+    );
+    await evaluate(cdp, appSession, "window.__restoreFetchAfterChannels()");
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, `document.querySelectorAll('.channel-card').length === ${channelsBefore + 1}`),
+      "Advanced channel deletion undo",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, `document.querySelectorAll('.channel-card').length === ${channelsBefore}`),
+      "Advanced channel creation undo",
     );
     const summarySpace = await evaluate(cdp, appSession, `(() => {
       const finalClip = [...document.querySelectorAll('.clip-editor')].at(-1);
