@@ -16,7 +16,7 @@ use crate::codex_mcp::{
     ANALYZE_TOOL_NAME, EditSession, MCP_SESSION_ENV, MCP_TOOL_NAME, MEL_TOOL_NAME,
 };
 use crate::model::{Project, TrackRole, json_string};
-use crate::prompt::{Action, EditPlan, MidiNote};
+use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS, MidiNote};
 
 pub(crate) const EDIT_SCHEMA: &str = include_str!("../codex/edit-plan.schema.json");
 const STUDIO_CONTRACT: &str = include_str!("../codex/STUDIO.md");
@@ -162,7 +162,7 @@ impl CodexPlanner {
         let mut delivered_plans = Vec::new();
         let status = loop {
             if let Err(error) =
-                publish_session_updates(&session, &mut delivered_plans, &mut on_update)
+                publish_session_update(&session, &mut delivered_plans, &mut on_update)
             {
                 terminate_process_group(&mut child);
                 let _ = stdin_writer.join();
@@ -190,8 +190,7 @@ impl CodexPlanner {
             }
             thread::sleep(Duration::from_millis(50));
         };
-        if let Err(error) = publish_session_updates(&session, &mut delivered_plans, &mut on_update)
-        {
+        if let Err(error) = publish_session_update(&session, &mut delivered_plans, &mut on_update) {
             let _ = stdin_writer.join();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
@@ -227,18 +226,19 @@ impl CodexPlanner {
     }
 }
 
-fn publish_session_updates(
+fn publish_session_update(
     session: &EditSession,
     delivered_plans: &mut Vec<EditPlan>,
     on_update: &mut impl FnMut(CodexEdit) -> Result<(), PlannerError>,
 ) -> Result<(), PlannerError> {
-    while let Some((plan, project)) = session.take_update().map_err(|message| invalid(&message))? {
-        on_update(CodexEdit {
-            plan: plan.clone(),
-            project,
-        })?;
-        delivered_plans.push(plan);
-    }
+    let Some((plan, project)) = session.take_update().map_err(|message| invalid(&message))? else {
+        return Ok(());
+    };
+    on_update(CodexEdit {
+        plan: plan.clone(),
+        project,
+    })?;
+    delivered_plans.push(plan);
     Ok(())
 }
 
@@ -441,7 +441,7 @@ pub(crate) fn plan_from_json(source: &str) -> Result<EditPlan, PlannerError> {
         .get("actions")
         .and_then(JsonValue::as_array)
         .ok_or_else(|| invalid("actions must be an array"))?;
-    if actions.is_empty() || actions.len() > 8 {
+    if actions.is_empty() || actions.len() > MAX_COMPOUND_ACTIONS {
         return Err(invalid("one to eight actions are required"));
     }
     let mut parsed = actions
@@ -722,6 +722,26 @@ fn invalid(message: &str) -> PlannerError {
 mod tests {
     use super::*;
 
+    fn write_test_session_update(session: &EditSession, summary: &str) {
+        let progress = session.path().join("edit-progress");
+        std::fs::create_dir(&progress).expect("progress directory");
+        std::fs::write(
+            progress.join("plan.json"),
+            format!(
+                concat!(
+                    "{{\"summary\":{},",
+                    "\"musicalPlan\":\"Keep the current tempo.\",",
+                    "\"actions\":[{{\"kind\":\"tempo\",\"target\":\"all\",",
+                    "\"name\":\"None\",\"value\":120}}]}}"
+                ),
+                json_string(summary)
+            ),
+        )
+        .expect("progress plan");
+        std::fs::write(progress.join("project.json"), Project::demo().to_json())
+            .expect("progress project");
+    }
+
     #[test]
     fn planner_task_requires_an_unbounded_edit_listen_evaluate_loop() {
         let task = planner_task("make the bass hit harder", 4.0, 8.0);
@@ -732,6 +752,38 @@ mod tests {
             task.contains("no predetermined iteration, tool-call, or request-wide action limit")
         );
         assert!(task.contains("overall session timeout is the only loop limit"));
+    }
+
+    #[test]
+    fn publishes_one_session_update_before_returning_to_timeout_checks() {
+        let session =
+            EditSession::create(&Project::demo(), "keep editing", 4.0, 8.0).expect("edit session");
+        write_test_session_update(&session, "First batch");
+        let mut delivered = Vec::new();
+        let mut first_callbacks = 0;
+
+        publish_session_update(&session, &mut delivered, &mut |edit| {
+            first_callbacks += 1;
+            assert_eq!(edit.plan.summary, "First batch");
+            write_test_session_update(&session, "Second batch");
+            Ok(())
+        })
+        .expect("first progress poll");
+
+        assert_eq!(first_callbacks, 1);
+        assert_eq!(delivered.len(), 1);
+        assert!(session.path().join("edit-progress").is_dir());
+
+        let mut second_callbacks = 0;
+        publish_session_update(&session, &mut delivered, &mut |edit| {
+            second_callbacks += 1;
+            assert_eq!(edit.plan.summary, "Second batch");
+            Ok(())
+        })
+        .expect("second progress poll");
+        assert_eq!(second_callbacks, 1);
+        assert_eq!(delivered.len(), 2);
+        assert!(!session.path().join("edit-progress").exists());
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::model::{
     Instrument, MAX_PROMPT_CHARACTERS, Modulator, Project, ProjectFileError, Routing, Track,
     TrackRole,
 };
-use crate::prompt::{Action, MidiNote};
+use crate::prompt::{Action, MAX_COMPOUND_ACTIONS, MidiNote};
 
 const MAX_TRACKS: usize = 128;
 const MAX_TOOLS_PER_TRACK: usize = 256;
@@ -695,7 +695,7 @@ fn parse_action(value: &JsonValue, depth: usize) -> Result<Action, ProjectFileEr
     let action_type = string(action, "type")?;
     if action_type == "compound" {
         let values = array(action, "actions")?;
-        if values.is_empty() || values.len() > 8 {
+        if values.is_empty() || values.len() > MAX_COMPOUND_ACTIONS {
             return Err(invalid(
                 "compound actions require one to eight child actions",
             ));
