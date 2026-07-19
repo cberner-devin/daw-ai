@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value as JsonValue;
 
+use crate::audio_analysis::{self, MAX_REGION_SECONDS};
 use crate::codex::{EDIT_SCHEMA, plan_from_json};
 use crate::model::{Project, StudioError, json_string};
 use crate::prompt::{Action, EditPlan};
@@ -12,10 +13,30 @@ use crate::storage::{ProjectStore, replace_text_file};
 
 pub(crate) const MCP_SESSION_ENV: &str = "DAW_AI_MCP_SESSION";
 pub(crate) const MCP_TOOL_NAME: &str = "apply_sound_graph_edits";
+pub(crate) const MEL_TOOL_NAME: &str = "render_mel_spectrogram";
+pub(crate) const ANALYZE_TOOL_NAME: &str = "analyze_audio_region";
 const GRAPH_FILE: &str = "sound-graph.json";
 const REQUEST_FILE: &str = "request.json";
 const OPERATIONS_FILE: &str = "edit-operations.jsonl";
+const PROGRESS_FILE_PREFIX: &str = "edit-progress-";
 const MAX_OPERATIONS_BYTES: u64 = 1024 * 1024;
+const AUDIO_REGION_SCHEMA: &str = r#"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["trackIds", "start", "end"],
+  "properties": {
+    "trackIds": {
+      "type": "array",
+      "description": "One or more stable channel IDs from sound-graph.json.",
+      "items": { "type": "integer", "minimum": 1 },
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true
+    },
+    "start": { "type": "number", "minimum": 0 },
+    "end": { "type": "number", "exclusiveMinimum": 0 }
+  }
+}"#;
 static SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct EditSession {
@@ -84,6 +105,28 @@ impl EditSession {
             },
             project,
         ))
+    }
+
+    pub(crate) fn updates_after(
+        &self,
+        delivered: usize,
+    ) -> Result<Vec<(EditPlan, Project)>, String> {
+        let plans = read_plans(&self.path)?;
+        if delivered > plans.len() {
+            return Err("Codex edit progress moved backwards".to_owned());
+        }
+        plans
+            .into_iter()
+            .enumerate()
+            .skip(delivered)
+            .map(|(index, plan)| {
+                let source = fs::read_to_string(progress_path(&self.path, index + 1))
+                    .map_err(|error| format!("could not read Codex edit progress: {error}"))?;
+                let project = Project::from_json(&source)
+                    .map_err(|error| format!("Codex edit progress is invalid: {error}"))?;
+                Ok((plan, project))
+            })
+            .collect()
     }
 }
 
@@ -171,30 +214,61 @@ fn initialize_response(id: &str, params: Option<&JsonValue>) -> String {
             json_string(protocol),
             json_string(env!("CARGO_PKG_VERSION")),
             json_string(
-                "Read sound-graph.json before editing. Use apply_sound_graph_edits for every intended change; it validates and rewrites the graph. Keep all batches to eight actions total."
+                "Read sound-graph.json before editing. Use the read-only listening tools to inspect relevant channels when useful. Use apply_sound_graph_edits for every intended change; it validates and rewrites the graph. Keep all batches to eight actions total."
             )
         ),
     )
 }
 
 fn tools_response(id: &str) -> String {
-    let schema = serde_json::from_str::<JsonValue>(EDIT_SCHEMA)
-        .expect("embedded edit schema is valid JSON")
-        .to_string();
-    let result = format!(
-        concat!(
-            "{{\"tools\":[{{\"name\":{},\"description\":{},\"inputSchema\":{},",
-            "\"annotations\":{{\"title\":\"Apply sound graph edits\",",
-            "\"readOnlyHint\":false,\"destructiveHint\":false,",
-            "\"idempotentHint\":false,\"openWorldHint\":false}}}}]}}"
-        ),
-        json_string(MCP_TOOL_NAME),
-        json_string(
-            "Apply one validated batch of generic MIDI clip, instrument, effect, modulator, routing, mix, arrangement, or tempo operations to sound-graph.json. Returns a precise validation error without changing the graph when the batch is invalid. Call iteratively when useful, with no more than eight actions across the full edit."
-        ),
-        schema
-    );
-    json_rpc_result(id, &result)
+    let edit_schema =
+        serde_json::from_str::<JsonValue>(EDIT_SCHEMA).expect("embedded edit schema is valid JSON");
+    let audio_schema = serde_json::from_str::<JsonValue>(AUDIO_REGION_SCHEMA)
+        .expect("embedded audio analysis schema is valid JSON");
+    json_rpc_result(
+        id,
+        &serde_json::json!({
+            "tools": [
+                {
+                    "name": MCP_TOOL_NAME,
+                    "description": "Apply one validated batch of generic MIDI clip, instrument, effect, modulator, routing, mix, arrangement, or tempo operations to sound-graph.json. Returns a precise validation error without changing the graph when the batch is invalid. Call iteratively when useful, with no more than eight actions across the full edit.",
+                    "inputSchema": edit_schema,
+                    "annotations": {
+                        "title": "Apply sound graph edits",
+                        "readOnlyHint": false,
+                        "destructiveHint": false,
+                        "idempotentHint": false,
+                        "openWorldHint": false
+                    }
+                },
+                {
+                    "name": MEL_TOOL_NAME,
+                    "description": "Render selected channels and a bounded time range from the current sound graph, then return a 64-band Mel spectrogram as a PNG image. Use it to inspect frequency balance, transients, density, and changes between edit batches.",
+                    "inputSchema": audio_schema,
+                    "annotations": {
+                        "title": "Render Mel spectrogram",
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": false
+                    }
+                },
+                {
+                    "name": ANALYZE_TOOL_NAME,
+                    "description": "Render selected channels and report deterministic audio-region measurements including peak, RMS, zero-crossing rate, spectral centroid, and low/mid/high frequency energy ratios.",
+                    "inputSchema": audio_schema,
+                    "annotations": {
+                        "title": "Analyze audio region",
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": false
+                    }
+                }
+            ]
+        })
+        .to_string(),
+    )
 }
 
 fn call_tool_response(id: &str, params: Option<&JsonValue>, session_path: &Path) -> String {
@@ -206,30 +280,184 @@ fn call_tool_response(id: &str, params: Option<&JsonValue>, session_path: &Path)
                 .get("name")
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| "tool name is required".to_owned())?;
-            if name != MCP_TOOL_NAME {
-                return Err(format!("unknown tool: {name}"));
-            }
             let arguments = params
                 .get("arguments")
                 .ok_or_else(|| "tool arguments are required".to_owned())?;
-            apply_graph_edits(session_path, &arguments.to_string())
+            match name {
+                MCP_TOOL_NAME => apply_graph_edits(session_path, &arguments.to_string())
+                    .map(|message| text_content(&message)),
+                MEL_TOOL_NAME => render_mel_spectrogram(session_path, arguments),
+                ANALYZE_TOOL_NAME => analyze_audio_region(session_path, arguments),
+                _ => Err(format!("unknown tool: {name}")),
+            }
         });
-    let (is_error, text) = match result {
-        Ok(message) => (false, message),
-        Err(message) => (true, message),
+    let (is_error, content) = match result {
+        Ok(content) => (false, content),
+        Err(message) => (true, text_content(&message)),
     };
     json_rpc_result(
         id,
-        &format!(
-            "{{\"content\":[{{\"type\":\"text\",\"text\":{}}}],\"isError\":{is_error}}}",
-            json_string(&text)
-        ),
+        &format!("{{\"content\":{content},\"isError\":{is_error}}}"),
     )
+}
+
+fn text_content(text: &str) -> String {
+    format!("[{{\"type\":\"text\",\"text\":{}}}]", json_string(text))
+}
+
+fn current_project(session_path: &Path) -> Result<Project, String> {
+    let source = fs::read_to_string(session_path.join(GRAPH_FILE))
+        .map_err(|error| format!("could not read sound-graph.json: {error}"))?;
+    Project::from_json(&source).map_err(|error| format!("sound-graph.json is invalid: {error}"))
+}
+
+fn audio_region_arguments(
+    project: &Project,
+    arguments: &JsonValue,
+) -> Result<(Vec<u64>, f32, f32), String> {
+    let arguments = arguments
+        .as_object()
+        .ok_or_else(|| "audio analysis arguments must be an object".to_owned())?;
+    let values = arguments
+        .get("trackIds")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "trackIds must be an array".to_owned())?;
+    if values.is_empty() || values.len() > 32 {
+        return Err("trackIds must contain between 1 and 32 channel IDs".to_owned());
+    }
+    let mut track_ids = Vec::with_capacity(values.len());
+    for value in values {
+        let track_id = value
+            .as_u64()
+            .filter(|track_id| *track_id > 0)
+            .ok_or_else(|| "trackIds must contain positive integers".to_owned())?;
+        if track_ids.contains(&track_id) {
+            return Err(format!("channel {track_id} was requested more than once"));
+        }
+        if !project.tracks.iter().any(|track| track.id == track_id) {
+            let available = project
+                .tracks
+                .iter()
+                .map(|track| track.id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "channel {track_id} does not exist; available channel IDs: {available}"
+            ));
+        }
+        track_ids.push(track_id);
+    }
+    let number = |name: &str| {
+        arguments
+            .get(name)
+            .and_then(JsonValue::as_f64)
+            .filter(|value| value.is_finite())
+            .map(|value| value as f32)
+            .ok_or_else(|| format!("{name} must be a finite number"))
+    };
+    let start = number("start")?;
+    let end = number("end")?;
+    if start < 0.0 || end <= start || end > project.duration {
+        return Err(format!(
+            "analysis range must be between 0 and {:.3} seconds with end after start",
+            project.duration
+        ));
+    }
+    if end - start > MAX_REGION_SECONDS {
+        return Err(format!(
+            "analysis ranges are limited to {MAX_REGION_SECONDS} seconds"
+        ));
+    }
+    Ok((track_ids, start, end))
+}
+
+fn render_mel_spectrogram(session_path: &Path, arguments: &JsonValue) -> Result<String, String> {
+    let project = current_project(session_path)?;
+    let (track_ids, start, end) = audio_region_arguments(&project, arguments)?;
+    let region = audio_analysis::render_region(&project, &track_ids, start, end)?;
+    let spectrogram = audio_analysis::mel_spectrogram(&region);
+    let description = format!(
+        concat!(
+            "Rendered channels {:?} from {:.3} to {:.3} seconds at {} Hz: ",
+            "{} events, {} Mel bands, {} source frames, {}x{} PNG, {:.1} to {:.1} dB."
+        ),
+        track_ids,
+        start,
+        end,
+        audio_analysis::SAMPLE_RATE,
+        region.event_count,
+        64,
+        spectrogram.frames,
+        spectrogram.width,
+        spectrogram.height,
+        spectrogram.minimum_db,
+        spectrogram.maximum_db
+    );
+    Ok(format!(
+        concat!(
+            "[{{\"type\":\"text\",\"text\":{}}},",
+            "{{\"type\":\"image\",\"data\":{},\"mimeType\":\"image/png\"}}]"
+        ),
+        json_string(&description),
+        json_string(&base64(&spectrogram.png))
+    ))
+}
+
+fn analyze_audio_region(session_path: &Path, arguments: &JsonValue) -> Result<String, String> {
+    let project = current_project(session_path)?;
+    let (track_ids, start, end) = audio_region_arguments(&project, arguments)?;
+    let region = audio_analysis::render_region(&project, &track_ids, start, end)?;
+    let analysis = audio_analysis::analyze(&region);
+    let report = serde_json::json!({
+        "trackIds": track_ids,
+        "start": start,
+        "end": end,
+        "sampleRate": audio_analysis::SAMPLE_RATE,
+        "eventsRendered": region.event_count,
+        "peak": round_measurement(analysis.peak),
+        "rms": round_measurement(analysis.rms),
+        "zeroCrossingRate": round_measurement(analysis.zero_crossing_rate),
+        "spectralCentroidHz": (analysis.spectral_centroid_hz * 10.0).round() / 10.0,
+        "energyRatios": {
+            "lowBelow250Hz": round_measurement(analysis.low_energy_ratio),
+            "mid250To2500Hz": round_measurement(analysis.mid_energy_ratio),
+            "highAbove2500Hz": round_measurement(analysis.high_energy_ratio)
+        }
+    });
+    Ok(text_content(&report.to_string()))
+}
+
+fn round_measurement(value: f32) -> f32 {
+    (value * 10_000.0).round() / 10_000.0
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(ALPHABET[(first >> 2) as usize] as char);
+        output.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            ALPHABET[(third & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
 }
 
 fn apply_graph_edits(session_path: &Path, source: &str) -> Result<String, String> {
     let plan = plan_from_json(source).map_err(|error| error.to_string())?;
-    let prior_action_count = read_plans(session_path)?
+    let prior_plans = read_plans(session_path)?;
+    let prior_action_count = prior_plans
         .iter()
         .map(|plan| action_count(&plan.action))
         .sum::<usize>();
@@ -253,7 +481,18 @@ fn apply_graph_edits(session_path: &Path, source: &str) -> Result<String, String
     store
         .save(studio.project())
         .map_err(|error| format!("Could not write sound-graph.json: {error}"))?;
+    let progress_path = progress_path(session_path, prior_plans.len() + 1);
+    if let Err(error) = write_new(&progress_path, &studio.project().to_json()) {
+        let _ = fs::remove_file(&progress_path);
+        return match store.save(&original_project) {
+            Ok(()) => Err(format!("could not record Codex edit progress: {error}")),
+            Err(rollback_error) => Err(format!(
+                "could not record Codex edit progress: {error}; also could not restore sound-graph.json: {rollback_error}"
+            )),
+        };
+    }
     if let Err(error) = append_operation(session_path, source) {
+        let _ = fs::remove_file(progress_path);
         return match store.save(&original_project) {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(format!(
@@ -265,6 +504,10 @@ fn apply_graph_edits(session_path: &Path, source: &str) -> Result<String, String
         "Applied {new_action_count} action(s) and updated sound-graph.json to version {}: {summary}",
         studio.project().version
     ))
+}
+
+fn progress_path(session_path: &Path, sequence: usize) -> PathBuf {
+    session_path.join(format!("{PROGRESS_FILE_PREFIX}{sequence}.json"))
 }
 
 fn read_request(session_path: &Path) -> Result<(f32, f32, String), String> {
@@ -352,6 +595,7 @@ fn studio_error_message(error: StudioError) -> String {
         )
         .to_owned(),
         StudioError::InvalidMix => "A mixer value is outside its published range.".to_owned(),
+        StudioError::InvalidChannel => "A channel change exceeds the sound graph limits.".to_owned(),
         StudioError::UnknownSoundTool => concat!(
             "An action references a sound-tool, clip, or event ID that is not in sound-graph.json. ",
             "Read the graph again and use its stable IDs."
@@ -396,10 +640,23 @@ fn reserve_session_directory() -> io::Result<PathBuf> {
 }
 
 fn write_new(path: &Path, source: &str) -> io::Result<()> {
+    write_new_with(path, |file| {
+        file.write_all(source.as_bytes())?;
+        file.write_all(b"\n")
+    })
+}
+
+fn write_new_with(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(source.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()
+    let result = write(&mut file).and_then(|()| file.sync_all());
+    drop(file);
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
 }
 
 fn json_rpc_result(id: &str, result: &str) -> String {
@@ -439,6 +696,23 @@ mod tests {
         )
     }
 
+    fn listening_tool_call(id: u64, name: &str, track_ids: &str, start: f32, end: f32) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": {
+                    "trackIds": serde_json::from_str::<JsonValue>(track_ids).unwrap(),
+                    "start": start,
+                    "end": end
+                }
+            }
+        })
+        .to_string()
+    }
+
     #[test]
     fn serves_and_applies_registered_graph_tools() {
         let session = EditSession::create(&Project::demo(), "brighten the bass", 4.0, 8.0)
@@ -463,11 +737,25 @@ mod tests {
         let output = String::from_utf8(output).expect("UTF-8 output");
         assert!(output.contains("test-version"));
         assert!(output.contains(MCP_TOOL_NAME));
+        assert!(output.contains(MEL_TOOL_NAME));
+        assert!(output.contains(ANALYZE_TOOL_NAME));
         assert!(output.contains("\"isError\":false"));
+
+        let first_update = session.updates_after(0).expect("first published update");
+        assert_eq!(first_update.len(), 1);
+        assert_eq!(first_update[0].0.summary, "Changed the bass waveform");
+        assert_eq!(first_update[0].1.tracks[1].instrument.waveform, "sawtooth");
+
+        let second = handle_message(&tool_call(4, 201, "triangle"), session.path())
+            .expect("second tool response");
+        assert!(second.contains("\"isError\":false"));
+        let second_update = session.updates_after(1).expect("second published update");
+        assert_eq!(second_update.len(), 1);
+        assert_eq!(second_update[0].1.tracks[1].instrument.waveform, "triangle");
 
         let (plan, graph) = session.finish().expect("completed graph edit");
         assert_eq!(plan.summary, "Changed the bass waveform");
-        assert_eq!(graph.tracks[1].instrument.waveform, "sawtooth");
+        assert_eq!(graph.tracks[1].instrument.waveform, "triangle");
     }
 
     #[test]
@@ -485,5 +773,49 @@ mod tests {
             Project::from_json(&graph).unwrap().to_json(),
             project.to_json()
         );
+    }
+
+    #[test]
+    fn listening_tools_return_an_image_and_audio_measurements() {
+        let session = EditSession::create(&Project::demo(), "inspect the mix", 0.0, 2.0)
+            .expect("edit session");
+        let spectrogram = handle_message(
+            &listening_tool_call(1, MEL_TOOL_NAME, "[1,2]", 0.0, 1.0),
+            session.path(),
+        )
+        .expect("spectrogram response");
+        assert!(spectrogram.contains("\"mimeType\":\"image/png\""));
+        assert!(spectrogram.contains("iVBORw0KGgo"));
+        assert!(spectrogram.contains("\"isError\":false"));
+
+        let analysis = handle_message(
+            &listening_tool_call(2, ANALYZE_TOOL_NAME, "[2,3]", 0.0, 1.0),
+            session.path(),
+        )
+        .expect("analysis response");
+        assert!(analysis.contains("spectralCentroidHz"));
+        assert!(analysis.contains("energyRatios"));
+        assert!(analysis.contains("\"isError\":false"));
+
+        let invalid = handle_message(
+            &listening_tool_call(3, ANALYZE_TOOL_NAME, "[999]", 0.0, 1.0),
+            session.path(),
+        )
+        .expect("invalid analysis response");
+        assert!(invalid.contains("available channel IDs"));
+        assert!(invalid.contains("\"isError\":true"));
+    }
+
+    #[test]
+    fn failed_new_file_writes_remove_the_incomplete_snapshot() {
+        let session =
+            EditSession::create(&Project::demo(), "test cleanup", 4.0, 8.0).expect("edit session");
+        let path = session.path().join("failed-progress.json");
+        let result = write_new_with(&path, |file| {
+            file.write_all(b"incomplete")?;
+            Err(io::Error::other("simulated snapshot failure"))
+        });
+        assert!(result.is_err());
+        assert!(!path.exists());
     }
 }

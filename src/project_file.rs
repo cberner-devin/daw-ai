@@ -3,8 +3,9 @@ use std::collections::HashSet;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::model::{
-    Clip, ClipEvent, Edit, Effect, Instrument, MAX_PROMPT_CHARACTERS, Modulator, Project,
-    ProjectFileError, Routing, Track, TrackRole,
+    ChannelOperation, ChannelOperationAction, Clip, ClipEvent, Edit, EditOperation, Effect,
+    Instrument, MAX_PROMPT_CHARACTERS, Modulator, Project, ProjectFileError, Routing, Track,
+    TrackRole,
 };
 use crate::prompt::{Action, MidiNote};
 
@@ -101,6 +102,72 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     {
         return Err(invalid("edit operation IDs must be unique"));
     }
+    let operation_values = root
+        .get("editOperations")
+        .map(|value| {
+            value
+                .as_array()
+                .ok_or_else(|| invalid("editOperations must be an array"))
+        })
+        .transpose()?
+        .map_or(&[][..], Vec::as_slice);
+    if operation_values.len() > MAX_EDITS {
+        return Err(invalid(format!(
+            "editOperations supports at most {MAX_EDITS} entries"
+        )));
+    }
+    let mut edit_operations = operation_values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| parse_edit_operation(value, index, version))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut recorded_operation_ids = HashSet::new();
+    if edit_operations
+        .iter()
+        .any(|operation| !recorded_operation_ids.insert(operation.operation_id.clone()))
+    {
+        return Err(invalid("edit operation records must be unique"));
+    }
+    for edit in &edits {
+        let Some(operation_id) = &edit.operation_id else {
+            continue;
+        };
+        if valid_operation_id(operation_id) && recorded_operation_ids.insert(operation_id.clone()) {
+            edit_operations.push(EditOperation {
+                operation_id: operation_id.clone(),
+                completed: true,
+                applied_steps: 1,
+                project_version: version,
+                message: edit.summary.clone(),
+            });
+        }
+    }
+    let channel_operation_values = root
+        .get("channelOperations")
+        .map(|value| {
+            value
+                .as_array()
+                .ok_or_else(|| invalid("channelOperations must be an array"))
+        })
+        .transpose()?
+        .map_or(&[][..], Vec::as_slice);
+    if channel_operation_values.len() > MAX_EDITS {
+        return Err(invalid(format!(
+            "channelOperations supports at most {MAX_EDITS} entries"
+        )));
+    }
+    let channel_operations = channel_operation_values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| parse_channel_operation(value, index, version))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut channel_operation_ids = HashSet::new();
+    if channel_operations
+        .iter()
+        .any(|operation| !channel_operation_ids.insert(operation.operation_id.as_str()))
+    {
+        return Err(invalid("channel operation records must be unique"));
+    }
     if !ids.is_disjoint(&event_ids) {
         return Err(invalid(
             "MIDI event IDs must not collide with sound graph object IDs",
@@ -114,6 +181,8 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         version,
         tracks,
         edits,
+        edit_operations,
+        channel_operations,
     })
 }
 
@@ -487,6 +556,100 @@ fn parse_edit(
         summary: limited_string(edit, "summary", 1, 160)?,
         action: parse_action(field(edit, "action")?, 0)?,
     })
+}
+
+fn parse_edit_operation(
+    value: &JsonValue,
+    index: usize,
+    current_version: u64,
+) -> Result<EditOperation, ProjectFileError> {
+    let operation = object(value, "edit operation")?;
+    let context = format!("edit operation {}", index + 1);
+    let operation_id = limited_string(operation, "operationId", 1, 128)?;
+    if !valid_operation_id(&operation_id) {
+        return Err(invalid(format!("{context} ID is invalid")));
+    }
+    let applied_steps = integer(operation, "appliedSteps")?;
+    if applied_steps == 0 || applied_steps > MAX_EDITS as u64 {
+        return Err(invalid(format!(
+            "{context} appliedSteps must be between 1 and {MAX_EDITS}"
+        )));
+    }
+    let project_version = integer(operation, "projectVersion")?;
+    if project_version > current_version {
+        return Err(invalid(format!(
+            "{context} projectVersion cannot exceed the project version"
+        )));
+    }
+    let completed = match string(operation, "status")? {
+        "partial" => false,
+        "completed" => true,
+        _ => return Err(invalid(format!("{context} status is invalid"))),
+    };
+    Ok(EditOperation {
+        operation_id,
+        completed,
+        applied_steps: applied_steps as usize,
+        project_version,
+        message: limited_string(operation, "message", 1, 160)?,
+    })
+}
+
+fn parse_channel_operation(
+    value: &JsonValue,
+    index: usize,
+    current_version: u64,
+) -> Result<ChannelOperation, ProjectFileError> {
+    let operation = object(value, "channel operation")?;
+    let context = format!("channel operation {}", index + 1);
+    let operation_id = limited_string(operation, "operationId", 1, 128)?;
+    if !valid_operation_id(&operation_id) {
+        return Err(invalid(format!("{context} ID is invalid")));
+    }
+    let track_id = integer(operation, "trackId")?;
+    if track_id == 0 {
+        return Err(invalid(format!(
+            "{context} trackId must be greater than zero"
+        )));
+    }
+    let project_version = integer(operation, "projectVersion")?;
+    if project_version > current_version {
+        return Err(invalid(format!(
+            "{context} projectVersion cannot exceed the project version"
+        )));
+    }
+    let role = match operation.get("role") {
+        Some(JsonValue::Null) => None,
+        Some(_) => Some(
+            TrackRole::from_name(string(operation, "role")?)
+                .ok_or_else(|| invalid(format!("{context} role is invalid")))?,
+        ),
+        None => return Err(invalid(format!("{context} role is required"))),
+    };
+    let action = match string(operation, "action")? {
+        "add" if role.is_some() => ChannelOperationAction::Add,
+        "delete" if role.is_none() => ChannelOperationAction::Delete,
+        _ => {
+            return Err(invalid(format!(
+                "{context} action and role are inconsistent"
+            )));
+        }
+    };
+    Ok(ChannelOperation {
+        operation_id,
+        action,
+        track_id,
+        role,
+        project_version,
+    })
+}
+
+fn valid_operation_id(operation_id: &str) -> bool {
+    !operation_id.is_empty()
+        && operation_id.len() <= 128
+        && operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn parse_regional_edit(
@@ -911,6 +1074,28 @@ mod tests {
         let source = studio.project().to_json();
         let parsed = parse_project(&source).expect("valid edited graph");
         assert_eq!(parsed.to_json(), source);
+    }
+
+    #[test]
+    fn legacy_edit_operation_ids_remain_saveable() {
+        let mut studio = crate::model::Studio::new();
+        studio
+            .apply_prompt(4.0, 8.0, "increase volume")
+            .expect("valid edit");
+        let mut legacy: JsonValue = serde_json::from_str(&studio.project().to_json()).unwrap();
+        legacy["edits"][0]["operationId"] = JsonValue::String("legacy:id".to_owned());
+        legacy
+            .as_object_mut()
+            .expect("project object")
+            .remove("editOperations");
+
+        let parsed = parse_project(&legacy.to_string()).expect("legacy operation ID");
+        assert!(parsed.edit_operations.is_empty());
+        let mut reloaded = crate::model::Studio::from_project(parsed);
+        reloaded
+            .set_mix(1, Some(0.75), None)
+            .expect("mutation after legacy load");
+        parse_project(&reloaded.project().to_json()).expect("saveable mutated project");
     }
 
     #[test]

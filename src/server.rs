@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::codex::{CodexEdit, CodexPlanner, EDIT_TIMEOUT_SECONDS};
-use crate::model::{Studio, StudioError, json_string};
+use crate::codex::{CodexEdit, CodexPlanner, EDIT_TIMEOUT_SECONDS, PlannerError};
+use crate::model::{ChannelOperationAction, Studio, StudioError, json_string};
 use crate::prompt::{EditPlan, PromptEngine};
 use crate::storage::ProjectStore;
 
@@ -158,11 +158,6 @@ impl PlannerGate {
     }
 }
 
-enum PlannedEdit {
-    Plan(EditPlan),
-    Graph(CodexEdit),
-}
-
 struct EditJobs {
     next_id: AtomicU64,
     jobs: Mutex<BTreeMap<u64, EditJob>>,
@@ -173,22 +168,16 @@ struct EditJob {
     started_at: Instant,
     finished_at: Option<Instant>,
     poll_after_ms: u64,
+    applied_steps: usize,
+    project_version: Option<u64>,
     state: EditJobState,
 }
 
 enum EditJobState {
     Queued,
-    Running {
-        phase: &'static str,
-        detail: &'static str,
-    },
-    Completed {
-        message: String,
-    },
-    Failed {
-        status: u16,
-        error: String,
-    },
+    Running { phase: &'static str, detail: String },
+    Completed { message: String },
+    Failed { status: u16, error: String },
 }
 
 struct EditRequest {
@@ -261,6 +250,8 @@ impl EditJobs {
                 started_at: Instant::now(),
                 finished_at: None,
                 poll_after_ms,
+                applied_steps: 0,
+                project_version: None,
                 state: EditJobState::Queued,
             },
         );
@@ -282,9 +273,33 @@ impl EditJobs {
         self.lock().remove(&id);
     }
 
-    fn set_running(&self, id: u64, phase: &'static str, detail: &'static str) {
+    fn set_running(&self, id: u64, phase: &'static str, detail: impl Into<String>) {
         if let Some(job) = self.lock().get_mut(&id) {
-            job.state = EditJobState::Running { phase, detail };
+            job.state = EditJobState::Running {
+                phase,
+                detail: detail.into(),
+            };
+        }
+    }
+
+    fn publish_update(&self, id: u64, project_version: u64, summary: &str) {
+        if let Some(job) = self.lock().get_mut(&id) {
+            job.applied_steps += 1;
+            job.project_version = Some(project_version);
+            job.state = EditJobState::Running {
+                phase: "editing",
+                detail: format!("Applied step {}: {summary}", job.applied_steps),
+            };
+        }
+    }
+
+    fn finalize_updates(&self, id: u64, project_version: u64) {
+        if let Some(job) = self.lock().get_mut(&id) {
+            job.project_version = Some(project_version);
+            job.state = EditJobState::Running {
+                phase: "finalizing",
+                detail: "Codex finished the sound graph edit".to_owned(),
+            };
         }
     }
 
@@ -324,6 +339,15 @@ impl EditFailure {
     }
 }
 
+fn planner_failure(error: PlannerError) -> EditFailure {
+    let status = match error {
+        PlannerError::ProjectChanged => 409,
+        PlannerError::SaveFailed => 500,
+        _ => 503,
+    };
+    EditFailure::new(status, error.to_string())
+}
+
 impl Router {
     fn new() -> io::Result<Self> {
         let planner = match std::env::var("DAW_AI_PROMPT_ENGINE") {
@@ -356,6 +380,16 @@ impl Router {
         if request.is_mutation() && !request.is_trusted_mutation(public_host) {
             return Response::json(403, error_json("cross-origin request rejected"));
         }
+        if let Some(operation_id) = edit_operation_id(&request.path) {
+            return if request.method == "GET" {
+                self.edit_operation_status(operation_id)
+            } else {
+                Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
+            };
+        }
+        if request.path.starts_with("/api/edit-operations/") {
+            return Response::json(404, error_json("edit operation not found"));
+        }
         if let Some(job_id) = edit_job_id(&request.path) {
             return if request.method == "GET" {
                 self.edit_status(job_id)
@@ -377,6 +411,7 @@ impl Router {
                 Response::json(200, studio.to_json())
             }
             ("POST", "/api/edits") => self.start_edit(&request.body),
+            ("POST", "/api/channels") => self.change_channel(&request.body),
             ("POST", "/api/mix") => self.change_mix(&request.body),
             ("POST", "/api/sound-tools") => self.change_sound_tool(&request.body),
             ("POST", "/api/logs") => Self::client_log(&request.body),
@@ -384,8 +419,8 @@ impl Router {
             ("POST", "/api/reset") => self.reset(),
             (
                 _,
-                "/api/edits" | "/api/mix" | "/api/sound-tools" | "/api/logs" | "/api/undo"
-                | "/api/reset",
+                "/api/edits" | "/api/channels" | "/api/mix" | "/api/sound-tools" | "/api/logs"
+                | "/api/undo" | "/api/reset",
             ) => Response::json(405, error_json("method not allowed")).with_header("Allow", "POST"),
             (_, "/api/project" | "/api/health") => {
                 Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
@@ -425,12 +460,12 @@ impl Router {
             studio.project().clone()
         };
         if let Some(operation_id) = operation_id {
-            if let Some(edit) = project
-                .edits
+            if let Some(operation) = project
+                .edit_operations
                 .iter()
-                .find(|edit| edit.operation_id.as_deref() == Some(operation_id))
+                .find(|operation| operation.operation_id == operation_id)
             {
-                return Response::json(200, recovered_edit_json(operation_id, edit));
+                return Response::json(200, recovered_operation_json(operation));
             }
         }
         let poll_after_ms = match &self.planner {
@@ -478,6 +513,24 @@ impl Router {
             .unwrap_or_else(|| Response::json(404, error_json("edit job not found")))
     }
 
+    fn edit_operation_status(&self, operation_id: &str) -> Response {
+        if !valid_operation_id(operation_id) {
+            return Response::json(404, error_json("edit operation not found"));
+        }
+        if let Some(response) = self.edit_jobs.response_for_operation(operation_id) {
+            return response;
+        }
+        self.lock_studio()
+            .project()
+            .edit_operations
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .map_or_else(
+                || Response::json(404, error_json("edit operation not found")),
+                |operation| Response::json(200, recovered_operation_json(operation)),
+            )
+    }
+
     fn run_edit_job(&self, job_id: u64, edit: EditRequest) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.perform_edit(job_id, edit)
@@ -505,7 +558,10 @@ impl Router {
             "planning",
             "Codex is planning and editing the sound graph",
         );
-        let planned_edit = self
+        if matches!(&self.planner, Planner::Codex) {
+            return self.perform_codex_edit(job_id, edit);
+        }
+        let plan = self
             .plan_edit(&edit.prompt, edit.start, edit.end, &edit.project)
             .map_err(|message| EditFailure::new(503, message))?;
         self.edit_jobs.set_running(
@@ -521,27 +577,108 @@ impl Router {
             ));
         }
         let mut candidate = studio.clone();
-        let result = match planned_edit {
-            PlannedEdit::Plan(plan) => candidate.apply_plan_for_operation(
-                edit.start,
-                edit.end,
-                &edit.prompt,
-                edit.operation_id,
-                plan,
-            ),
-            PlannedEdit::Graph(graph_edit) => candidate.replace_graph_for_operation(
+        let summary = candidate
+            .apply_plan_for_operation(edit.start, edit.end, &edit.prompt, edit.operation_id, plan)
+            .map_err(|error| EditFailure::new(422, studio_error_message(error)))?;
+        self.commit(&mut studio, candidate)
+            .map_err(|_| EditFailure::new(500, "could not save the sound graph"))?;
+        Ok(summary)
+    }
+
+    fn perform_codex_edit(&self, job_id: u64, edit: EditRequest) -> Result<String, EditFailure> {
+        let mut expected_version = edit.project.version;
+        let mut published_update = false;
+        let completed = CodexPlanner::interpret_with_updates(
+            &edit.prompt,
+            edit.start,
+            edit.end,
+            &edit.project,
+            |graph_edit| {
+                self.commit_codex_update(
+                    job_id,
+                    &edit,
+                    &mut expected_version,
+                    &mut published_update,
+                    graph_edit,
+                )
+            },
+        )
+        .map_err(planner_failure)?;
+        if !published_update {
+            return Err(EditFailure::new(
+                503,
+                "Codex completed without publishing a sound graph edit",
+            ));
+        }
+        self.complete_codex_operation(
+            job_id,
+            &edit,
+            &mut expected_version,
+            &completed.plan.summary,
+        )
+        .map_err(planner_failure)?;
+        Ok(completed.plan.summary)
+    }
+
+    fn commit_codex_update(
+        &self,
+        job_id: u64,
+        edit: &EditRequest,
+        expected_version: &mut u64,
+        published_update: &mut bool,
+        graph_edit: CodexEdit,
+    ) -> Result<(), PlannerError> {
+        let summary = graph_edit.plan.summary.clone();
+        let mut studio = self.lock_studio();
+        if studio.project().version != *expected_version {
+            return Err(PlannerError::ProjectChanged);
+        }
+        let mut candidate = studio.clone();
+        candidate
+            .replace_graph(
                 graph_edit.project,
                 edit.start,
                 edit.end,
                 &edit.prompt,
-                edit.operation_id,
                 graph_edit.plan,
-            ),
-        };
-        let summary = result.map_err(|error| EditFailure::new(422, studio_error_message(error)))?;
+            )
+            .map_err(|error| PlannerError::InvalidOutput(studio_error_message(error).to_owned()))?;
+        if !candidate.record_operation_step(&edit.operation_id, &summary) {
+            return Err(PlannerError::InvalidOutput(
+                "could not record the published edit operation".to_owned(),
+            ));
+        }
         self.commit(&mut studio, candidate)
-            .map_err(|_| EditFailure::new(500, "could not save the sound graph"))?;
-        Ok(summary)
+            .map_err(|_| PlannerError::SaveFailed)?;
+        *expected_version = studio.project().version;
+        *published_update = true;
+        self.edit_jobs
+            .publish_update(job_id, *expected_version, &summary);
+        Ok(())
+    }
+
+    fn complete_codex_operation(
+        &self,
+        job_id: u64,
+        edit: &EditRequest,
+        expected_version: &mut u64,
+        message: &str,
+    ) -> Result<(), PlannerError> {
+        let mut studio = self.lock_studio();
+        if studio.project().version != *expected_version {
+            return Err(PlannerError::ProjectChanged);
+        }
+        let mut candidate = studio.clone();
+        if !candidate.mark_operation_complete(&edit.operation_id, message) {
+            return Err(PlannerError::InvalidOutput(
+                "could not mark the completed edit operation".to_owned(),
+            ));
+        }
+        self.commit(&mut studio, candidate)
+            .map_err(|_| PlannerError::SaveFailed)?;
+        *expected_version = studio.project().version;
+        self.edit_jobs.finalize_updates(job_id, *expected_version);
+        Ok(())
     }
 
     fn plan_edit(
@@ -550,20 +687,14 @@ impl Router {
         start: f32,
         end: f32,
         project: &crate::model::Project,
-    ) -> Result<PlannedEdit, String> {
+    ) -> Result<EditPlan, String> {
         match &self.planner {
-            Planner::Demo => Ok(PlannedEdit::Plan(PromptEngine::interpret_project(
-                prompt, project, start, end,
-            ))),
-            Planner::Codex => CodexPlanner::interpret(prompt, start, end, project)
-                .map(PlannedEdit::Graph)
-                .map_err(|error| error.to_string()),
+            Planner::Demo => Ok(PromptEngine::interpret_project(prompt, project, start, end)),
+            Planner::Codex => unreachable!("Codex edits use incremental planning"),
             #[cfg(test)]
             Planner::GatedDemo(gate) => {
                 gate.wait_until_released();
-                Ok(PlannedEdit::Plan(PromptEngine::interpret_project(
-                    prompt, project, start, end,
-                )))
+                Ok(PromptEngine::interpret_project(prompt, project, start, end))
             }
         }
     }
@@ -597,6 +728,84 @@ impl Router {
                 Ok(()) => Response::json(200, studio.to_json()),
                 Err(response) => response,
             },
+            Err(error) => Response::json(422, studio_error(error)),
+        }
+    }
+
+    fn change_channel(&self, body: &str) -> Response {
+        let form = parse_form(body);
+        let operation_id = form.get("operation_id").map(String::as_str);
+        if operation_id.is_some_and(|operation_id| !valid_operation_id(operation_id)) {
+            return Response::json(422, error_json("operation ID is invalid"));
+        }
+        #[derive(Clone, Copy)]
+        enum Change {
+            Add(crate::model::TrackRole),
+            Delete(u64),
+        }
+        let change = match form.get("action").map(String::as_str) {
+            Some("add") => form
+                .get("role")
+                .and_then(|role| crate::model::TrackRole::from_name(role))
+                .map(Change::Add),
+            Some("delete") => form
+                .get("track_id")
+                .and_then(|track_id| track_id.parse::<u64>().ok())
+                .map(Change::Delete),
+            _ => None,
+        };
+        let Some(change) = change else {
+            return Response::json(422, studio_error(StudioError::InvalidChannel));
+        };
+        let mut studio = self.lock_studio();
+        if let Some(operation_id) = operation_id {
+            if let Some(recorded) = studio
+                .project()
+                .channel_operations
+                .iter()
+                .find(|recorded| recorded.operation_id == operation_id)
+            {
+                let matches = match change {
+                    Change::Add(role) => {
+                        recorded.action == ChannelOperationAction::Add
+                            && recorded.role == Some(role)
+                    }
+                    Change::Delete(track_id) => {
+                        recorded.action == ChannelOperationAction::Delete
+                            && recorded.track_id == track_id
+                    }
+                };
+                return if matches {
+                    Response::json(200, studio.to_json())
+                } else {
+                    Response::json(409, error_json("channel operation ID was already used"))
+                };
+            }
+        }
+        let mut candidate = studio.clone();
+        let result = match change {
+            Change::Add(role) => candidate
+                .add_channel(role)
+                .map(|track_id| (ChannelOperationAction::Add, track_id, Some(role))),
+            Change::Delete(track_id) => candidate
+                .delete_channel(track_id)
+                .map(|()| (ChannelOperationAction::Delete, track_id, None)),
+        };
+        match result {
+            Ok((action, track_id, role)) => {
+                if operation_id.is_some_and(|operation_id| {
+                    !candidate.record_channel_operation(operation_id, action, track_id, role)
+                }) {
+                    return Response::json(
+                        409,
+                        error_json("channel operation ID was already used"),
+                    );
+                }
+                match self.commit(&mut studio, candidate) {
+                    Ok(()) => Response::json(200, studio.to_json()),
+                    Err(response) => response,
+                }
+            }
             Err(error) => Response::json(422, studio_error(error)),
         }
     }
@@ -818,6 +1027,7 @@ impl Request {
                 "/api/edits"
                     | "/api/mix"
                     | "/api/sound-tools"
+                    | "/api/channels"
                     | "/api/logs"
                     | "/api/undo"
                     | "/api/reset"
@@ -945,17 +1155,32 @@ fn valid_operation_id(operation_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-fn recovered_edit_json(operation_id: &str, edit: &crate::model::Edit) -> String {
-    format!(
+fn recovered_operation_json(operation: &crate::model::EditOperation) -> String {
+    let common = format!(
         concat!(
-            "{{\"id\":\"recovered\",\"operationId\":{},\"status\":\"completed\",",
-            "\"phase\":\"completed\",\"message\":{},\"elapsedSeconds\":0,",
-            "\"timeoutSeconds\":{}}}"
+            "\"id\":\"recovered\",\"operationId\":{},\"elapsedSeconds\":0,",
+            "\"timeoutSeconds\":{},\"appliedSteps\":{},\"projectVersion\":{}"
         ),
-        json_string(operation_id),
-        json_string(&edit.summary),
-        EDIT_TIMEOUT_SECONDS
-    )
+        json_string(&operation.operation_id),
+        EDIT_TIMEOUT_SECONDS,
+        operation.applied_steps,
+        operation.project_version
+    );
+    if operation.completed {
+        format!(
+            "{{{common},\"status\":\"completed\",\"phase\":\"completed\",\"message\":{}}}",
+            json_string(&operation.message)
+        )
+    } else {
+        format!(
+            concat!(
+                "{{{},\"status\":\"failed\",\"phase\":\"failed\",",
+                "\"errorStatus\":500,",
+                "\"error\":\"Codex stopped before completing the edit.\"}}"
+            ),
+            common
+        )
+    }
 }
 
 fn accepted_edit_job_json(id: u64, operation_id: &str, poll_after_ms: u64) -> String {
@@ -963,6 +1188,7 @@ fn accepted_edit_job_json(id: u64, operation_id: &str, poll_after_ms: u64) -> St
         concat!(
             "{{\"id\":\"{}\",\"operationId\":{},\"status\":\"queued\",\"phase\":\"queued\",",
             "\"detail\":\"Waiting for the edit worker\",\"elapsedSeconds\":0,",
+            "\"appliedSteps\":0,\"projectVersion\":null,",
             "\"timeoutSeconds\":{},\"pollAfterMs\":{}}}"
         ),
         id,
@@ -975,12 +1201,20 @@ fn accepted_edit_job_json(id: u64, operation_id: &str, poll_after_ms: u64) -> St
 fn edit_job_json(id: u64, job: &EditJob) -> String {
     let ended_at = job.finished_at.unwrap_or_else(Instant::now);
     let elapsed = ended_at.saturating_duration_since(job.started_at).as_secs();
+    let project_version = job
+        .project_version
+        .map_or_else(|| "null".to_owned(), |version| version.to_string());
     let common = format!(
-        "\"id\":\"{}\",\"operationId\":{},\"elapsedSeconds\":{},\"timeoutSeconds\":{}",
+        concat!(
+            "\"id\":\"{}\",\"operationId\":{},\"elapsedSeconds\":{},",
+            "\"timeoutSeconds\":{},\"appliedSteps\":{},\"projectVersion\":{}"
+        ),
         id,
         json_string(&job.operation_id),
         elapsed,
-        EDIT_TIMEOUT_SECONDS
+        EDIT_TIMEOUT_SECONDS,
+        job.applied_steps,
+        project_version
     );
     match &job.state {
         EditJobState::Queued => format!(
@@ -1020,6 +1254,11 @@ fn edit_job_id(path: &str) -> Option<u64> {
     (!id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
         .then(|| id.parse::<u64>().ok())
         .flatten()
+}
+
+fn edit_operation_id(path: &str) -> Option<&str> {
+    let operation_id = path.strip_prefix("/api/edit-operations/")?;
+    valid_operation_id(operation_id).then_some(operation_id)
 }
 
 fn parse_form(body: &str) -> HashMap<String, String> {
@@ -1188,6 +1427,7 @@ const fn studio_error_message(error: StudioError) -> &'static str {
         StudioError::InvalidSelection => "select a valid part of the track",
         StudioError::UnknownTrack => "track not found",
         StudioError::InvalidMix => "invalid mixer setting",
+        StudioError::InvalidChannel => "invalid channel change",
         StudioError::UnknownSoundTool => "sound tool not found",
         StudioError::InvalidSoundTool => "invalid sound tool setting",
     }
@@ -1281,6 +1521,17 @@ mod tests {
         assert_eq!(running["detail"], "Codex is arranging the requested change");
         assert_eq!(running["pollAfterMs"], 750);
         assert_eq!(running["operationId"], operation_id);
+        assert_eq!(running["appliedSteps"], 0);
+        assert!(running["projectVersion"].is_null());
+
+        jobs.publish_update(id, 7, "Added a bass layer");
+        let updated: serde_json::Value =
+            serde_json::from_str(&jobs.response(id).expect("updated job response").body)
+                .expect("updated job JSON");
+        assert_eq!(updated["phase"], "editing");
+        assert_eq!(updated["detail"], "Applied step 1: Added a bass layer");
+        assert_eq!(updated["appliedSteps"], 1);
+        assert_eq!(updated["projectVersion"], 7);
 
         jobs.fail(id, 503, "Codex timed out".to_owned());
         let failed: serde_json::Value =
@@ -1349,6 +1600,382 @@ mod tests {
         assert_eq!(invalid.status, 422);
         let project = router.handle(&request("GET", "/api/project", ""));
         assert!(project.body.contains("\"waveform\":\"sawtooth\""));
+    }
+
+    #[test]
+    fn channel_api_adds_and_deletes_complete_tracks() {
+        let router = Router::demo();
+        let added = router.handle(&request(
+            "POST",
+            "/api/channels",
+            "operation_id=add-lead&action=add&role=lead",
+        ));
+        assert_eq!(added.status, 200);
+        let added: serde_json::Value = serde_json::from_str(&added.body).expect("added project");
+        let tracks = added["tracks"].as_array().expect("tracks");
+        assert_eq!(tracks.len(), 4);
+        let lead = tracks.last().expect("lead track");
+        assert_eq!(lead["role"], "lead");
+        assert_eq!(lead["clips"][0]["start"], 0.0);
+        assert_eq!(lead["clips"][0]["end"], added["duration"]);
+        let track_id = lead["id"].as_u64().expect("lead track ID");
+        assert_eq!(added["channelOperations"][0]["operationId"], "add-lead");
+        assert_eq!(added["channelOperations"][0]["trackId"], track_id);
+        let duplicate = router.handle(&request(
+            "POST",
+            "/api/channels",
+            "operation_id=add-lead&action=add&role=lead",
+        ));
+        assert_eq!(duplicate.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&duplicate.body).expect("duplicate add")
+                ["tracks"]
+                .as_array()
+                .expect("tracks")
+                .len(),
+            4
+        );
+        assert_eq!(
+            router
+                .handle(&request(
+                    "POST",
+                    "/api/channels",
+                    "operation_id=add-lead&action=add&role=texture",
+                ))
+                .status,
+            409
+        );
+
+        let deleted = router.handle(&request(
+            "POST",
+            "/api/channels",
+            &format!("operation_id=delete-lead&action=delete&track_id={track_id}"),
+        ));
+        assert_eq!(deleted.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&deleted.body)
+                .expect("deleted project")["tracks"]
+                .as_array()
+                .expect("tracks")
+                .len(),
+            3
+        );
+        assert_eq!(
+            router
+                .handle(&request("POST", "/api/channels", "action=add&role=unknown"))
+                .status,
+            422
+        );
+    }
+
+    #[test]
+    fn codex_updates_commit_as_incremental_recoverable_steps() {
+        let router = Router::demo();
+        let (job_id, operation_id, _) = router.edit_jobs.create(750, None).expect("edit job");
+        let project = router.lock_studio().project().clone();
+        let edit = EditRequest {
+            operation_id: operation_id.clone(),
+            prompt: "shape the bass in two steps".to_owned(),
+            start: 4.0,
+            end: 8.0,
+            project: project.clone(),
+        };
+        let plan = |waveform: &str, summary: &str| EditPlan {
+            action: crate::prompt::Action::Configure {
+                track_id: 2,
+                target: crate::model::TrackRole::Bass,
+                tool: "instrument",
+                tool_id: 201,
+                clip_id: None,
+                parameter: "waveform",
+                value: waveform.to_owned(),
+            },
+            summary: summary.to_owned(),
+        };
+        let mut session = Studio::from_project(project);
+        let first_plan = plan("sawtooth", "Brightened the bass");
+        session
+            .apply_plan(4.0, 8.0, &edit.prompt, first_plan.clone())
+            .expect("first session step");
+        let mut expected_version = edit.project.version;
+        let mut published_update = false;
+        router
+            .commit_codex_update(
+                job_id,
+                &edit,
+                &mut expected_version,
+                &mut published_update,
+                CodexEdit {
+                    plan: first_plan,
+                    project: session.project().clone(),
+                },
+            )
+            .expect("first live step");
+        assert!(
+            router
+                .lock_studio()
+                .project()
+                .edits
+                .iter()
+                .all(|edit| edit.operation_id.is_none())
+        );
+
+        let second_plan = plan("triangle", "Softened the bass");
+        session
+            .apply_plan(4.0, 8.0, &edit.prompt, second_plan.clone())
+            .expect("second session step");
+        router
+            .commit_codex_update(
+                job_id,
+                &edit,
+                &mut expected_version,
+                &mut published_update,
+                CodexEdit {
+                    plan: second_plan,
+                    project: session.project().clone(),
+                },
+            )
+            .expect("second live step");
+        router
+            .complete_codex_operation(
+                job_id,
+                &edit,
+                &mut expected_version,
+                "Finished shaping the bass",
+            )
+            .expect("terminal operation marker");
+
+        let studio = router.lock_studio();
+        assert_eq!(studio.project().version, 4);
+        assert_eq!(studio.project().tracks[1].instrument.waveform, "triangle");
+        assert_eq!(studio.project().edits.len(), 2);
+        assert!(
+            studio
+                .project()
+                .edits
+                .iter()
+                .all(|edit| edit.operation_id.is_none())
+        );
+        let operation = &studio.project().edit_operations[0];
+        assert_eq!(operation.operation_id, operation_id);
+        assert!(operation.completed);
+        assert_eq!(operation.applied_steps, 2);
+        assert_eq!(operation.message, "Finished shaping the bass");
+        crate::model::Project::from_json(&studio.project().to_json())
+            .expect("persistable incremental graph");
+        drop(studio);
+
+        let status: serde_json::Value = serde_json::from_str(
+            &router
+                .edit_jobs
+                .response(job_id)
+                .expect("incremental job status")
+                .body,
+        )
+        .expect("incremental job JSON");
+        assert_eq!(status["appliedSteps"], 2);
+        assert_eq!(status["projectVersion"], 4);
+        assert_eq!(status["phase"], "finalizing");
+
+        router.edit_jobs.remove(job_id);
+        let recovered = router.handle(&request(
+            "POST",
+            "/api/edits",
+            &format!(
+                "operation_id={operation_id}&start=4&end=8&prompt=shape+the+bass+in+two+steps"
+            ),
+        ));
+        assert_eq!(recovered.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recovered.body)
+                .expect("recovered terminal operation")["status"],
+            "completed"
+        );
+    }
+
+    #[test]
+    fn partial_codex_update_is_not_recovered_as_a_completed_operation() {
+        let router = Router::demo();
+        let (job_id, operation_id, _) = router.edit_jobs.create(750, None).expect("edit job");
+        let project = router.lock_studio().project().clone();
+        let edit = EditRequest {
+            operation_id: operation_id.clone(),
+            prompt: "shape the bass in two steps".to_owned(),
+            start: 4.0,
+            end: 8.0,
+            project: project.clone(),
+        };
+        let first_plan = EditPlan {
+            action: crate::prompt::Action::Configure {
+                track_id: 2,
+                target: crate::model::TrackRole::Bass,
+                tool: "instrument",
+                tool_id: 201,
+                clip_id: None,
+                parameter: "waveform",
+                value: "sawtooth".to_owned(),
+            },
+            summary: "Brightened the bass".to_owned(),
+        };
+        let mut session = Studio::from_project(project);
+        session
+            .apply_plan(4.0, 8.0, &edit.prompt, first_plan.clone())
+            .expect("first of two session steps");
+        let mut expected_version = edit.project.version;
+        let mut published_update = false;
+        router
+            .commit_codex_update(
+                job_id,
+                &edit,
+                &mut expected_version,
+                &mut published_update,
+                CodexEdit {
+                    plan: first_plan,
+                    project: session.project().clone(),
+                },
+            )
+            .expect("first live step");
+        assert!(
+            router
+                .lock_studio()
+                .project()
+                .edits
+                .iter()
+                .all(|edit| edit.operation_id.as_deref() != Some(operation_id.as_str()))
+        );
+
+        router.edit_jobs.remove(job_id);
+        let persisted = crate::model::Project::from_json(&router.lock_studio().project().to_json())
+            .expect("persisted partial operation");
+        let restarted = Router {
+            studio: Arc::new(Mutex::new(Studio::from_project(persisted))),
+            store: None,
+            planner: Planner::Demo,
+            edit_jobs: Arc::new(EditJobs::new()),
+        };
+        let retried = restarted.handle(&request(
+            "POST",
+            "/api/edits",
+            &format!(
+                "operation_id={operation_id}&start=4&end=8&prompt=shape+the+bass+in+two+steps"
+            ),
+        ));
+        assert_eq!(retried.status, 200);
+        let retried_json: serde_json::Value =
+            serde_json::from_str(&retried.body).expect("retried edit job");
+        assert_eq!(retried_json["status"], "failed");
+        assert_eq!(retried_json["operationId"], operation_id);
+        assert_eq!(retried_json["appliedSteps"], 1);
+        assert_eq!(retried_json["projectVersion"], expected_version);
+        let recovered = restarted.handle(&request(
+            "GET",
+            &format!("/api/edit-operations/{operation_id}"),
+            "",
+        ));
+        assert_eq!(recovered.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recovered.body)
+                .expect("recovered partial operation")["status"],
+            "failed"
+        );
+    }
+
+    #[test]
+    fn codex_completion_is_independent_of_edit_log_compaction() {
+        let router = Router::demo();
+        let mut populated = Studio::new();
+        let regional_plan = || EditPlan {
+            action: crate::prompt::Action::Gain {
+                amount: 1.0,
+                target: Some(crate::model::TrackRole::Bass),
+            },
+            summary: "Retained regional state".to_owned(),
+        };
+        for _ in 1..crate::model::EDIT_LOG_LIMIT {
+            populated
+                .apply_plan(4.0, 8.0, "retain regional state", regional_plan())
+                .expect("regional edit");
+        }
+        populated
+            .apply_plan_for_operation(
+                4.0,
+                8.0,
+                "retain prior operation identity",
+                "previous-operation".to_owned(),
+                regional_plan(),
+            )
+            .expect("prior operation");
+        let project = populated.project().clone();
+        *router.lock_studio() = Studio::from_project(project.clone());
+
+        let (job_id, operation_id, _) = router.edit_jobs.create(750, None).expect("edit job");
+        let edit = EditRequest {
+            operation_id: operation_id.clone(),
+            prompt: "change the bass waveform".to_owned(),
+            start: 4.0,
+            end: 8.0,
+            project: project.clone(),
+        };
+        let plan = EditPlan {
+            action: crate::prompt::Action::Configure {
+                track_id: 2,
+                target: crate::model::TrackRole::Bass,
+                tool: "instrument",
+                tool_id: 201,
+                clip_id: None,
+                parameter: "waveform",
+                value: "sawtooth".to_owned(),
+            },
+            summary: "Changed the bass waveform".to_owned(),
+        };
+        let mut session = Studio::from_project(project);
+        session
+            .apply_plan(4.0, 8.0, &edit.prompt, plan.clone())
+            .expect("nonregional Codex edit");
+        let mut expected_version = edit.project.version;
+        let mut published_update = false;
+        router
+            .commit_codex_update(
+                job_id,
+                &edit,
+                &mut expected_version,
+                &mut published_update,
+                CodexEdit {
+                    plan,
+                    project: session.project().clone(),
+                },
+            )
+            .expect("compacted Codex update");
+        router
+            .complete_codex_operation(
+                job_id,
+                &edit,
+                &mut expected_version,
+                "Changed the bass waveform",
+            )
+            .expect("independent completion record");
+
+        let studio = router.lock_studio();
+        assert_eq!(studio.project().edits.len(), crate::model::EDIT_LOG_LIMIT);
+        assert_eq!(
+            studio
+                .project()
+                .edits
+                .last()
+                .and_then(|edit| edit.operation_id.as_deref()),
+            Some("previous-operation")
+        );
+        let completed = studio
+            .project()
+            .edit_operations
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("Codex operation record");
+        assert!(completed.completed);
+        assert_eq!(completed.message, "Changed the bass waveform");
+        assert!(studio.project().edit_operations.iter().any(|operation| {
+            operation.operation_id == "previous-operation" && operation.completed
+        }));
     }
 
     #[test]
