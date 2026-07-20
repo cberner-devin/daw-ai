@@ -17,6 +17,7 @@ pub(crate) const MCP_SESSION_ENV: &str = "DAW_AI_MCP_SESSION";
 pub(crate) const MCP_TOOL_NAME: &str = "apply_sound_graph_edits";
 pub(crate) const MEL_TOOL_NAME: &str = "render_mel_spectrogram";
 pub(crate) const ANALYZE_TOOL_NAME: &str = "analyze_audio_region";
+pub(crate) const GRAPH_RESOURCE_URI: &str = "daw-ai://sound-graph/current";
 const GRAPH_FILE: &str = "sound-graph.json";
 const REQUEST_FILE: &str = "request.json";
 const PROGRESS_DIRECTORY: &str = "edit-progress";
@@ -183,6 +184,10 @@ fn handle_message(source: &str, session_path: &Path) -> Option<String> {
         "notifications/initialized" | "notifications/cancelled" => None,
         "initialize" => id.map(|id| initialize_response(&id, request.get("params"))),
         "ping" => id.map(|id| json_rpc_result(&id, "{}")),
+        "resources/list" => id.map(|id| resources_response(&id)),
+        "resources/read" => {
+            id.map(|id| read_resource_response(&id, request.get("params"), session_path))
+        }
         "tools/list" => id.map(|id| tools_response(&id)),
         "tools/call" => id.map(|id| call_tool_response(&id, request.get("params"), session_path)),
         _ => id.map(|id| json_rpc_error(&id, -32601, "method not found")),
@@ -197,18 +202,70 @@ fn initialize_response(id: &str, params: Option<&JsonValue>) -> String {
         .unwrap_or("2025-06-18");
     json_rpc_result(
         id,
-        &format!(
-            concat!(
-                "{{\"protocolVersion\":{},\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},",
-                "\"serverInfo\":{{\"name\":\"daw-ai\",\"version\":{}}},",
-                "\"instructions\":{}}}"
-            ),
-            json_string(protocol),
-            json_string(env!("CARGO_PKG_VERSION")),
-            json_string(
-                "Read sound-graph.json before editing. Work in an edit, listen, and evaluate loop: apply each intended change through apply_sound_graph_edits, use the read-only listening tools on the updated graph, compare the result with the request, and repeat until complete. There is no predetermined iteration or tool-call limit; only the overall session timeout limits the loop."
+        &serde_json::json!({
+            "protocolVersion": protocol,
+            "capabilities": {
+                "resources": {"subscribe": false, "listChanged": false},
+                "tools": {"listChanged": false}
+            },
+            "serverInfo": {
+                "name": "daw-ai",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "instructions": format!(
+                "Read the current sound graph from the registered {GRAPH_RESOURCE_URI} MCP resource before editing. Work in an edit, listen, and evaluate loop: apply each intended change through apply_sound_graph_edits, use the read-only listening tools on the updated graph, compare the result with the request, and repeat until complete. There is no predetermined iteration or tool-call limit; only the overall session timeout limits the loop."
             )
-        ),
+        })
+        .to_string(),
+    )
+}
+
+fn resources_response(id: &str) -> String {
+    json_rpc_result(
+        id,
+        &serde_json::json!({
+            "resources": [{
+                "uri": GRAPH_RESOURCE_URI,
+                "name": GRAPH_FILE,
+                "description": "The latest DAW-AI sound graph, including stable channel, instrument, effect, modulator, clip, event, modulation-target, and routing IDs.",
+                "mimeType": "application/json"
+            }]
+        })
+        .to_string(),
+    )
+}
+
+fn read_resource_response(id: &str, params: Option<&JsonValue>, session_path: &Path) -> String {
+    let Some(uri) = params
+        .and_then(JsonValue::as_object)
+        .and_then(|params| params.get("uri"))
+        .and_then(JsonValue::as_str)
+    else {
+        return json_rpc_error(id, -32602, "resources/read requires a string uri");
+    };
+    if uri != GRAPH_RESOURCE_URI {
+        return json_rpc_error(id, -32602, "unknown DAW-AI resource URI");
+    }
+    let source = match fs::read_to_string(session_path.join(GRAPH_FILE)) {
+        Ok(source) => source,
+        Err(error) => {
+            return json_rpc_error(
+                id,
+                -32603,
+                &format!("could not read current sound graph: {error}"),
+            );
+        }
+    };
+    json_rpc_result(
+        id,
+        &serde_json::json!({
+            "contents": [{
+                "uri": GRAPH_RESOURCE_URI,
+                "mimeType": "application/json",
+                "text": source
+            }]
+        })
+        .to_string(),
     )
 }
 
@@ -223,7 +280,7 @@ fn tools_response(id: &str) -> String {
             "tools": [
                 {
                     "name": MCP_TOOL_NAME,
-                    "description": "Apply one validated batch of generic MIDI clip, instrument, effect, modulator, routing, mix, arrangement, or tempo operations to sound-graph.json. Returns a precise validation error without changing the graph when the batch is invalid. Use as many focused batches as needed in an edit, listen, and evaluate loop.",
+                    "description": "Apply one validated batch of generic MIDI clip, instrument, effect, modulator, routing, mix, arrangement, or tempo operations to the current sound graph. Returns a precise validation error without changing the graph when the batch is invalid. A successful response includes the current channel and stable sound-tool IDs; the full updated graph is available from the registered MCP resource. Use as many focused batches as needed in an edit, listen, and evaluate loop.",
                     "inputSchema": edit_schema,
                     "annotations": {
                         "title": "Apply sound graph edits",
@@ -498,10 +555,45 @@ fn apply_graph_edits(session_path: &Path, source: &str) -> Result<String, String
             )),
         };
     }
-    Ok(format!(
-        "Applied {new_action_count} action(s) and updated sound-graph.json to version {}: {summary}",
-        studio.project().version
-    ))
+    Ok(serde_json::json!({
+        "message": format!(
+            "Applied {new_action_count} action(s) and updated the sound graph to version {}: {summary}",
+            studio.project().version
+        ),
+        "version": studio.project().version,
+        "summary": summary,
+        "graphResource": GRAPH_RESOURCE_URI,
+        "channels": sound_tool_inventory(studio.project())
+    })
+    .to_string())
+}
+
+fn sound_tool_inventory(project: &Project) -> Vec<JsonValue> {
+    project
+        .tracks
+        .iter()
+        .map(|track| {
+            serde_json::json!({
+                "id": track.id,
+                "name": track.name,
+                "role": track.role.as_str(),
+                "instrumentId": track.instrument.id,
+                "effects": track.effects.iter().map(|effect| {
+                    serde_json::json!({"id": effect.id, "name": effect.name})
+                }).collect::<Vec<_>>(),
+                "modulators": track.modulators.iter().map(|modulator| {
+                    serde_json::json!({
+                        "id": modulator.id,
+                        "name": modulator.name,
+                        "target": modulator.target
+                    })
+                }).collect::<Vec<_>>(),
+                "clips": track.clips.iter().map(|clip| {
+                    serde_json::json!({"id": clip.id, "label": clip.label})
+                }).collect::<Vec<_>>()
+            })
+        })
+        .collect()
 }
 
 fn wait_for_progress_handoff(session_path: &Path) {
@@ -725,6 +817,16 @@ mod tests {
         .to_string()
     }
 
+    fn resource_read(id: u64, uri: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "resources/read",
+            "params": {"uri": uri}
+        })
+        .to_string()
+    }
+
     fn session_entries(session: &EditSession) -> Vec<String> {
         let mut entries = fs::read_dir(session.path())
             .expect("session directory")
@@ -781,6 +883,16 @@ mod tests {
         let second = handle_message(&tool_call(4, 201, "triangle"), session.path())
             .expect("second tool response");
         assert!(second.contains("\"isError\":false"));
+        let second: JsonValue = serde_json::from_str(&second).expect("tool response envelope");
+        let result = second["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool response text");
+        let result: JsonValue = serde_json::from_str(result).expect("tool response inventory");
+        assert_eq!(result["graphResource"], GRAPH_RESOURCE_URI);
+        assert_eq!(result["channels"][1]["id"], 2);
+        assert_eq!(result["channels"][1]["instrumentId"], 201);
+        assert_eq!(result["channels"][1]["effects"][0]["id"], 210);
+        assert_eq!(result["channels"][1]["modulators"][0]["id"], 250);
         let second_update = session
             .take_update()
             .expect("second published update")
@@ -793,6 +905,66 @@ mod tests {
             .expect("completed graph edit");
         assert_eq!(plan.summary, "Changed the bass waveform");
         assert_eq!(graph.tracks[1].instrument.waveform, "triangle");
+    }
+
+    #[test]
+    fn serves_the_latest_sound_graph_as_an_mcp_resource() {
+        let session = EditSession::create(&Project::demo(), "inspect the graph", 0.0, 8.0)
+            .expect("edit session");
+
+        let initialize = handle_message(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            session.path(),
+        )
+        .expect("initialize response");
+        let initialize: JsonValue = serde_json::from_str(&initialize).expect("initialize envelope");
+        assert_eq!(
+            initialize["result"]["capabilities"]["resources"]["listChanged"],
+            false
+        );
+
+        let resources = handle_message(
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/list"}"#,
+            session.path(),
+        )
+        .expect("resource list response");
+        let resources: JsonValue =
+            serde_json::from_str(&resources).expect("resource list envelope");
+        assert_eq!(
+            resources["result"]["resources"][0]["uri"],
+            GRAPH_RESOURCE_URI
+        );
+        assert_eq!(
+            resources["result"]["resources"][0]["mimeType"],
+            "application/json"
+        );
+
+        let edit =
+            handle_message(&tool_call(3, 201, "sawtooth"), session.path()).expect("edit response");
+        assert!(edit.contains("\"isError\":false"));
+        let (_, updated) = session
+            .take_update()
+            .expect("published update")
+            .expect("update");
+
+        let resource = handle_message(&resource_read(4, GRAPH_RESOURCE_URI), session.path())
+            .expect("resource read response");
+        let resource: JsonValue = serde_json::from_str(&resource).expect("resource read envelope");
+        let source = resource["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("resource text");
+        let graph: JsonValue = serde_json::from_str(source).expect("resource graph");
+        assert_eq!(graph["version"], updated.version);
+        assert_eq!(graph["tracks"][1]["instrument"]["id"], 201);
+        assert_eq!(graph["tracks"][1]["instrument"]["waveform"], "sawtooth");
+
+        let invalid = handle_message(
+            &resource_read(5, "daw-ai://sound-graph/missing"),
+            session.path(),
+        )
+        .expect("invalid resource response");
+        let invalid: JsonValue = serde_json::from_str(&invalid).expect("invalid resource envelope");
+        assert_eq!(invalid["error"]["code"], -32602);
     }
 
     #[test]

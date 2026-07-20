@@ -1,10 +1,10 @@
 # DAW-AI synth edit contract
 
-DAW-AI is a deterministic browser synthesizer. Read `sound-graph.json`, make a musical plan, and express it with small sound-graph operations. The registered `apply_sound_graph_edits` tool validates each batch, updates the file, and returns an actionable error without changing the graph when a batch is invalid.
+DAW-AI is a deterministic browser synthesizer. Read the registered `daw-ai://sound-graph/current` MCP resource, make a musical plan, and express it with small sound-graph operations. The local `sound-graph.json` file mirrors that resource but may be inaccessible to shell commands under a hardened service sandbox. The registered `apply_sound_graph_edits` tool validates each batch, updates the graph, and returns an actionable error without changing it when a batch is invalid.
 
 ## Sound graph
 
-The `sound-graph.json` file in the current directory is the source of truth for this edit session. Each track is represented as explicit sound tools:
+The `daw-ai://sound-graph/current` resource is the source of truth for this edit session and always returns the latest graph. Re-read it after a batch when follow-up configuration needs newly created stable IDs. Each track is represented as explicit sound tools:
 
 - `clips` are MIDI clips with beat-relative note events. Every event has `time`, `duration`, MIDI `pitch`, and normalized `velocity`; drum-track pitches use General MIDI conventions. The synthesized groups cover kicks 35–36, snares and claps 37–40, toms 41/43/45/47/48/50, hats 42/44/46, cymbals 49/51/52/53/55/57/59, and auxiliary percussion 54/56/58/60–81. `loopBeats` controls repetition inside the clip's second-based `start`/`end` range. `sourceStart` is the read-only loop-phase anchor and can precede `start` when an edit retains the right side of a clip.
 - `instrument` contains at least two `oscillators`, each with an independently configurable `waveform`, semitone `tuning` (-24 to 24), and `level` (0 to 1), plus numeric `attack`, `release`, and `tone` parameters. The top-level `waveform` mirrors oscillator 1 for compatibility.
@@ -68,7 +68,7 @@ Supported effect names are `Reverb`, `Room`, `Echo`, `Chorus`, `Low-pass filter`
 
 Actions are applied in order. Place `add-track` before any role-based MIDI clip, instrument, or modulator action that depends on the new track. Stable effect targets bind to the matching-role track that owns that effect ID. Never invent stable IDs for a newly added track in the same plan; use `trackId: 0` for its MIDI clip.
 
-Always finish graph work through `apply_sound_graph_edits`, even if you inspected or directly edited the JSON file. Read the returned validation error, correct the IDs, ranges, routing, or operation order it identifies, and call the tool again. Do not stop after only describing a change.
+Always finish graph work through `apply_sound_graph_edits`, even if you inspected or directly edited the JSON file. A successful response includes the current channel and stable sound-tool IDs and identifies the graph resource. Read the resource again when the full updated graph is useful. Read any validation error, correct the IDs, ranges, routing, or operation order it identifies, and call the tool again. Do not stop after only describing a change.
 
 ## Musical examples
 
