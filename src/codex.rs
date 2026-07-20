@@ -382,8 +382,10 @@ pub fn run_mcp() -> std::io::Result<()> {
 fn planner_task(prompt: &str, start: f32, end: f32) -> String {
     format!(
         concat!(
-            "You are the sound-graph editing engine inside DAW-AI. Read sound-graph.json in ",
-            "the current directory before deciding what to change. Operate in an implementation ",
+            "You are the sound-graph editing engine inside DAW-AI. Read the current graph from ",
+            "the registered {resource} MCP resource before deciding what to change; use the local ",
+            "sound-graph.json file only as a fallback. Re-read the resource after edits when you ",
+            "need newly created stable IDs. Operate in an implementation ",
             "loop: form or refine a musical plan from the request, current graph, and registered ",
             "read-only listening tools; use the registered daw_ai {tool} tool to apply the next ",
             "coherent graph batch; use the listening tools on the updated graph; then compare the ",
@@ -400,6 +402,7 @@ fn planner_task(prompt: &str, start: f32, end: f32) -> String {
         ),
         contract = STUDIO_CONTRACT,
         tool = MCP_TOOL_NAME,
+        resource = crate::codex_mcp::GRAPH_RESOURCE_URI,
         start = start,
         end = end,
         prompt = prompt,
@@ -798,6 +801,8 @@ mod tests {
     #[test]
     fn planner_task_requires_an_unbounded_edit_listen_evaluate_loop() {
         let task = planner_task("make the bass hit harder", 4.0, 8.0);
+        assert!(task.contains(crate::codex_mcp::GRAPH_RESOURCE_URI));
+        assert!(task.contains("sound-graph.json file only as a fallback"));
         assert!(task.contains("Operate in an implementation loop"));
         assert!(task.contains("listening tools on the updated graph"));
         assert!(task.contains("compare the result with the request and repeat"));

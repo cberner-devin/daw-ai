@@ -20,7 +20,7 @@ codex login
 codex login status
 ```
 
-Codex also offers standalone installers; see the linked official CLI documentation when Node.js is not available. DAW-AI invokes `codex exec` with GPT-5.6 Sol at high reasoning in an ephemeral, isolated workspace by default. The Debug tab can retain Codex sessions when a persistent transcript is useful. It registers a local DAW-AI MCP server whose sound-graph edit tool validates each operation and whose read-only listening tools render spectrograms and audio measurements from the current graph.
+Codex also offers standalone installers; see the linked official CLI documentation when Node.js is not available. DAW-AI invokes `codex exec` with GPT-5.6 Sol at high reasoning in an ephemeral, isolated workspace by default. The Debug tab can retain Codex sessions when a persistent transcript is useful. It registers a local DAW-AI MCP server whose standard sound-graph resource provides reliable access to the latest graph and stable IDs, whose edit tool validates each operation, and whose read-only listening tools render spectrograms and audio measurements from the current graph.
 
 Start the studio on the charter's default port:
 
