@@ -16,7 +16,7 @@ use crate::codex_mcp::{
     ANALYZE_TOOL_NAME, EditSession, MCP_SESSION_ENV, MCP_TOOL_NAME, MEL_TOOL_NAME,
 };
 use crate::model::{Project, TrackRole, json_string};
-use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS, MidiNote};
+use crate::prompt::{Action, AutomationPoint, EditPlan, MAX_COMPOUND_ACTIONS, MidiNote};
 
 pub(crate) const EDIT_SCHEMA: &str = include_str!("../codex/edit-plan.schema.json");
 const STUDIO_CONTRACT: &str = include_str!("../codex/STUDIO.md");
@@ -134,7 +134,7 @@ impl CodexPlanner {
             .arg("--config")
             .arg("approval_policy=\"never\"")
             .arg("--config")
-            .arg("web_search=\"disabled\"")
+            .arg("web_search=\"cached\"")
             .arg("--config")
             .arg("sandbox_workspace_write.exclude_tmpdir_env_var=true")
             .arg("--config")
@@ -385,7 +385,13 @@ fn planner_task(prompt: &str, start: f32, end: f32) -> String {
             "You are the sound-graph editing engine inside DAW-AI. Read the current graph from ",
             "the registered {resource} MCP resource before deciding what to change; use the local ",
             "sound-graph.json file only as a fallback. Re-read the resource after edits when you ",
-            "need newly created stable IDs. Operate in an implementation ",
+            "need newly created stable IDs. Before forming the first musical plan, use web search ",
+            "to research how producers create the requested musical effect, its perceptual ",
+            "signature, and its usual tension, transition, or arrangement context. Treat that ",
+            "research as creative guidance rather than a fixed genre recipe, and apply it to the ",
+            "current composition. When the researched signature depends on a transition or ",
+            "contrast over time, make that contrast audible inside the selected region instead ",
+            "of substituting a uniform final-state texture. Operate in an implementation ",
             "loop: form or refine a musical plan from the request, current graph, and registered ",
             "read-only listening tools; use the registered daw_ai {tool} tool to apply the next ",
             "coherent graph batch; use the listening tools on the updated graph; then compare the ",
@@ -462,7 +468,7 @@ pub(crate) fn plan_from_json(source: &str) -> Result<EditPlan, PlannerError> {
         .and_then(JsonValue::as_array)
         .ok_or_else(|| invalid("actions must be an array"))?;
     if actions.is_empty() || actions.len() > MAX_COMPOUND_ACTIONS {
-        return Err(invalid("one to eight actions are required"));
+        return Err(invalid("one to nine actions are required"));
     }
     let mut parsed = actions
         .iter()
@@ -485,7 +491,7 @@ fn action_from_json(value: &JsonValue) -> Result<Action, PlannerError> {
     let target = role_from_name(target_name)?;
     let name = string_field(object, "name")?;
     let value = number_field(object, "value")?;
-    match kind {
+    let action = match kind {
         "gain" if (0.0..=2.0).contains(&value) => Ok(Action::Gain {
             amount: value as f32,
             target,
@@ -505,7 +511,7 @@ fn action_from_json(value: &JsonValue) -> Result<Action, PlannerError> {
             {
                 return Err(invalid("midi-clip fields are invalid"));
             }
-            Ok(Action::MidiClip {
+            return Ok(Action::MidiClip {
                 track_id: integer_field(object, "trackId")?,
                 target,
                 label: label.to_owned(),
@@ -513,7 +519,7 @@ fn action_from_json(value: &JsonValue) -> Result<Action, PlannerError> {
                 end: end as f32,
                 loop_beats: value as f32,
                 notes: midi_notes_field(object, value)?,
-            })
+            });
         }
         "add-track" => target
             .map(|role| Action::AddTrack { role })
@@ -545,6 +551,13 @@ fn action_from_json(value: &JsonValue) -> Result<Action, PlannerError> {
                 value: setting.to_owned(),
             })
         }
+        "automation" if value == 0.0 => Ok(Action::Automation {
+            track_id: nonzero_integer_field(object, "trackId")?,
+            parameter: automation_parameter(name)?,
+            curve: automation_curve(string_field(object, "setting")?)?,
+            points: automation_points_field(object)?,
+            target: target.ok_or_else(|| invalid("automation requires a role target"))?,
+        }),
         "effect" if (0.0..=1.0).contains(&value) => Ok(Action::Effect {
             name: effect_name(name, false)?,
             mix: value as f32,
@@ -566,7 +579,79 @@ fn action_from_json(value: &JsonValue) -> Result<Action, PlannerError> {
             Ok(Action::Tempo { bpm: value as u16 })
         }
         _ => Err(invalid("action fields are inconsistent or out of range")),
+    }?;
+    let start = object
+        .get("start")
+        .map(|_| number_field(object, "start"))
+        .transpose()?
+        .unwrap_or(0.0);
+    let end = object
+        .get("end")
+        .map(|_| number_field(object, "end"))
+        .transpose()?
+        .unwrap_or(1.0);
+    if !(0.0..1.0).contains(&start) || !(0.0..=1.0).contains(&end) || end <= start {
+        return Err(invalid("action timing fields are invalid"));
     }
+    if start == 0.0 && end == 1.0 {
+        return Ok(action);
+    }
+    if !matches!(
+        action,
+        Action::Gain { .. }
+            | Action::Mute { .. }
+            | Action::AddTrack { .. }
+            | Action::Automation { .. }
+            | Action::Effect { .. }
+            | Action::RemoveEffect { .. }
+            | Action::Filter { .. }
+            | Action::Rhythm { .. }
+    ) {
+        return Err(invalid(
+            "partial timing is supported for arrangement, mix, effect, and automation actions",
+        ));
+    }
+    Ok(Action::Timed {
+        start: start as f32,
+        end: end as f32,
+        action: Box::new(action),
+    })
+}
+
+fn automation_points_field(object: &Object) -> Result<Vec<AutomationPoint>, PlannerError> {
+    let points = object
+        .get("points")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| invalid("automation points must be an array"))?;
+    if !(2..=16).contains(&points.len()) {
+        return Err(invalid("automation requires between 2 and 16 points"));
+    }
+    let points = points
+        .iter()
+        .map(|point| {
+            let point = point
+                .as_object()
+                .ok_or_else(|| invalid("each automation point must be an object"))?;
+            Ok(AutomationPoint {
+                time: number_field(point, "time")? as f32,
+                value: number_field(point, "value")? as f32,
+            })
+        })
+        .collect::<Result<Vec<_>, PlannerError>>()?;
+    if points.first().map(|point| point.time) != Some(0.0)
+        || points.last().map(|point| point.time) != Some(1.0)
+        || points
+            .iter()
+            .any(|point| !(0.0..=1.0).contains(&point.time))
+        || points
+            .windows(2)
+            .any(|points| points[1].time <= points[0].time)
+    {
+        return Err(invalid(
+            "automation point times must increase from 0 through 1",
+        ));
+    }
+    Ok(points)
 }
 
 fn midi_notes_field(object: &Object, loop_beats: f64) -> Result<Vec<MidiNote>, PlannerError> {
@@ -624,6 +709,7 @@ fn effect_name(name: &str, allow_all: bool) -> Result<&'static str, PlannerError
         "Chorus" => Ok("Chorus"),
         "Low-pass filter" => Ok("Low-pass filter"),
         "Punch compressor" => Ok("Punch compressor"),
+        "Drive" => Ok("Drive"),
         "Shimmer" => Ok("Shimmer"),
         "Effects" if allow_all => Ok("Effects"),
         _ => Err(invalid("unknown effect name")),
@@ -656,6 +742,22 @@ fn modulator_parameter(name: &str) -> Result<String, PlannerError> {
     }
 }
 
+fn automation_parameter(name: &str) -> Result<String, PlannerError> {
+    if modulator_parameter(name).is_ok() || modulator_automation_target(name).is_some() {
+        Ok(name.to_owned())
+    } else {
+        Err(invalid("unknown automation target"))
+    }
+}
+
+fn automation_curve(name: &str) -> Result<&'static str, PlannerError> {
+    match name {
+        "linear" => Ok("linear"),
+        "hold" => Ok("hold"),
+        _ => Err(invalid("unknown automation curve")),
+    }
+}
+
 fn modulator_shape(name: &str) -> Result<&'static str, PlannerError> {
     match name {
         "sine" => Ok("sine"),
@@ -676,8 +778,20 @@ fn modulator_rate(value: f64) -> Result<f32, PlannerError> {
 }
 
 fn effect_modulation_target(name: &str) -> Option<u64> {
-    name.strip_prefix("effect:")?
-        .strip_suffix(".mix")?
+    let target = name.strip_prefix("effect:")?;
+    [".mix", ".cutoff", ".resonance"]
+        .iter()
+        .find_map(|suffix| target.strip_suffix(suffix))?
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+}
+
+fn modulator_automation_target(name: &str) -> Option<u64> {
+    let target = name.strip_prefix("modulator:")?;
+    [".rate", ".depth"]
+        .iter()
+        .find_map(|suffix| target.strip_suffix(suffix))?
         .parse::<u64>()
         .ok()
         .filter(|id| *id > 0)
@@ -707,6 +821,8 @@ fn sound_parameter_name(name: &str) -> Result<&'static str, PlannerError> {
         "release" => Ok("release"),
         "tone" => Ok("tone"),
         "mix" => Ok("mix"),
+        "cutoff" => Ok("cutoff"),
+        "resonance" => Ok("resonance"),
         "enabled" => Ok("enabled"),
         "shape" => Ok("shape"),
         "rate" => Ok("rate"),
@@ -746,6 +862,15 @@ fn integer_field(object: &Object, name: &str) -> Result<u64, PlannerError> {
         Err(invalid(&format!(
             "{name} must be a non-negative safe integer"
         )))
+    }
+}
+
+fn nonzero_integer_field(object: &Object, name: &str) -> Result<u64, PlannerError> {
+    let value = integer_field(object, name)?;
+    if value == 0 {
+        Err(invalid(&format!("{name} must identify an existing track")))
+    } else {
+        Ok(value)
     }
 }
 
@@ -810,6 +935,59 @@ mod tests {
             task.contains("no predetermined iteration, tool-call, or request-wide action limit")
         );
         assert!(task.contains("overall session timeout is the only loop limit"));
+        assert!(task.contains("Before forming the first musical plan, use web search"));
+        assert!(task.contains("perceptual signature"));
+        assert!(task.contains("creative guidance rather than a fixed genre recipe"));
+        assert!(task.contains("make that contrast audible inside the selected region"));
+    }
+
+    #[test]
+    fn parses_scoped_parameter_automation() {
+        let plan = plan_from_json(
+            r#"{
+                "summary":"Opened the bass filter through the transition",
+                "musicalPlan":"Build brightness only through the middle of the selection.",
+                "actions":[{
+                    "kind":"automation","target":"bass","name":"effect:210.cutoff","value":0,
+                    "trackId":2,"tool":"None","toolId":0,"clipId":0,"parameter":"None",
+                    "setting":"linear","start":0.2,"end":0.8,"rate":0,
+                    "points":[
+                        {"time":0,"value":300},
+                        {"time":0.5,"value":4000},
+                        {"time":1,"value":12000}
+                    ]
+                }]
+            }"#,
+        )
+        .expect("valid scoped automation");
+
+        assert_eq!(
+            plan.action,
+            Action::Timed {
+                start: 0.2,
+                end: 0.8,
+                action: Box::new(Action::Automation {
+                    track_id: 2,
+                    parameter: "effect:210.cutoff".to_owned(),
+                    curve: "linear",
+                    points: vec![
+                        AutomationPoint {
+                            time: 0.0,
+                            value: 300.0,
+                        },
+                        AutomationPoint {
+                            time: 0.5,
+                            value: 4000.0,
+                        },
+                        AutomationPoint {
+                            time: 1.0,
+                            value: 12000.0,
+                        },
+                    ],
+                    target: TrackRole::Bass,
+                }),
+            }
+        );
     }
 
     #[test]
@@ -852,7 +1030,8 @@ mod tests {
                 "musicalPlan":"Darken the chord timbre and add a long ambient tail.",
                 "actions":[
                     {"kind":"filter","target":"chords","name":"None","value":-0.3},
-                    {"kind":"effect","target":"chords","name":"Reverb","value":0.42}
+                    {"kind":"effect","target":"chords","name":"Reverb","value":0.42},
+                    {"kind":"effect","target":"chords","name":"Drive","value":0.2}
                 ]
             }"#,
         )
@@ -868,6 +1047,11 @@ mod tests {
                     Action::Effect {
                         name: "Reverb",
                         mix: 0.42,
+                        target: Some(TrackRole::Chords),
+                    },
+                    Action::Effect {
+                        name: "Drive",
+                        mix: 0.2,
                         target: Some(TrackRole::Chords),
                     },
                 ],
@@ -962,6 +1146,34 @@ mod tests {
     }
 
     #[test]
+    fn automation_schema_and_parser_both_require_points() {
+        let schema: JsonValue = serde_json::from_str(EDIT_SCHEMA).expect("edit schema");
+        let action_schema = &schema["properties"]["actions"]["items"];
+        let requires_points = action_schema["allOf"]
+            .as_array()
+            .expect("action conditionals")
+            .iter()
+            .any(|conditional| {
+                conditional["if"]["properties"]["kind"]["const"] == "automation"
+                    && conditional["then"]["required"]
+                        .as_array()
+                        .is_some_and(|required| required.iter().any(|field| field == "points"))
+            });
+        assert!(requires_points, "automation schema must require points");
+
+        let missing_points = r#"{
+            "summary":"Automated bass volume",
+            "musicalPlan":"Raise the bass through the selected region.",
+            "actions":[{
+                "kind":"automation","target":"bass","name":"track.volume","value":0,
+                "trackId":2,"tool":"None","toolId":0,"clipId":0,"parameter":"None",
+                "setting":"linear","start":0,"end":1,"rate":0,"events":[]
+            }]
+        }"#;
+        assert!(plan_from_json(missing_points).is_err());
+    }
+
+    #[test]
     fn parses_sound_tool_actions() {
         let plan = plan_from_json(
             r#"{
@@ -998,10 +1210,10 @@ mod tests {
     fn parses_any_published_modulation_target() {
         let plan = plan_from_json(
             r#"{
-                "summary":"Route movement to the bass filter mix",
-                "musicalPlan":"Add slow sine movement to the existing bass filter mix.",
+                "summary":"Route movement to the bass filter cutoff",
+                "musicalPlan":"Add slow sine movement to the existing bass filter cutoff.",
                 "actions":[{
-                    "kind":"modulator","target":"bass","name":"effect:210.mix","value":0.25,
+                    "kind":"modulator","target":"bass","name":"effect:210.cutoff","value":0.25,
                     "trackId":0,"tool":"None","toolId":0,"clipId":0,"parameter":"None","setting":"sine","rate":0.5
                 }]
             }"#,
@@ -1010,7 +1222,7 @@ mod tests {
         assert_eq!(
             plan.action,
             Action::Modulator {
-                parameter: "effect:210.mix".to_owned(),
+                parameter: "effect:210.cutoff".to_owned(),
                 shape: "sine",
                 rate: 0.5,
                 depth: 0.25,

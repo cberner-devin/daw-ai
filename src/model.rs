@@ -6,6 +6,12 @@ const HISTORY_LIMIT: usize = 50;
 const TRACK_LIMIT: usize = 128;
 pub(crate) const EDIT_LOG_LIMIT: usize = 256;
 pub(crate) const MAX_PROMPT_CHARACTERS: usize = 2_000;
+pub(crate) const FILTER_CUTOFF_MIN_HZ: f32 = 80.0;
+pub(crate) const FILTER_CUTOFF_MAX_HZ: f32 = 16_000.0;
+pub(crate) const FILTER_CUTOFF_DEFAULT_HZ: f32 = 1_200.0;
+pub(crate) const FILTER_RESONANCE_MIN: f32 = 0.1;
+pub(crate) const FILTER_RESONANCE_MAX: f32 = 20.0;
+pub(crate) const FILTER_RESONANCE_DEFAULT: f32 = 0.7;
 
 struct ModulationTarget {
     id: String,
@@ -61,11 +67,23 @@ impl TrackRole {
     }
 }
 
+pub(crate) const fn legacy_filter_cutoff_hz(role: TrackRole) -> f32 {
+    match role {
+        TrackRole::Drums => 3_150.0,
+        TrackRole::Bass => 420.0,
+        TrackRole::Chords => 980.0,
+        TrackRole::Lead => 1_260.0,
+        TrackRole::Texture => 1_470.0,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Effect {
     pub id: u64,
     pub name: String,
     pub mix: f32,
+    pub cutoff_hz: Option<f32>,
+    pub resonance: Option<f32>,
     pub enabled: bool,
 }
 
@@ -412,7 +430,7 @@ impl Track {
                 output,
                 concat!(
                     "{{\"id\":{},\"type\":\"effect\",\"name\":{},",
-                    "\"enabled\":{},\"parameters\":{{\"mix\":{}}}}}"
+                    "\"enabled\":{},\"parameters\":{{\"mix\":{}"
                 ),
                 effect.id,
                 json_string(&effect.name),
@@ -420,6 +438,15 @@ impl Track {
                 decimal(effect.mix)
             )
             .expect("writing to a string cannot fail");
+            if let Some(cutoff_hz) = effect.cutoff_hz {
+                write!(output, ",\"cutoff\":{}", decimal(cutoff_hz))
+                    .expect("writing to a string cannot fail");
+            }
+            if let Some(resonance) = effect.resonance {
+                write!(output, ",\"resonance\":{}", decimal(resonance))
+                    .expect("writing to a string cannot fail");
+            }
+            output.push_str("}}");
         }
 
         output.push_str("],\"modulators\":[");
@@ -450,6 +477,27 @@ impl Track {
 
         output.push_str("],\"modulationTargets\":[");
         for (index, target) in modulation_targets(self).iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            write!(
+                output,
+                concat!(
+                    "{{\"id\":{},\"label\":{},\"minimum\":{},",
+                    "\"maximum\":{},\"scale\":{},\"mode\":{}}}"
+                ),
+                json_string(&target.id),
+                json_string(&target.label),
+                decimal(target.minimum),
+                decimal(target.maximum),
+                decimal(target.scale),
+                json_string(target.mode)
+            )
+            .expect("writing to a string cannot fail");
+        }
+
+        output.push_str("],\"automationTargets\":[");
+        for (index, target) in automation_targets(self).iter().enumerate() {
             if index > 0 {
                 output.push(',');
             }
@@ -665,11 +713,27 @@ impl ChannelOperation {
 }
 
 impl Action {
+    fn retain_after_track_deletion(&mut self, track_id: u64) -> bool {
+        match self {
+            Self::Compound { actions } => {
+                actions.retain_mut(|action| action.retain_after_track_deletion(track_id));
+                !actions.is_empty()
+            }
+            Self::Timed { action, .. } => action.retain_after_track_deletion(track_id),
+            Self::Automation {
+                track_id: owner_id, ..
+            } => *owner_id != track_id,
+            _ => true,
+        }
+    }
+
     fn has_regional_state(&self) -> bool {
         match self {
             Self::Compound { actions } => actions.iter().any(Self::has_regional_state),
+            Self::Timed { action, .. } => action.has_regional_state(),
             Self::Gain { .. }
             | Self::Mute { .. }
+            | Self::Automation { .. }
             | Self::Effect { .. }
             | Self::RemoveEffect { .. }
             | Self::Filter { .. }
@@ -714,6 +778,18 @@ impl Action {
                     action.write_json(output);
                 }
                 output.push_str("]}");
+                return;
+            }
+            Self::Timed { start, end, action } => {
+                write!(
+                    output,
+                    "{{\"type\":\"timed\",\"start\":{},\"end\":{},\"action\":",
+                    decimal(*start),
+                    decimal(*end)
+                )
+                .expect("writing to a string cannot fail");
+                action.write_json(output);
+                output.push('}');
                 return;
             }
             Self::Gain { amount, target } => write!(
@@ -825,6 +901,40 @@ impl Action {
                 json_string(parameter),
                 json_string(value)
             ),
+            Self::Automation {
+                track_id,
+                parameter,
+                curve,
+                points,
+                target,
+            } => {
+                write!(
+                    output,
+                    concat!(
+                        "{{\"type\":\"automation\",\"trackId\":{},\"name\":{},\"curve\":{},",
+                        "\"target\":{},\"points\":["
+                    ),
+                    track_id,
+                    json_string(parameter),
+                    json_string(curve),
+                    json_string(target.as_str())
+                )
+                .expect("writing to a string cannot fail");
+                for (index, point) in points.iter().enumerate() {
+                    if index > 0 {
+                        output.push(',');
+                    }
+                    write!(
+                        output,
+                        "{{\"time\":{},\"value\":{}}}",
+                        decimal(point.time),
+                        decimal(point.value)
+                    )
+                    .expect("writing to a string cannot fail");
+                }
+                output.push_str("]}");
+                return;
+            }
             Self::Effect { name, mix, target } => write!(
                 output,
                 concat!(
@@ -1117,6 +1227,18 @@ impl Studio {
                 }
                 Ok(())
             }
+            Action::Timed {
+                start: relative_start,
+                end: relative_end,
+                action,
+            } => {
+                let duration = end - start;
+                self.apply_action(
+                    action,
+                    start + duration * relative_start,
+                    start + duration * relative_end,
+                )
+            }
             Action::AddTrack { role } => {
                 if self.project.tracks.len() >= TRACK_LIMIT {
                     return Err(StudioError::InvalidChannel);
@@ -1179,6 +1301,35 @@ impl Studio {
                     .find(|track| track.id == *track_id && track.role == *target)
                     .ok_or(StudioError::UnknownTrack)?;
                 configure_track_tool(track, tool, *tool_id, *clip_id, parameter, value)
+            }
+            Action::Automation {
+                track_id,
+                parameter,
+                points,
+                target,
+                ..
+            } => {
+                let track = self
+                    .project
+                    .tracks
+                    .iter()
+                    .find(|track| {
+                        track.id == *track_id
+                            && track.role == *target
+                            && valid_automation_target(track, parameter)
+                    })
+                    .ok_or(StudioError::UnknownSoundTool)?;
+                let target = automation_targets(track)
+                    .into_iter()
+                    .find(|target| target.id == *parameter)
+                    .expect("validated automation target exists");
+                if points
+                    .iter()
+                    .any(|point| !(target.minimum..=target.maximum).contains(&point.value))
+                {
+                    return Err(StudioError::InvalidSoundTool);
+                }
+                Ok(())
             }
             Action::Gain { target, .. }
             | Action::Mute { target }
@@ -1255,6 +1406,9 @@ impl Studio {
 
         self.remember();
         self.project.tracks.remove(index);
+        self.project
+            .edits
+            .retain_mut(|edit| edit.action.retain_after_track_deletion(track_id));
         self.project.version += 1;
         Ok(())
     }
@@ -1537,6 +1691,20 @@ fn configure_track_tool(
                 .ok_or(StudioError::UnknownSoundTool)?;
             match parameter {
                 "mix" => effect.mix = parse_range(value, 0.0, 1.0)?,
+                "cutoff" if effect.cutoff_hz.is_some() => {
+                    effect.cutoff_hz = Some(parse_range(
+                        value,
+                        FILTER_CUTOFF_MIN_HZ,
+                        FILTER_CUTOFF_MAX_HZ,
+                    )?);
+                }
+                "resonance" if effect.resonance.is_some() => {
+                    effect.resonance = Some(parse_range(
+                        value,
+                        FILTER_RESONANCE_MIN,
+                        FILTER_RESONANCE_MAX,
+                    )?);
+                }
                 "enabled" => effect.enabled = parse_bool(value)?,
                 _ => return Err(StudioError::InvalidSoundTool),
             }
@@ -1760,14 +1928,36 @@ fn modulation_targets(track: &Track) -> Vec<ModulationTarget> {
             mode: "add",
         });
     }
-    targets.extend(track.effects.iter().map(|effect| ModulationTarget {
-        id: format!("effect:{}.mix", effect.id),
-        label: format!("{} mix", effect.name),
-        minimum: 0.0,
-        maximum: 1.0,
-        scale: 1.0,
-        mode: "add",
-    }));
+    for effect in &track.effects {
+        targets.push(ModulationTarget {
+            id: format!("effect:{}.mix", effect.id),
+            label: format!("{} mix", effect.name),
+            minimum: 0.0,
+            maximum: 1.0,
+            scale: 1.0,
+            mode: "add",
+        });
+        if effect.cutoff_hz.is_some() {
+            targets.push(ModulationTarget {
+                id: format!("effect:{}.cutoff", effect.id),
+                label: format!("{} cutoff", effect.name),
+                minimum: FILTER_CUTOFF_MIN_HZ,
+                maximum: FILTER_CUTOFF_MAX_HZ,
+                scale: 4.0,
+                mode: "exponential",
+            });
+        }
+        if effect.resonance.is_some() {
+            targets.push(ModulationTarget {
+                id: format!("effect:{}.resonance", effect.id),
+                label: format!("{} resonance", effect.name),
+                minimum: FILTER_RESONANCE_MIN,
+                maximum: FILTER_RESONANCE_MAX,
+                scale: 10.0,
+                mode: "add",
+            });
+        }
+    }
     targets
 }
 
@@ -1775,6 +1965,40 @@ pub(crate) fn valid_modulator_target(track: &Track, value: &str) -> bool {
     modulation_targets(track)
         .iter()
         .any(|target| target.id == value)
+}
+
+fn automation_targets(track: &Track) -> Vec<ModulationTarget> {
+    let mut targets = modulation_targets(track);
+    for modulator in &track.modulators {
+        targets.push(ModulationTarget {
+            id: format!("modulator:{}.rate", modulator.id),
+            label: format!("{} rate", modulator.name),
+            minimum: 0.01,
+            maximum: 20.0,
+            scale: 1.0,
+            mode: "linear",
+        });
+        targets.push(ModulationTarget {
+            id: format!("modulator:{}.depth", modulator.id),
+            label: format!("{} depth", modulator.name),
+            minimum: 0.0,
+            maximum: 1.0,
+            scale: 1.0,
+            mode: "linear",
+        });
+    }
+    targets
+}
+
+pub(crate) fn valid_automation_target(track: &Track, value: &str) -> bool {
+    automation_target_range(track, value).is_some()
+}
+
+pub(crate) fn automation_target_range(track: &Track, value: &str) -> Option<(f32, f32)> {
+    automation_targets(track)
+        .into_iter()
+        .find(|target| target.id == value)
+        .map(|target| (target.minimum, target.maximum))
 }
 
 fn role_action_track_index(
@@ -2019,10 +2243,13 @@ const fn tool_id(track_id: u64, offset: u64) -> u64 {
 }
 
 fn effect(id: u64, name: &str, mix: f32) -> Effect {
+    let is_filter = name == "Low-pass filter";
     Effect {
         id,
         name: name.to_owned(),
         mix,
+        cutoff_hz: is_filter.then_some(FILTER_CUTOFF_DEFAULT_HZ),
+        resonance: is_filter.then_some(FILTER_RESONANCE_DEFAULT),
         enabled: true,
     }
 }
@@ -2189,6 +2416,12 @@ mod tests {
             .configure_sound_tool(bass_id, "effect", effect_id, None, "mix", "0.72")
             .expect("configurable effect");
         studio
+            .configure_sound_tool(bass_id, "effect", effect_id, None, "cutoff", "640")
+            .expect("configurable filter cutoff");
+        studio
+            .configure_sound_tool(bass_id, "effect", effect_id, None, "resonance", "8.5")
+            .expect("configurable filter resonance");
+        studio
             .configure_sound_tool(
                 bass_id,
                 "modulator",
@@ -2235,6 +2468,8 @@ mod tests {
         assert_eq!(bass.instrument.oscillators[1].waveform, "triangle");
         assert_eq!(bass.instrument.oscillators[1].level, 0.41);
         assert_eq!(bass.effects[0].mix, 0.72);
+        assert_eq!(bass.effects[0].cutoff_hz, Some(640.0));
+        assert_eq!(bass.effects[0].resonance, Some(8.5));
         assert_eq!(bass.modulators[0].target, "track.volume");
         assert_eq!(bass.modulators[0].rate_mode, "tempo");
         assert_eq!(bass.modulators[0].trigger, "midi");
@@ -2273,7 +2508,9 @@ mod tests {
         assert!(targets.contains(&"instrument.oscillator1.tuning".to_owned()));
         assert!(targets.contains(&"instrument.oscillator2.level".to_owned()));
         assert!(targets.contains(&"track.volume".to_owned()));
-        assert!(targets.iter().any(|target| target.starts_with("effect:")));
+        assert!(targets.contains(&"effect:210.mix".to_owned()));
+        assert!(targets.contains(&"effect:210.cutoff".to_owned()));
+        assert!(targets.contains(&"effect:210.resonance".to_owned()));
 
         for target in &targets {
             studio
@@ -2285,6 +2522,131 @@ mod tests {
         for target in targets {
             assert!(json.contains(&json_string(&target)));
         }
+    }
+
+    #[test]
+    fn publishes_and_validates_parameter_automation_targets() {
+        let mut studio = Studio::new();
+        let bass = &studio.project().tracks[1];
+        let bass_id = bass.id;
+        let modulator_id = bass.modulators[0].id;
+        let targets = automation_targets(bass)
+            .into_iter()
+            .map(|target| target.id)
+            .collect::<Vec<_>>();
+        assert!(targets.contains(&"track.volume".to_owned()));
+        assert!(targets.contains(&"effect:210.cutoff".to_owned()));
+        assert!(targets.contains(&format!("modulator:{modulator_id}.rate")));
+        assert!(targets.contains(&format!("modulator:{modulator_id}.depth")));
+        assert!(studio.to_json().contains("\"automationTargets\""));
+
+        let valid = crate::prompt::EditPlan {
+            summary: "Raised the bass level".to_owned(),
+            action: Action::Timed {
+                start: 0.25,
+                end: 0.75,
+                action: Box::new(Action::Automation {
+                    track_id: bass_id,
+                    parameter: "track.volume".to_owned(),
+                    curve: "linear",
+                    points: vec![
+                        crate::prompt::AutomationPoint {
+                            time: 0.0,
+                            value: 0.1,
+                        },
+                        crate::prompt::AutomationPoint {
+                            time: 1.0,
+                            value: 1.4,
+                        },
+                    ],
+                    target: TrackRole::Bass,
+                }),
+            },
+        };
+        studio
+            .apply_plan(0.0, 8.0, "raise the bass through the transition", valid)
+            .expect("published automation target");
+        let saved = studio.project().to_json();
+        assert!(saved.contains("\"type\":\"timed\""));
+        assert!(saved.contains("\"type\":\"automation\""));
+
+        let invalid = crate::prompt::EditPlan {
+            summary: "Invalid level".to_owned(),
+            action: Action::Automation {
+                track_id: bass_id,
+                parameter: "track.volume".to_owned(),
+                curve: "linear",
+                points: vec![
+                    crate::prompt::AutomationPoint {
+                        time: 0.0,
+                        value: 0.0,
+                    },
+                    crate::prompt::AutomationPoint {
+                        time: 1.0,
+                        value: 2.0,
+                    },
+                ],
+                target: TrackRole::Bass,
+            },
+        };
+        assert!(
+            studio
+                .apply_plan(0.0, 8.0, "raise it too far", invalid)
+                .is_err()
+        );
+        assert_eq!(studio.project().to_json(), saved);
+    }
+
+    #[test]
+    fn deleting_a_track_prunes_only_its_owned_automation() {
+        let mut studio = Studio::new();
+        let bass_id = studio.project().tracks[1].id;
+        studio
+            .apply_plan(
+                0.0,
+                4.0,
+                "automate the bass and change tempo",
+                crate::prompt::EditPlan {
+                    summary: "Automated bass and changed tempo".to_owned(),
+                    action: Action::Compound {
+                        actions: vec![
+                            Action::Automation {
+                                track_id: bass_id,
+                                parameter: "track.volume".to_owned(),
+                                curve: "linear",
+                                points: vec![
+                                    crate::prompt::AutomationPoint {
+                                        time: 0.0,
+                                        value: 0.2,
+                                    },
+                                    crate::prompt::AutomationPoint {
+                                        time: 1.0,
+                                        value: 1.2,
+                                    },
+                                ],
+                                target: TrackRole::Bass,
+                            },
+                            Action::Tempo { bpm: 128 },
+                        ],
+                    },
+                },
+            )
+            .expect("valid compound edit");
+
+        studio
+            .delete_channel(bass_id)
+            .expect("delete automated bass");
+        assert!(!studio.to_json().contains("\"type\":\"automation\""));
+        assert!(studio.to_json().contains("\"type\":\"tempo\""));
+        assert!(studio.undo());
+        assert!(studio.to_json().contains("\"type\":\"automation\""));
+        assert!(
+            studio
+                .project()
+                .tracks
+                .iter()
+                .any(|track| track.id == bass_id)
+        );
     }
 
     #[test]

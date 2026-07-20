@@ -2089,6 +2089,65 @@ mod tests {
     }
 
     #[test]
+    fn deleting_an_automated_channel_persists_without_its_envelope() {
+        let (router, path) = persisted_demo();
+        let bass_id = router.lock_studio().project().tracks[1].id;
+        {
+            let mut studio = router.lock_studio();
+            let mut candidate = studio.clone();
+            candidate
+                .apply_plan(
+                    0.0,
+                    4.0,
+                    "automate bass volume",
+                    crate::prompt::EditPlan {
+                        summary: "Automated bass volume".to_owned(),
+                        action: crate::prompt::Action::Automation {
+                            track_id: bass_id,
+                            parameter: "track.volume".to_owned(),
+                            curve: "linear",
+                            points: vec![
+                                crate::prompt::AutomationPoint {
+                                    time: 0.0,
+                                    value: 0.2,
+                                },
+                                crate::prompt::AutomationPoint {
+                                    time: 1.0,
+                                    value: 1.2,
+                                },
+                            ],
+                            target: crate::model::TrackRole::Bass,
+                        },
+                    },
+                )
+                .expect("valid automation");
+            assert!(router.commit(&mut studio, candidate).is_ok());
+        }
+
+        let deleted = router.handle(&request(
+            "POST",
+            "/api/channels",
+            &format!("action=delete&track_id={bass_id}"),
+        ));
+        assert_eq!(deleted.status, 200, "{}", deleted.body);
+        let saved = ProjectStore::open(path.clone()).expect("saved project").1;
+        assert!(
+            saved
+                .project()
+                .tracks
+                .iter()
+                .all(|track| track.id != bass_id)
+        );
+        assert!(
+            !saved
+                .project()
+                .to_json()
+                .contains("\"type\":\"automation\"")
+        );
+        std::fs::remove_file(path).expect("remove test graph");
+    }
+
+    #[test]
     fn completed_async_edits_persist_the_sound_graph() {
         let (router, path) = persisted_demo();
         let accepted = router.handle(&request(

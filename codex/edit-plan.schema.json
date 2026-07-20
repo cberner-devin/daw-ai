@@ -14,13 +14,13 @@
     "actions": {
       "type": "array",
       "minItems": 1,
-      "maxItems": 8,
+      "maxItems": 9,
       "items": {
         "type": "object",
         "properties": {
           "kind": {
             "type": "string",
-            "enum": ["gain", "mute", "midi-clip", "add-track", "instrument", "modulator", "configure", "effect", "remove-effect", "filter", "rhythm", "tempo"]
+            "enum": ["gain", "mute", "midi-clip", "add-track", "instrument", "modulator", "configure", "automation", "effect", "remove-effect", "filter", "rhythm", "tempo"]
           },
           "target": {
             "type": "string",
@@ -30,10 +30,13 @@
             "type": "string",
             "anyOf": [
               {
-                "enum": ["None", "MIDI Clip", "sine", "triangle", "sawtooth", "square", "instrument.attack", "instrument.release", "instrument.tone", "instrument.pitch", "instrument.oscillator1.tuning", "instrument.oscillator1.level", "instrument.oscillator2.tuning", "instrument.oscillator2.level", "track.volume", "Reverb", "Room", "Echo", "Chorus", "Low-pass filter", "Punch compressor", "Shimmer", "Effects"]
+                "enum": ["None", "MIDI Clip", "sine", "triangle", "sawtooth", "square", "instrument.attack", "instrument.release", "instrument.tone", "instrument.pitch", "instrument.oscillator1.tuning", "instrument.oscillator1.level", "instrument.oscillator2.tuning", "instrument.oscillator2.level", "track.volume", "Reverb", "Room", "Echo", "Chorus", "Low-pass filter", "Punch compressor", "Drive", "Shimmer", "Effects"]
               },
               {
-                "pattern": "^effect:[1-9][0-9]*\\.mix$"
+                "pattern": "^effect:[1-9][0-9]*\\.(mix|cutoff|resonance)$"
+              },
+              {
+                "pattern": "^modulator:[1-9][0-9]*\\.(rate|depth)$"
               }
             ]
           },
@@ -42,7 +45,8 @@
           },
           "trackId": {
             "type": "integer",
-            "minimum": 0
+            "minimum": 0,
+            "description": "Stable owning track ID for configure and automation actions; automation requires a nonzero ID."
           },
           "tool": {
             "type": "string",
@@ -58,7 +62,7 @@
           },
           "parameter": {
             "type": "string",
-            "enum": ["None", "waveform", "oscillator1.waveform", "oscillator1.tuning", "oscillator1.level", "oscillator2.waveform", "oscillator2.tuning", "oscillator2.level", "attack", "release", "tone", "mix", "enabled", "shape", "rate", "rateMode", "trigger", "depth", "target", "time", "duration", "pitch", "velocity", "position"]
+            "enum": ["None", "waveform", "oscillator1.waveform", "oscillator1.tuning", "oscillator1.level", "oscillator2.waveform", "oscillator2.tuning", "oscillator2.level", "attack", "release", "tone", "mix", "cutoff", "resonance", "enabled", "shape", "rate", "rateMode", "trigger", "depth", "target", "time", "duration", "pitch", "velocity", "position"]
           },
           "setting": {
             "type": "string",
@@ -67,12 +71,14 @@
           "start": {
             "type": "number",
             "minimum": 0,
-            "maximum": 1
+            "maximum": 1,
+            "description": "Relative start within the selected region. Used by MIDI clips and time-bounded arrangement, mix, effect, and automation actions."
           },
           "end": {
             "type": "number",
             "minimum": 0,
-            "maximum": 1
+            "maximum": 1,
+            "description": "Relative end within the selected region; it must be after start."
           },
           "rate": {
             "type": "number",
@@ -109,9 +115,43 @@
               "required": ["time", "duration", "pitch", "velocity"],
               "additionalProperties": false
             }
+          },
+          "points": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 16,
+            "description": "Automation points with strictly increasing relative times from 0 through 1 and values in the selected automation target's published range.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "time": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "value": {
+                  "type": "number"
+                }
+              },
+              "required": ["time", "value"],
+              "additionalProperties": false
+            }
           }
         },
         "required": ["kind", "target", "name", "value", "trackId", "tool", "toolId", "clipId", "parameter", "setting", "start", "end", "rate", "events"],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "kind": { "const": "automation" }
+              },
+              "required": ["kind"]
+            },
+            "then": {
+              "required": ["points"]
+            }
+          }
+        ],
         "additionalProperties": false
       }
     }

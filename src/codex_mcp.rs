@@ -213,7 +213,7 @@ fn initialize_response(id: &str, params: Option<&JsonValue>) -> String {
                 "version": env!("CARGO_PKG_VERSION")
             },
             "instructions": format!(
-                "Read the current sound graph from the registered {GRAPH_RESOURCE_URI} MCP resource before editing. Work in an edit, listen, and evaluate loop: apply each intended change through apply_sound_graph_edits, use the read-only listening tools on the updated graph, compare the result with the request, and repeat until complete. There is no predetermined iteration or tool-call limit; only the overall session timeout limits the loop."
+                "Research the requested musical effect before planning, then read the current sound graph from the registered {GRAPH_RESOURCE_URI} MCP resource before editing. When its signature depends on a transition or contrast over time, make that contrast audible inside the selected region instead of substituting a uniform final-state texture. Work in an edit, listen, and evaluate loop: apply each intended change through apply_sound_graph_edits, use the read-only listening tools on the updated graph, compare the result with the request, and repeat until complete. There is no predetermined iteration or tool-call limit; only the overall session timeout limits the loop."
             )
         })
         .to_string(),
@@ -227,7 +227,7 @@ fn resources_response(id: &str) -> String {
             "resources": [{
                 "uri": GRAPH_RESOURCE_URI,
                 "name": GRAPH_FILE,
-                "description": "The latest DAW-AI sound graph, including stable channel, instrument, effect, modulator, clip, event, modulation-target, and routing IDs.",
+                "description": "The latest DAW-AI sound graph, including stable channel, instrument, effect, modulator, clip, event, modulation-target, automation-target, and routing IDs.",
                 "mimeType": "application/json"
             }]
         })
@@ -280,7 +280,7 @@ fn tools_response(id: &str) -> String {
             "tools": [
                 {
                     "name": MCP_TOOL_NAME,
-                    "description": "Apply one validated batch of generic MIDI clip, instrument, effect, modulator, routing, mix, arrangement, or tempo operations to the current sound graph. Returns a precise validation error without changing the graph when the batch is invalid. A successful response includes the current channel and stable sound-tool IDs; the full updated graph is available from the registered MCP resource. Use as many focused batches as needed in an edit, listen, and evaluate loop.",
+                    "description": "Apply one validated batch of generic MIDI clip, instrument, effect, modulator, automation, routing, mix, arrangement, or tempo operations to the current sound graph. Time-bound arrangement actions and parameter envelopes with relative ranges. Returns a precise validation error without changing the graph when a batch is invalid. A successful response includes the current channel and stable sound-tool IDs; the full updated graph is available from the registered MCP resource. Use as many focused batches as needed in an edit, listen, and evaluate loop.",
                     "inputSchema": edit_schema,
                     "annotations": {
                         "title": "Apply sound graph edits",
@@ -304,7 +304,7 @@ fn tools_response(id: &str) -> String {
                 },
                 {
                     "name": ANALYZE_TOOL_NAME,
-                    "description": "Render selected channels and report deterministic audio-region measurements including peak, RMS, zero-crossing rate, spectral centroid, and low/mid/high frequency energy ratios.",
+                    "description": "Render selected channels and report deterministic whole-region and short-window timeline measurements including event density, peak, RMS, zero-crossing rate, spectral centroid, and low/mid/high frequency energy ratios. Use the timeline to verify buildups, transitions, impacts, and other changes over time.",
                     "inputSchema": audio_schema,
                     "annotations": {
                         "title": "Analyze audio region",
@@ -458,6 +458,37 @@ fn analyze_audio_region(session_path: &Path, arguments: &JsonValue) -> Result<St
     let (track_ids, start, end) = audio_region_arguments(&project, arguments)?;
     let region = audio_analysis::render_region(&project, &track_ids, start, end)?;
     let analysis = audio_analysis::analyze(&region);
+    let (window_seconds, windows) = timeline_windows(start, end);
+    let mut timeline = Vec::new();
+    for (window_start, window_end) in windows {
+        let sample_start =
+            ((window_start - start) * audio_analysis::SAMPLE_RATE as f32).round() as usize;
+        let sample_end = if window_end >= end {
+            region.samples.len()
+        } else {
+            ((window_end - start) * audio_analysis::SAMPLE_RATE as f32).round() as usize
+        };
+        let window = region.slice(sample_start, sample_end, window_start, window_end);
+        let measurements = audio_analysis::analyze(&window);
+        timeline.push(serde_json::json!({
+            "start": round_time(window_start),
+            "end": round_time(window_end),
+            "eventsRendered": window.event_count,
+            "onsetDensityHz": round_measurement(
+                window.event_count as f32 / (window_end - window_start)
+            ),
+            "peak": round_measurement(measurements.peak),
+            "rms": round_measurement(measurements.rms),
+            "zeroCrossingRate": round_measurement(measurements.zero_crossing_rate),
+            "spectralCentroidHz":
+                (measurements.spectral_centroid_hz * 10.0).round() / 10.0,
+            "energyRatios": {
+                "lowBelow250Hz": round_measurement(measurements.low_energy_ratio),
+                "mid250To2500Hz": round_measurement(measurements.mid_energy_ratio),
+                "highAbove2500Hz": round_measurement(measurements.high_energy_ratio)
+            }
+        }));
+    }
     let channels = selected_channel_metadata(&project, &track_ids);
     let report = serde_json::json!({
         "trackIds": track_ids,
@@ -474,9 +505,35 @@ fn analyze_audio_region(session_path: &Path, arguments: &JsonValue) -> Result<St
             "lowBelow250Hz": round_measurement(analysis.low_energy_ratio),
             "mid250To2500Hz": round_measurement(analysis.mid_energy_ratio),
             "highAbove2500Hz": round_measurement(analysis.high_energy_ratio)
-        }
+        },
+        "timelineWindowSeconds": round_time(window_seconds),
+        "timeline": timeline
     });
     Ok(text_content(&report.to_string()))
+}
+
+fn timeline_windows(start: f32, end: f32) -> (f32, Vec<(f32, f32)>) {
+    let start = f64::from(start);
+    let end = f64::from(end);
+    let duration = end - start;
+    let window_seconds = (duration / 8.0).clamp(0.5, 1.0);
+    let window_count = (duration / window_seconds).ceil() as usize;
+    let windows = (0..window_count)
+        .map(|index| {
+            let window_start = start + index as f64 * window_seconds;
+            let window_end = if index + 1 == window_count {
+                end
+            } else {
+                (start + (index + 1) as f64 * window_seconds).min(end)
+            };
+            (window_start as f32, window_end as f32)
+        })
+        .collect();
+    (window_seconds as f32, windows)
+}
+
+fn round_time(value: f32) -> f32 {
+    (value * 1_000.0).round() / 1_000.0
 }
 
 fn selected_channel_labels(project: &Project, track_ids: &[u64]) -> String {
@@ -972,7 +1029,7 @@ mod tests {
         let session = EditSession::create(&Project::demo(), "iterate on the bass", 4.0, 8.0)
             .expect("edit session");
         let mut plans = Vec::new();
-        for iteration in 1..=9 {
+        for iteration in 1..=11 {
             let waveform = if iteration % 2 == 0 {
                 "triangle"
             } else {
@@ -992,7 +1049,7 @@ mod tests {
         }
 
         let (plan, graph) = session.finish(plans).expect("completed iterative edit");
-        assert_eq!(action_count(&plan.action), 9);
+        assert_eq!(action_count(&plan.action), 11);
         assert_eq!(graph.tracks[1].instrument.waveform, "sawtooth");
 
         let (store, mut studio) = ProjectStore::open(session.path().join("iterative-result.json"))
@@ -1106,6 +1163,12 @@ mod tests {
         let report: JsonValue = serde_json::from_str(report).expect("analysis report");
         assert!(report.get("spectralCentroidHz").is_some());
         assert!(report.get("energyRatios").is_some());
+        assert_eq!(report["timelineWindowSeconds"], 0.5);
+        let timeline = report["timeline"].as_array().expect("analysis timeline");
+        assert_eq!(timeline.len(), 2);
+        assert!(timeline[0].get("onsetDensityHz").is_some());
+        assert_eq!(timeline[0]["start"], 0.0);
+        assert_eq!(timeline[1]["end"], 1.0);
         assert_eq!(
             report["channels"],
             serde_json::json!([
@@ -1122,6 +1185,72 @@ mod tests {
         assert!(invalid.contains("available channel IDs"));
         assert!(invalid.contains("1 (Pulse Kit, drums)"));
         assert!(invalid.contains("\"isError\":true"));
+    }
+
+    #[test]
+    fn analysis_timeline_preserves_effect_tails_between_windows() {
+        let mut project = Project::demo();
+        let bass_index = project
+            .tracks
+            .iter()
+            .position(|track| track.role == crate::model::TrackRole::Bass)
+            .expect("demo bass");
+        let bass_id = project.tracks[bass_index].id;
+        let bass = &mut project.tracks[bass_index];
+        bass.instrument.release = 0.02;
+        for modulator in &mut bass.modulators {
+            modulator.enabled = false;
+        }
+        let echo_id = bass.effects[0].id;
+        bass.effects[0].name = "Echo".to_owned();
+        bass.effects[0].mix = 1.0;
+        bass.effects[0].cutoff_hz = None;
+        bass.effects[0].resonance = None;
+        bass.effects.truncate(1);
+        bass.routing.effect_order = vec![echo_id];
+        let clip = &mut bass.clips[0];
+        clip.end = 1.0;
+        clip.loop_beats = 16.0;
+        clip.events.truncate(1);
+        clip.events[0].time = 0.0;
+        clip.events[0].duration = 0.0625;
+
+        let restarted = audio_analysis::render_region(&project, &[bass_id], 0.5, 1.0)
+            .expect("independent second window");
+        let restarted_rms = audio_analysis::analyze(&restarted).rms;
+        let session =
+            EditSession::create(&project, "inspect the echo tail", 0.0, 1.0).expect("edit session");
+        let content = analyze_audio_region(
+            session.path(),
+            &serde_json::json!({"trackIds": [bass_id], "start": 0.0, "end": 1.0}),
+        )
+        .expect("continuous analysis");
+        let content: JsonValue = serde_json::from_str(&content).expect("analysis content");
+        let report: JsonValue =
+            serde_json::from_str(content[0]["text"].as_str().expect("analysis report text"))
+                .expect("analysis report");
+        let second = &report["timeline"][1];
+        assert_eq!(second["eventsRendered"], 0);
+        assert!(
+            second["rms"].as_f64().expect("second-window RMS")
+                > f64::from(restarted_rms) + 0.000_01,
+            "the second timeline window lost the preceding echo tail"
+        );
+    }
+
+    #[test]
+    fn timeline_windows_do_not_emit_a_rounded_residual() {
+        let (window_seconds, windows) = timeline_windows(0.0, 4.3);
+        assert!((window_seconds - 0.5375).abs() < 0.000_001);
+        assert_eq!(windows.len(), 8);
+        assert_eq!(windows.first().map(|window| window.0), Some(0.0));
+        assert_eq!(windows.last().map(|window| window.1), Some(4.3));
+        assert!(windows.iter().all(|(start, end)| end > start));
+        assert!(
+            windows
+                .windows(2)
+                .all(|windows| windows[0].1 == windows[1].0)
+        );
     }
 
     #[test]
