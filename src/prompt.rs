@@ -1,6 +1,6 @@
 use crate::model::{Project, TrackRole};
 
-pub(crate) const MAX_COMPOUND_ACTIONS: usize = 8;
+pub(crate) const MAX_COMPOUND_ACTIONS: usize = 9;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MidiNote {
@@ -11,9 +11,20 @@ pub struct MidiNote {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct AutomationPoint {
+    pub time: f32,
+    pub value: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Compound {
         actions: Vec<Action>,
+    },
+    Timed {
+        start: f32,
+        end: f32,
+        action: Box<Action>,
     },
     Gain {
         amount: f32,
@@ -53,6 +64,13 @@ pub enum Action {
         clip_id: Option<u64>,
         parameter: &'static str,
         value: String,
+    },
+    Automation {
+        track_id: u64,
+        parameter: String,
+        curve: &'static str,
+        points: Vec<AutomationPoint>,
+        target: TrackRole,
     },
     Effect {
         name: &'static str,
@@ -133,6 +151,16 @@ impl PromptEngine {
         let wants_reverb =
             contains_any(&normalized, &["reverb", "spacious", "space", "room", "wet"]);
         let wants_echo = contains_any(&normalized, &["delay", "echo"]);
+        let wants_drive = contains_any(
+            &normalized,
+            &[
+                "drive",
+                "distortion",
+                "distorted",
+                "overdrive",
+                "saturation",
+            ],
+        );
         let wants_any_effect = contains_any(&normalized, &["effect", "effects", "fx"]);
         let wants_all_effects = contains_any(&normalized, &["effects", "all effect", "all fx"]);
         let wants_warm = contains_any(&normalized, &["dark", "warm", "warmth", "muffled"]);
@@ -352,6 +380,17 @@ impl PromptEngine {
             };
         }
 
+        if wants_drive {
+            return EditPlan {
+                action: Action::Effect {
+                    name: "Drive",
+                    mix: 0.58,
+                    target,
+                },
+                summary: format!("Added harmonic drive to {target_name}"),
+            };
+        }
+
         if contains_any(&normalized, &["faster", "speed up", "more tempo"]) {
             let bpm = current_bpm.saturating_add(8).min(180);
             return EditPlan {
@@ -553,6 +592,11 @@ fn electronic_drop_plan(context: Option<PromptContext<'_>>) -> EditPlan {
         mix: 0.68,
         target: Some(TrackRole::Bass),
     });
+    actions.push(Action::Effect {
+        name: "Drive",
+        mix: 0.72,
+        target: Some(TrackRole::Bass),
+    });
     if drop_bass.is_none() {
         actions.push(Action::Gain {
             amount: 0.58,
@@ -751,6 +795,18 @@ fn removable_effect_names(prompt: &str) -> Vec<&'static str> {
     ) {
         names.push("Punch compressor");
     }
+    if contains_any(
+        prompt,
+        &[
+            "drive",
+            "distortion",
+            "distorted",
+            "overdrive",
+            "saturation",
+        ],
+    ) {
+        names.push("Drive");
+    }
     if contains_any(prompt, &["shimmer"]) {
         names.push("Shimmer");
     }
@@ -836,6 +892,14 @@ mod tests {
                 ..
             }
         ));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            Action::Effect {
+                name: "Drive",
+                target: Some(TrackRole::Bass),
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -864,6 +928,14 @@ mod tests {
                 name: "Reverb",
                 mix: 0.42,
                 target: Some(TrackRole::Chords),
+            }
+        );
+        assert_eq!(
+            PromptEngine::interpret("add drive to the bass", 112).action,
+            Action::Effect {
+                name: "Drive",
+                mix: 0.58,
+                target: Some(TrackRole::Bass),
             }
         );
     }
@@ -898,6 +970,7 @@ mod tests {
                 "Punch compressor",
                 TrackRole::Drums,
             ),
+            ("remove drive from bass", "Drive", TrackRole::Bass),
             ("remove shimmer from texture", "Shimmer", TrackRole::Texture),
         ] {
             assert_eq!(

@@ -82,11 +82,13 @@
       this.contextStartedAt = 0;
       this.projectStartedAt = 0;
       this.nextStep = 0;
+      this.nextAutomationTime = 0;
       this.timer = null;
       this.frame = null;
       this.noiseBuffer = null;
       this.reverbImpulse = null;
       this.trackGraphs = new Map();
+      this.modulatorPhaseCurves = new Map();
       this.activeSources = new Set();
     }
 
@@ -132,10 +134,11 @@
       if (this.playhead >= state.project.duration - 0.01) this.playhead = 0;
 
       this.createTrackGraphs();
-      this.playbackState = "playing";
       this.contextStartedAt = this.context.currentTime;
       this.projectStartedAt = this.playhead;
-      this.scheduleTrackAutomation();
+      this.nextAutomationTime = this.playhead;
+      this.scheduleTrackExactBoundaries();
+      this.playbackState = "playing";
       this.chaseActiveVoices();
       this.nextStep = this.playhead;
       this.pump();
@@ -169,6 +172,7 @@
         this.master = null;
         this.reverbImpulse = null;
         this.trackGraphs.clear();
+        this.modulatorPhaseCurves.clear();
         this.noiseBuffer = null;
         void context.close().catch(() => {});
       }
@@ -199,6 +203,7 @@
       compressor.connect(this.context.destination);
 
       this.reverbImpulse = this.createReverbImpulse();
+      this.driveCurve = this.createDriveCurve();
 
       const noiseRandom = this.seededRandom(0x4e4f4953);
       this.noiseBuffer = this.context.createBuffer(
@@ -214,7 +219,14 @@
 
     createTrackGraphs() {
       this.trackGraphs.clear();
+      this.modulatorPhaseCurves.clear();
       for (const track of state.project.tracks) {
+        for (const modulator of track.modulators) {
+          this.modulatorPhaseCurves.set(
+            `${track.id}:${modulator.id}`,
+            this.buildModulatorPhaseCurve(track, modulator),
+          );
+        }
         const input = this.context.createGain();
         const toneFilter = this.context.createBiquadFilter();
         const effectFilter = this.context.createBiquadFilter();
@@ -229,6 +241,9 @@
         const reverb = this.context.createConvolver();
         const chorusSend = this.context.createGain();
         const chorusDelay = this.context.createDelay(0.05);
+        const driveSend = this.context.createGain();
+        const drive = this.context.createWaveShaper();
+        const driveFilter = this.context.createBiquadFilter();
         const compressorSend = this.context.createGain();
         const compressor = this.context.createDynamicsCompressor();
 
@@ -238,12 +253,14 @@
         effectFilter.type = "lowpass";
         effectFilter.dawAiAutomation = "effect-filter";
         effectFilter.dawAiTrackId = track.id;
+        effectFilter.Q.value = 0.7;
         filterOutput.gain.value = 0;
         filterBypass.gain.value = 0;
         gate.gain.value = 0;
         echoSend.gain.value = 0;
         reverbSend.gain.value = 0;
         chorusSend.gain.value = 0;
+        driveSend.gain.value = 0;
         compressorSend.gain.value = 0;
         delay.delayTime.value = 60 / state.project.bpm / 2;
         delay.dawAiEffect = "echo";
@@ -251,6 +268,13 @@
         reverb.buffer = this.reverbImpulse;
         chorusDelay.delayTime.value = 0.018;
         chorusDelay.dawAiEffect = "chorus";
+        drive.curve = this.driveCurve;
+        drive.oversample = "4x";
+        drive.dawAiEffect = "drive";
+        driveFilter.type = "highpass";
+        driveFilter.frequency.value = 180;
+        driveFilter.Q.value = 0.7;
+        driveFilter.dawAiEffect = "drive-highpass";
         compressor.threshold.value = -22;
         compressor.knee.value = 18;
         compressor.ratio.value = 7;
@@ -269,6 +293,8 @@
         reverbSend.dawAiTrackId = track.id;
         chorusSend.dawAiAutomation = "chorus";
         chorusSend.dawAiTrackId = track.id;
+        driveSend.dawAiAutomation = "drive";
+        driveSend.dawAiTrackId = track.id;
         compressorSend.dawAiAutomation = "compressor";
         compressorSend.dawAiTrackId = track.id;
 
@@ -282,10 +308,11 @@
         delayFeedback.connect(delay);
 
         const stages = {
-          echo: [echoSend, delay],
-          reverb: [reverbSend, reverb],
-          chorus: [chorusSend, chorusDelay],
-          compressor: [compressorSend, compressor],
+          echo: { send: echoSend, processors: [delay] },
+          reverb: { send: reverbSend, processors: [reverb] },
+          chorus: { send: chorusSend, processors: [chorusDelay] },
+          drive: { send: driveSend, processors: [drive, driveFilter] },
+          compressor: { send: compressorSend, processors: [compressor] },
         };
         const routedCategories = track.routing.audio
           .filter((node) => node.startsWith("effect:"))
@@ -293,15 +320,21 @@
           .filter(Boolean)
           .map((effect) => this.effectCategory(effect.name))
           .filter(Boolean);
-        const stageOrder = [...new Set([...routedCategories, "echo", "reverb", "chorus", "compressor"])];
+        const stageOrder = [
+          ...new Set([...routedCategories, "drive", "echo", "reverb", "chorus", "compressor"]),
+        ];
         let stageSource = chainInput;
         for (const category of stageOrder) {
-          const [send, processor] = stages[category];
+          const { send, processors } = stages[category];
           const output = this.context.createGain();
           stageSource.connect(output);
           stageSource.connect(send);
-          send.connect(processor);
-          processor.connect(output);
+          let processorOutput = send;
+          for (const processor of processors) {
+            processorOutput.connect(processor);
+            processorOutput = processor;
+          }
+          processorOutput.connect(output);
           stageSource = output;
         }
         stageSource.connect(gate);
@@ -316,67 +349,237 @@
           echoSend,
           reverbSend,
           chorusSend,
+          driveSend,
           compressorSend,
         });
       }
     }
 
-    scheduleTrackAutomation() {
+    scheduleTrackExactBoundaries() {
       for (const track of state.project.tracks) {
         const boundaries = new Set([this.projectStartedAt]);
         for (const edit of state.project.edits) {
           if (edit.start >= this.projectStartedAt) boundaries.add(edit.start);
           if (edit.end >= this.projectStartedAt) boundaries.add(edit.end);
+          this.addExactActionBoundaries(
+            edit.action,
+            track.id,
+            edit.start,
+            edit.end,
+            boundaries,
+            this.projectStartedAt,
+            state.project.duration,
+          );
         }
         for (const clip of track.clips) {
           if (clip.start >= this.projectStartedAt) boundaries.add(clip.start);
           if (clip.end >= this.projectStartedAt) boundaries.add(clip.end);
         }
-        for (const modulator of track.modulators) {
-          if (
-            !modulator.enabled ||
-            this.isVoiceModulationTarget(modulator.target)
-          ) continue;
-          const interval = this.modulationInterval([modulator]);
-          for (let time = this.projectStartedAt; time <= state.project.duration; time += interval) {
-            boundaries.add(time);
-          }
+        const graph = this.trackGraphs.get(track.id);
+        for (const boundary of [...boundaries].sort((left, right) => left - right)) {
+          this.scheduleTrackBoundary(track, graph, boundary);
+        }
+      }
+    }
+
+    scheduleTrackAutomation(windowStart, windowEnd) {
+      if (windowEnd <= windowStart) return;
+      for (const track of state.project.tracks) {
+        const graphModulators = track.modulators.filter(
+          (modulator) => modulator.enabled && !this.isVoiceModulationTarget(modulator.target),
+        );
+        const hasAutomation = state.project.edits.some(
+          (edit) => this.actionAutomatesTrack(edit.action, track.id),
+        );
+        const interval = Math.min(
+          hasAutomation ? 0.01 : Number.POSITIVE_INFINITY,
+          graphModulators.length > 0
+            ? this.modulationInterval(graphModulators)
+            : Number.POSITIVE_INFINITY,
+        );
+        if (!Number.isFinite(interval)) continue;
+        const boundaries = new Set([windowStart, windowEnd]);
+        const firstIndex = Math.ceil(
+          (windowStart - this.projectStartedAt) / interval - 0.000001,
+        );
+        for (let index = Math.max(0, firstIndex); ; index += 1) {
+          const time = this.projectStartedAt + index * interval;
+          if (time > windowEnd + 0.000001) break;
+          boundaries.add(time);
         }
         const orderedBoundaries = [...boundaries].sort((left, right) => left - right);
         const graph = this.trackGraphs.get(track.id);
         for (const boundary of orderedBoundaries) {
-          const audioTime = Math.max(
-            this.context.currentTime,
-            this.contextStartedAt + boundary - this.projectStartedAt,
-          );
-          const automation = this.automationAt(track, boundary);
-          graph.gate.gain.setValueAtTime(automation.gain, audioTime);
-          graph.filterOutput.gain.setValueAtTime(automation.filterBypass ? 0 : 1, audioTime);
-          graph.filterBypass.gain.setValueAtTime(automation.filterBypass ? 1 : 0, audioTime);
-          graph.echoSend.gain.setValueAtTime(Math.min(0.6, automation.echo * 0.55), audioTime);
-          const reverbMix = Math.max(
-            automation.reverb.reverb,
-            automation.reverb.room,
-            automation.reverb.shimmer,
-          );
-          graph.reverbSend.gain.setValueAtTime(Math.min(0.6, reverbMix * 0.7), audioTime);
-          graph.chorusSend.gain.setValueAtTime(Math.min(0.5, automation.chorus * 0.5), audioTime);
-          graph.compressorSend.gain.setValueAtTime(Math.min(0.5, automation.compression * 0.45), audioTime);
-          const toneFrequency = clamp(
-            this.baseFilterForRole(track.role) *
-              (0.7 + automation.instrumentTone * 0.6) *
-              (1 + automation.filter),
-            180,
-            9000,
-          );
-          graph.toneFilter.frequency.dawAiProjectTime = boundary;
-          graph.toneFilter.frequency.setValueAtTime(toneFrequency, audioTime);
-          graph.effectFilter.frequency.setValueAtTime(
-            this.effectFilterFrequency(track, automation),
-            audioTime,
-          );
+          this.scheduleTrackBoundary(track, graph, boundary);
         }
       }
+    }
+
+    scheduleTrackBoundary(track, graph, boundary) {
+      const audioTime = Math.max(
+        this.context.currentTime,
+        this.contextStartedAt + boundary - this.projectStartedAt,
+      );
+      const automation = this.automationAt(track, boundary);
+      graph.gate.gain.dawAiProjectTime = boundary;
+      graph.gate.gain.setValueAtTime(automation.gain, audioTime);
+      graph.filterOutput.gain.setValueAtTime(automation.filterBypass ? 0 : 1, audioTime);
+      graph.filterBypass.gain.setValueAtTime(automation.filterBypass ? 1 : 0, audioTime);
+      graph.echoSend.gain.setValueAtTime(Math.min(0.6, automation.echo * 0.55), audioTime);
+      const reverbMix = Math.max(
+        automation.reverb.reverb,
+        automation.reverb.room,
+        automation.reverb.shimmer,
+      );
+      graph.reverbSend.gain.setValueAtTime(Math.min(0.6, reverbMix * 0.7), audioTime);
+      graph.chorusSend.gain.setValueAtTime(Math.min(0.5, automation.chorus * 0.5), audioTime);
+      graph.driveSend.gain.setValueAtTime(Math.min(0.75, automation.drive * 0.75), audioTime);
+      graph.compressorSend.gain.setValueAtTime(Math.min(0.5, automation.compression * 0.45), audioTime);
+      const toneFrequency = clamp(
+        this.baseFilterForRole(track.role) *
+          (0.7 + automation.instrumentTone * 0.6) *
+          (1 + automation.filter),
+        180,
+        9000,
+      );
+      graph.toneFilter.frequency.dawAiProjectTime = boundary;
+      graph.toneFilter.frequency.setValueAtTime(toneFrequency, audioTime);
+      graph.effectFilter.frequency.setValueAtTime(
+        this.effectFilterFrequency(track, automation),
+        audioTime,
+      );
+      graph.effectFilter.Q.setValueAtTime(automation.filterResonance, audioTime);
+    }
+
+    addExactActionBoundaries(
+      action,
+      trackId,
+      start,
+      end,
+      boundaries,
+      windowStart,
+      windowEnd,
+    ) {
+      if (action.type === "compound") {
+        for (const child of action.actions) {
+          this.addExactActionBoundaries(
+            child,
+            trackId,
+            start,
+            end,
+            boundaries,
+            windowStart,
+            windowEnd,
+          );
+        }
+        return;
+      }
+      if (action.type === "timed") {
+        const duration = end - start;
+        const scopedStart = start + duration * action.start;
+        const scopedEnd = start + duration * action.end;
+        if (scopedStart >= windowStart && scopedStart <= windowEnd) boundaries.add(scopedStart);
+        if (scopedEnd >= windowStart && scopedEnd <= windowEnd) boundaries.add(scopedEnd);
+        this.addExactActionBoundaries(
+          action.action,
+          trackId,
+          scopedStart,
+          scopedEnd,
+          boundaries,
+          windowStart,
+          windowEnd,
+        );
+        return;
+      }
+      if (
+        action.type !== "automation" ||
+        action.trackId !== trackId ||
+        end < windowStart ||
+        start > windowEnd
+      ) return;
+      for (const point of action.points) {
+        const time = start + (end - start) * point.time;
+        if (time >= windowStart && time <= windowEnd) boundaries.add(time);
+      }
+      if (start >= windowStart && start <= windowEnd) boundaries.add(start);
+      if (end >= windowStart && end <= windowEnd) boundaries.add(end);
+    }
+
+    buildModulatorPhaseCurve(track, modulator) {
+      const targetId = `modulator:${modulator.id}.rate`;
+      const boundaries = new Set([0, state.project.duration]);
+      for (const edit of state.project.edits) {
+        this.collectRateAutomationBoundaries(
+          edit.action,
+          track.id,
+          targetId,
+          edit.start,
+          edit.end,
+          boundaries,
+        );
+      }
+      const ordered = [...boundaries].sort((left, right) => left - right);
+      const segments = [];
+      let cumulativeCycles = 0;
+      for (let index = 1; index < ordered.length; index += 1) {
+        const start = clamp(ordered[index - 1], 0, state.project.duration);
+        const end = clamp(ordered[index], 0, state.project.duration);
+        const duration = end - start;
+        if (duration <= 0.000001) continue;
+        const firstTime = start + duration * 0.25;
+        const secondTime = start + duration * 0.75;
+        const firstRate = this.automatedParameterAt(
+          track,
+          targetId,
+          modulator.parameters.rate,
+          firstTime,
+        );
+        const secondRate = this.automatedParameterAt(
+          track,
+          targetId,
+          modulator.parameters.rate,
+          secondTime,
+        );
+        const slope = (secondRate - firstRate) / (secondTime - firstTime);
+        const startRate = firstRate - slope * (firstTime - start);
+        segments.push({ start, end, startRate, slope, cumulativeCycles });
+        cumulativeCycles += startRate * duration + 0.5 * slope * duration ** 2;
+      }
+      return { segments, totalCycles: cumulativeCycles };
+    }
+
+    collectRateAutomationBoundaries(action, trackId, targetId, start, end, boundaries) {
+      if (action.type === "compound") {
+        for (const child of action.actions) {
+          this.collectRateAutomationBoundaries(child, trackId, targetId, start, end, boundaries);
+        }
+        return;
+      }
+      if (action.type === "timed") {
+        const duration = end - start;
+        this.collectRateAutomationBoundaries(
+          action.action,
+          trackId,
+          targetId,
+          start + duration * action.start,
+          start + duration * action.end,
+          boundaries,
+        );
+        return;
+      }
+      if (action.type !== "automation" || action.trackId !== trackId || action.name !== targetId) return;
+      boundaries.add(start);
+      boundaries.add(end);
+      for (const point of action.points) boundaries.add(start + (end - start) * point.time);
+    }
+
+    modulatorCyclesAt(track, modulator, time) {
+      const curve = this.modulatorPhaseCurves.get(`${track.id}:${modulator.id}`);
+      if (!curve) return Math.max(0, time) * modulator.parameters.rate;
+      const segment = curve.segments.find((candidate) => time >= candidate.start && time <= candidate.end);
+      if (!segment) return curve.totalCycles;
+      const elapsed = clamp(time - segment.start, 0, segment.end - segment.start);
+      return segment.cumulativeCycles + segment.startRate * elapsed + 0.5 * segment.slope * elapsed ** 2;
     }
 
     automationAt(track, time) {
@@ -392,6 +595,8 @@
         filter: 0,
         filterBypass: false,
         lowPass: 0,
+        filterCutoff: null,
+        filterResonance: 0.7,
         echo: 0,
         reverb: {
           reverb: 0,
@@ -399,6 +604,7 @@
           shimmer: 0,
         },
         chorus: 0,
+        drive: 0,
         compression: 0,
       };
       for (const effect of track.effects) {
@@ -406,6 +612,22 @@
         const target = `effect:${effect.id}.mix`;
         const mix = this.parameterAt(track, target, effect.parameters.mix, time);
         this.applyEffect(effect.name, mix, automation);
+        if (Number.isFinite(effect.parameters.cutoff)) {
+          automation.filterCutoff = this.parameterAt(
+            track,
+            `effect:${effect.id}.cutoff`,
+            effect.parameters.cutoff,
+            time,
+          );
+        }
+        if (Number.isFinite(effect.parameters.resonance)) {
+          automation.filterResonance = this.parameterAt(
+            track,
+            `effect:${effect.id}.resonance`,
+            effect.parameters.resonance,
+            time,
+          );
+        }
       }
       for (const edit of state.project.edits) {
         if (time >= edit.start && time < edit.end) {
@@ -416,16 +638,16 @@
     }
 
     modulatorValue(track, modulator, time) {
-      let phaseTime = time;
+      let phaseOrigin = 0;
       if (modulator.trigger === "midi") {
         const onset = this.lastMidiOnset(track, time);
         if (onset === null) return 0;
-        phaseTime -= onset;
+        phaseOrigin = onset;
       }
-      const rate = modulator.rateMode === "tempo"
-        ? modulator.parameters.rate * state.project.bpm / 60
-        : modulator.parameters.rate;
-      const phase = phaseTime * rate * Math.PI * 2;
+      let cycles = this.modulatorCyclesAt(track, modulator, time) -
+        this.modulatorCyclesAt(track, modulator, phaseOrigin);
+      if (modulator.rateMode === "tempo") cycles *= state.project.bpm / 60;
+      const phase = cycles * Math.PI * 2;
       let value;
       if (modulator.shape === "triangle") {
         value = (2 / Math.PI) * Math.asin(Math.sin(phase));
@@ -434,23 +656,63 @@
       } else if (modulator.shape === "envelope") {
         value = Math.abs(Math.sin(phase)) * 2 - 1;
       } else if (modulator.shape === "random") {
-        value = Math.sin(Math.floor(phaseTime * rate * 8) * 91.17 + modulator.id) * 0.8;
+        value = Math.sin(Math.floor(cycles * 8) * 91.17 + modulator.id) * 0.8;
       } else {
         value = Math.sin(phase);
       }
-      return value * modulator.parameters.depth;
+      return value * this.automatedParameterAt(
+        track,
+        `modulator:${modulator.id}.depth`,
+        modulator.parameters.depth,
+        time,
+      );
     }
 
     modulationInterval(modulators) {
       const fastestRate = Math.max(
-        ...modulators.map((modulator) =>
-          modulator.rateMode === "tempo"
-            ? modulator.parameters.rate * state.project.bpm / 60
-            : modulator.parameters.rate,
-        ),
+        ...modulators.map((modulator) => {
+          const target = `modulator:${modulator.id}.rate`;
+          const automatedMaximum = Math.max(
+            modulator.parameters.rate,
+            ...state.project.edits.flatMap((edit) => this.automationPointValues(edit.action, target)),
+          );
+          return modulator.rateMode === "tempo"
+            ? automatedMaximum * state.project.bpm / 60
+            : automatedMaximum;
+        }),
         0.01,
       );
       return clamp(1 / (fastestRate * 8), 0.0025, 0.025);
+    }
+
+    automationPointValues(action, targetId) {
+      if (action.type === "compound") {
+        return action.actions.flatMap((child) => this.automationPointValues(child, targetId));
+      }
+      if (action.type === "timed") return this.automationPointValues(action.action, targetId);
+      return action.type === "automation" && action.name === targetId
+        ? action.points.map((point) => point.value)
+        : [];
+    }
+
+    actionAutomates(action, trackId, targetId) {
+      if (action.type === "compound") {
+        return action.actions.some((child) => this.actionAutomates(child, trackId, targetId));
+      }
+      if (action.type === "timed") return this.actionAutomates(action.action, trackId, targetId);
+      return action.type === "automation" && action.trackId === trackId && action.name === targetId;
+    }
+
+    actionAutomatesTrack(action, trackId) {
+      if (action.type === "compound") {
+        return action.actions.some((child) => this.actionAutomatesTrack(child, trackId));
+      }
+      if (action.type === "timed") return this.actionAutomatesTrack(action.action, trackId);
+      return action.type === "automation" && action.trackId === trackId;
+    }
+
+    hasParameterAutomation(track, targetId) {
+      return state.project.edits.some((edit) => this.actionAutomates(edit.action, track.id, targetId));
     }
 
     isVoiceModulationTarget(target) {
@@ -478,15 +740,69 @@
     }
 
     parameterAt(track, targetId, baseValue, time) {
-      const target = track.modulationTargets.find((candidate) => candidate.id === targetId);
+      const target = (track.automationTargets || track.modulationTargets)
+        .find((candidate) => candidate.id === targetId);
       if (!target) return baseValue;
+      const automatedBase = this.automatedParameterAt(track, targetId, baseValue, time);
       const amount = track.modulators
         .filter((modulator) => modulator.enabled && modulator.target === targetId)
         .reduce((total, modulator) => total + this.modulatorValue(track, modulator, time), 0);
       const value = target.mode === "multiply"
-        ? baseValue * (1 + amount * target.scale)
-        : baseValue + amount * target.scale;
+        ? automatedBase * (1 + amount * target.scale)
+        : target.mode === "exponential"
+          ? automatedBase * 2 ** (amount * target.scale)
+          : automatedBase + amount * target.scale;
       return clamp(value, target.minimum, target.maximum);
+    }
+
+    automatedParameterAt(track, targetId, baseValue, time) {
+      let value = baseValue;
+      for (const edit of state.project.edits) {
+        const automated = this.automationActionValue(
+          edit.action,
+          track.id,
+          targetId,
+          time,
+          edit.start,
+          edit.end,
+        );
+        if (automated !== null) value = automated;
+      }
+      return value;
+    }
+
+    automationActionValue(action, trackId, targetId, time, start, end) {
+      if (time < start || time >= end) return null;
+      if (action.type === "compound") {
+        let value = null;
+        for (const child of action.actions) {
+          const candidate = this.automationActionValue(child, trackId, targetId, time, start, end);
+          if (candidate !== null) value = candidate;
+        }
+        return value;
+      }
+      if (action.type === "timed") {
+        const duration = end - start;
+        return this.automationActionValue(
+          action.action,
+          trackId,
+          targetId,
+          time,
+          start + duration * action.start,
+          start + duration * action.end,
+        );
+      }
+      if (action.type !== "automation" || action.trackId !== trackId || action.name !== targetId) return null;
+      const progress = clamp((time - start) / (end - start), 0, 1);
+      if (action.curve === "hold") {
+        return [...action.points].reverse().find((point) => point.time <= progress)?.value ?? action.points[0].value;
+      }
+      const upper = action.points.findIndex((point) => point.time >= progress);
+      if (upper <= 0) return action.points[0].value;
+      const previous = action.points[upper - 1];
+      const next = action.points[upper];
+      const amount = (progress - previous.time) / (next.time - previous.time);
+      return previous.value + (next.value - previous.value) * amount;
     }
 
     instrumentParametersAt(track, time) {
@@ -499,6 +815,17 @@
     applyAutomationAction(action, role, automation, edit, time) {
       if (action.type === "compound") {
         for (const child of action.actions) this.applyAutomationAction(child, role, automation, edit, time);
+        return;
+      }
+      if (action.type === "timed") {
+        const duration = edit.end - edit.start;
+        const scopedEdit = {
+          start: edit.start + duration * action.start,
+          end: edit.start + duration * action.end,
+        };
+        if (time >= scopedEdit.start && time < scopedEdit.end) {
+          this.applyAutomationAction(action.action, role, automation, scopedEdit, time);
+        }
         return;
       }
       if (action.target !== "all" && action.target !== role) return;
@@ -521,6 +848,9 @@
       if (normalized === "room") automation.reverb.room = Math.max(automation.reverb.room, mix);
       if (normalized === "shimmer") automation.reverb.shimmer = Math.max(automation.reverb.shimmer, mix);
       if (normalized.includes("chorus")) automation.chorus = Math.max(automation.chorus, mix);
+      if (normalized.includes("drive") || normalized.includes("distortion")) {
+        automation.drive = Math.max(automation.drive, mix);
+      }
       if (normalized.includes("compressor") || normalized.includes("compression")) {
         automation.compression = Math.max(automation.compression, mix);
       }
@@ -543,6 +873,9 @@
         automation.filter = 0;
       }
       if (normalized.includes("chorus") || removeAll) automation.chorus = 0;
+      if (normalized.includes("drive") || normalized.includes("distortion") || removeAll) {
+        automation.drive = 0;
+      }
       if (normalized.includes("compressor") || normalized.includes("compression") || removeAll) {
         automation.compression = 0;
       }
@@ -572,7 +905,11 @@
       const dryCutoff = 20000;
       const mix = clamp(automation.lowPass, 0, 1);
       if (mix === 0) return dryCutoff;
-      const wetCutoff = clamp(this.baseFilterForRole(track.role) * 0.35, 180, 9000);
+      const wetCutoff = clamp(
+        automation.filterCutoff ?? this.baseFilterForRole(track.role) * 0.35,
+        80,
+        16000,
+      );
       return dryCutoff * ((wetCutoff / dryCutoff) ** mix);
     }
 
@@ -581,8 +918,19 @@
       if (normalized.includes("echo") || normalized.includes("delay")) return "echo";
       if (normalized === "reverb" || normalized === "room" || normalized === "shimmer") return "reverb";
       if (normalized.includes("chorus")) return "chorus";
+      if (normalized.includes("drive") || normalized.includes("distortion")) return "drive";
       if (normalized.includes("compressor") || normalized.includes("compression")) return "compressor";
       return null;
+    }
+
+    createDriveCurve() {
+      const curve = new Float32Array(4096);
+      const normalization = Math.tanh(40);
+      for (let index = 0; index < curve.length; index += 1) {
+        const sample = (index * 2) / (curve.length - 1) - 1;
+        curve[index] = Math.tanh(sample * 40) / normalization;
+      }
+      return curve;
     }
 
     createReverbImpulse() {
@@ -637,7 +985,10 @@
     pump() {
       if (!this.isPlaying || !state.project) return;
       this.updatePosition();
-      const scheduleUntil = this.playhead + 0.22;
+      const scheduleUntil = Math.min(this.playhead + 0.22, state.project.duration);
+      this.nextAutomationTime = Math.max(this.nextAutomationTime, this.playhead);
+      this.scheduleTrackAutomation(this.nextAutomationTime, scheduleUntil);
+      this.nextAutomationTime = scheduleUntil;
       const stepDuration = this.stepDuration();
       while (this.nextStep < scheduleUntil && this.nextStep < state.project.duration) {
         const windowEnd = Math.min(this.nextStep + stepDuration, state.project.duration);
@@ -792,14 +1143,25 @@
       const result = { rhythm: 0 };
       for (const edit of state.project.edits) {
         if (time < edit.start || time >= edit.end) continue;
-        this.applyPatternAction(edit.action, track.role, result, edit);
+        this.applyPatternAction(edit.action, track.role, result, edit, time);
       }
       return result;
     }
 
-    applyPatternAction(action, role, result, edit) {
+    applyPatternAction(action, role, result, edit, time) {
       if (action.type === "compound") {
-        for (const child of action.actions) this.applyPatternAction(child, role, result, edit);
+        for (const child of action.actions) this.applyPatternAction(child, role, result, edit, time);
+        return;
+      }
+      if (action.type === "timed") {
+        const duration = edit.end - edit.start;
+        const scopedEdit = {
+          start: edit.start + duration * action.start,
+          end: edit.start + duration * action.end,
+        };
+        if (time >= scopedEdit.start && time < scopedEdit.end) {
+          this.applyPatternAction(action.action, role, result, scopedEdit, time);
+        }
         return;
       }
       if (action.target !== "all" && action.target !== role) return;
@@ -820,8 +1182,10 @@
       const modulators = track.modulators.filter((modulator) =>
         modulator.enabled && ["instrument.pitch", tuningTarget].includes(modulator.target),
       );
-      if (modulators.length === 0) return;
-      const interval = this.modulationInterval(modulators);
+      const automated = this.hasParameterAutomation(track, "instrument.pitch") ||
+        this.hasParameterAutomation(track, tuningTarget);
+      if (modulators.length === 0 && !automated) return;
+      const interval = modulators.length === 0 ? 0.025 : this.modulationInterval(modulators);
       for (let offset = 0; offset <= duration; offset += interval) {
         const semitones =
           this.parameterAt(track, "instrument.pitch", 0, projectTime + offset) +
@@ -835,11 +1199,12 @@
       const modulators = track.modulators.filter(
         (modulator) => modulator.enabled && modulator.target === target,
       );
-      if (modulators.length === 0) {
+      const automated = this.hasParameterAutomation(track, target);
+      if (modulators.length === 0 && !automated) {
         parameter.setValueAtTime(oscillator.level, audioTime);
         return;
       }
-      const interval = this.modulationInterval(modulators);
+      const interval = modulators.length === 0 ? 0.025 : this.modulationInterval(modulators);
       for (let offset = 0; offset <= duration; offset += interval) {
         parameter.setValueAtTime(
           this.parameterAt(track, target, oscillator.level, projectTime + offset),
@@ -1056,6 +1421,7 @@
         oscillator.dawAiBaseFrequency = frequency;
         oscillator.dawAiEventId = event.id;
         oscillator.dawAiEventTime = event.time;
+        oscillator.dawAiProjectTime = projectTime;
         oscillator.dawAiEventDuration = event.duration;
         oscillator.dawAiInstrumentAttack = instrument.attack;
         oscillator.dawAiInstrumentRelease = instrument.release;
@@ -1503,9 +1869,40 @@
   }
 
   function renderEffect(track, effect, index, effectCount) {
+    const filterControls = Number.isFinite(effect.parameters.cutoff)
+      ? [
+          soundRange(
+            track,
+            "effect",
+            effect.id,
+            effect.name,
+            "cutoff",
+            effect.parameters.cutoff,
+            80,
+            16000,
+            "Hz",
+            "",
+            "Cutoff",
+          ),
+          soundRange(
+            track,
+            "effect",
+            effect.id,
+            effect.name,
+            "resonance",
+            effect.parameters.resonance,
+            0.1,
+            20,
+            "Q",
+            "",
+            "Resonance",
+          ),
+        ].join("")
+      : "";
     return `<div class="effect-card ${effect.enabled ? "" : "is-disabled"}">
       <div class="effect-card-heading"><span class="effect-pill"><strong>${escapeHtml(effect.name)}</strong> <b>${formatSoundValue(effect.parameters.mix, "%")}</b></span><code>#${effect.id}</code></div>
       ${soundRange(track, "effect", effect.id, effect.name, "mix", effect.parameters.mix, 0, 1, "%")}
+      ${filterControls}
       <div class="tool-actions">
         ${soundToggle(track, "effect", effect.id, effect.name, effect.enabled)}
         <button type="button" aria-label="${escapeHtml(`Move ${track.name} ${effect.name} effect #${effect.id} earlier`)}" ${index === 0 ? "disabled" : ""} data-sound-tool="routing" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="position" data-sound-value="${Math.max(0, index - 1)}" data-control-key="${track.id}-routing-${effect.id}-up">&uarr;</button>
@@ -1586,6 +1983,14 @@
   function collectRegionalEffects(action, role, edit, effects) {
     if (action.type === "compound") {
       for (const child of action.actions) collectRegionalEffects(child, role, edit, effects);
+      return;
+    }
+    if (action.type === "timed") {
+      const duration = edit.end - edit.start;
+      collectRegionalEffects(action.action, role, {
+        start: edit.start + duration * action.start,
+        end: edit.start + duration * action.end,
+      }, effects);
       return;
     }
     if (action.type === "effect" && (action.target === "all" || action.target === role)) {
@@ -1813,12 +2218,14 @@
   }
 
   function editAppliesToTrack(edit, track) {
-    return actionAppliesToTrack(edit.action, track.role);
+    return actionAppliesToTrack(edit.action, track);
   }
 
-  function actionAppliesToTrack(action, role) {
-    if (action.type === "compound") return action.actions.some((child) => actionAppliesToTrack(child, role));
-    return action.target === "all" || action.target === role;
+  function actionAppliesToTrack(action, track) {
+    if (action.type === "compound") return action.actions.some((child) => actionAppliesToTrack(child, track));
+    if (action.type === "timed") return actionAppliesToTrack(action.action, track);
+    if (action.type === "automation") return action.trackId === track.id;
+    return action.target === "all" || action.target === track.role;
   }
 
   function waveformBars(seed) {

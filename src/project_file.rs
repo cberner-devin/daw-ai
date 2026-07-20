@@ -4,10 +4,11 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::model::{
     ChannelOperation, ChannelOperationAction, Clip, ClipEvent, Edit, EditOperation, Effect,
-    Instrument, MAX_PROMPT_CHARACTERS, Modulator, Oscillator, Project, ProjectFileError, Routing,
-    Track, TrackRole,
+    FILTER_CUTOFF_MAX_HZ, FILTER_CUTOFF_MIN_HZ, FILTER_RESONANCE_DEFAULT, FILTER_RESONANCE_MAX,
+    FILTER_RESONANCE_MIN, Instrument, MAX_PROMPT_CHARACTERS, Modulator, Oscillator, Project,
+    ProjectFileError, Routing, Track, TrackRole, automation_target_range, legacy_filter_cutoff_hz,
 };
-use crate::prompt::{Action, MAX_COMPOUND_ACTIONS, MidiNote};
+use crate::prompt::{Action, AutomationPoint, MAX_COMPOUND_ACTIONS, MidiNote};
 
 const MAX_TRACKS: usize = 128;
 const MAX_TOOLS_PER_TRACK: usize = 256;
@@ -46,7 +47,7 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         .enumerate()
         .map(|(index, value)| parse_track(value, index, duration, &mut ids, &mut event_ids))
         .collect::<Result<Vec<_>, _>>()?;
-    let edits = match (root.get("edits"), root.get("regionalEdits")) {
+    let mut edits = match (root.get("edits"), root.get("regionalEdits")) {
         (Some(_), Some(_)) => {
             return Err(invalid(
                 "sound graph cannot contain both edits and regionalEdits",
@@ -94,6 +95,9 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         }
         (None, None) => Vec::new(),
     };
+    for edit in &mut edits {
+        validate_loaded_automation(&mut edit.action, &tracks)?;
+    }
     let mut operation_ids = HashSet::new();
     if edits
         .iter()
@@ -259,7 +263,7 @@ fn parse_track(
     }
     let effects = effect_values
         .iter()
-        .map(|value| parse_effect(value, ids))
+        .map(|value| parse_effect(value, role, ids))
         .collect::<Result<Vec<_>, _>>()?;
 
     let modulator_values = array(track, "modulators")?;
@@ -338,7 +342,11 @@ fn validate_waveform(value: &str) -> Result<(), ProjectFileError> {
     }
 }
 
-fn parse_effect(value: &JsonValue, ids: &mut HashSet<u64>) -> Result<Effect, ProjectFileError> {
+fn parse_effect(
+    value: &JsonValue,
+    role: TrackRole,
+    ids: &mut HashSet<u64>,
+) -> Result<Effect, ProjectFileError> {
     let effect = object(value, "effect")?;
     let id = unique_id(effect, "id", ids, "effect")?;
     expect_type(effect, "effect")?;
@@ -347,10 +355,33 @@ fn parse_effect(value: &JsonValue, ids: &mut HashSet<u64>) -> Result<Effect, Pro
         return Err(invalid(format!("unsupported effect: {name}")));
     }
     let parameters = object(field(effect, "parameters")?, "effect parameters")?;
+    let is_filter = name == "Low-pass filter";
     Ok(Effect {
         id,
         name,
         mix: range(parameters, "mix", 0.0, 1.0)?,
+        cutoff_hz: if is_filter {
+            Some(optional_range(
+                parameters,
+                "cutoff",
+                legacy_filter_cutoff_hz(role),
+                FILTER_CUTOFF_MIN_HZ,
+                FILTER_CUTOFF_MAX_HZ,
+            )?)
+        } else {
+            None
+        },
+        resonance: if is_filter {
+            Some(optional_range(
+                parameters,
+                "resonance",
+                FILTER_RESONANCE_DEFAULT,
+                FILTER_RESONANCE_MIN,
+                FILTER_RESONANCE_MAX,
+            )?)
+        } else {
+            None
+        },
         enabled: boolean(effect, "enabled")?,
     })
 }
@@ -754,7 +785,7 @@ fn parse_action(value: &JsonValue, depth: usize) -> Result<Action, ProjectFileEr
         let values = array(action, "actions")?;
         if values.is_empty() || values.len() > MAX_COMPOUND_ACTIONS {
             return Err(invalid(
-                "compound actions require one to eight child actions",
+                "compound actions require one to nine child actions",
             ));
         }
         return Ok(Action::Compound {
@@ -762,6 +793,18 @@ fn parse_action(value: &JsonValue, depth: usize) -> Result<Action, ProjectFileEr
                 .iter()
                 .map(|value| parse_action(value, depth + 1))
                 .collect::<Result<Vec<_>, _>>()?,
+        });
+    }
+    if action_type == "timed" {
+        let start = relative_range(action, "start")?;
+        let end = relative_range(action, "end")?;
+        if end <= start {
+            return Err(invalid("timed edit end must be after its start"));
+        }
+        return Ok(Action::Timed {
+            start,
+            end,
+            action: Box::new(parse_action(field(action, "action")?, depth + 1)?),
         });
     }
     let target = action_target(action)?;
@@ -822,6 +865,34 @@ fn parse_action(value: &JsonValue, depth: usize) -> Result<Action, ProjectFileEr
                 value: limited_string(action, "setting", 1, 64)?,
             })
         }
+        "automation" => {
+            let points = array(action, "points")?;
+            if !(2..=16).contains(&points.len()) {
+                return Err(invalid("automation requires between 2 and 16 points"));
+            }
+            let points = points
+                .iter()
+                .map(|point| {
+                    let point = object(point, "automation point")?;
+                    Ok(AutomationPoint {
+                        time: relative_range(point, "time")?,
+                        value: finite_number(point, "value")?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ProjectFileError>>()?;
+            validate_automation_points(&points)?;
+            Ok(Action::Automation {
+                track_id: action
+                    .get("trackId")
+                    .map(|_| integer(action, "trackId"))
+                    .transpose()?
+                    .unwrap_or(0),
+                parameter: limited_string(action, "name", 1, 64)?,
+                curve: automation_curve(string(action, "curve")?)?,
+                points,
+                target: required_target(target, "automation")?,
+            })
+        }
         "effect" => Ok(Action::Effect {
             name: effect_name(string(action, "name")?, false)?,
             mix: range(action, "value", 0.0, 1.0)?,
@@ -843,6 +914,76 @@ fn parse_action(value: &JsonValue, depth: usize) -> Result<Action, ProjectFileEr
             bpm: bounded_integer(action, "value", 60, 180)? as u16,
         }),
         _ => Err(invalid(format!("unsupported edit action: {action_type}"))),
+    }
+}
+
+fn validate_automation_points(points: &[AutomationPoint]) -> Result<(), ProjectFileError> {
+    if points.first().map(|point| point.time) != Some(0.0)
+        || points.last().map(|point| point.time) != Some(1.0)
+        || points
+            .windows(2)
+            .any(|points| points[1].time <= points[0].time)
+    {
+        Err(invalid(
+            "automation point times must increase from 0 through 1",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_loaded_automation(
+    action: &mut Action,
+    tracks: &[Track],
+) -> Result<(), ProjectFileError> {
+    match action {
+        Action::Compound { actions } => {
+            for action in actions {
+                validate_loaded_automation(action, tracks)?;
+            }
+        }
+        Action::Timed { action, .. } => validate_loaded_automation(action, tracks)?,
+        Action::Automation {
+            track_id,
+            parameter,
+            points,
+            target,
+            ..
+        } => {
+            let track = if *track_id == 0 {
+                tracks.iter().rev().find(|track| {
+                    track.role == *target && automation_target_range(track, parameter).is_some()
+                })
+            } else {
+                tracks.iter().find(|track| {
+                    track.id == *track_id
+                        && track.role == *target
+                        && automation_target_range(track, parameter).is_some()
+                })
+            }
+            .ok_or_else(|| invalid("automation target does not exist on its owning track"))?;
+            *track_id = track.id;
+            let (minimum, maximum) = automation_target_range(track, parameter)
+                .expect("validated automation target exists");
+            if points
+                .iter()
+                .any(|point| !(minimum..=maximum).contains(&point.value))
+            {
+                return Err(invalid(
+                    "automation point value is outside its target's published range",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn automation_curve(value: &str) -> Result<&'static str, ProjectFileError> {
+    match value {
+        "linear" => Ok("linear"),
+        "hold" => Ok("hold"),
+        _ => Err(invalid("automation curve is unsupported")),
     }
 }
 
@@ -942,6 +1083,8 @@ fn sound_parameter(value: &str) -> Result<&'static str, ProjectFileError> {
         "release" => Ok("release"),
         "tone" => Ok("tone"),
         "mix" => Ok("mix"),
+        "cutoff" => Ok("cutoff"),
+        "resonance" => Ok("resonance"),
         "enabled" => Ok("enabled"),
         "shape" => Ok("shape"),
         "rate" => Ok("rate"),
@@ -966,6 +1109,7 @@ fn effect_name(value: &str, allow_all: bool) -> Result<&'static str, ProjectFile
         "Chorus" => Ok("Chorus"),
         "Low-pass filter" => Ok("Low-pass filter"),
         "Punch compressor" => Ok("Punch compressor"),
+        "Drive" => Ok("Drive"),
         "Shimmer" => Ok("Shimmer"),
         "Effects" if allow_all => Ok("Effects"),
         _ => Err(invalid(format!("unsupported effect: {value}"))),
@@ -1072,6 +1216,20 @@ fn range(object: &Object, name: &str, minimum: f32, maximum: f32) -> Result<f32,
     Ok(value)
 }
 
+fn optional_range(
+    object: &Object,
+    name: &str,
+    default: f32,
+    minimum: f32,
+    maximum: f32,
+) -> Result<f32, ProjectFileError> {
+    if object.contains_key(name) {
+        range(object, name, minimum, maximum)
+    } else {
+        Ok(default)
+    }
+}
+
 fn relative_range(object: &Object, name: &str) -> Result<f32, ProjectFileError> {
     range(object, name, 0.0, 1.0)
 }
@@ -1139,11 +1297,65 @@ mod tests {
     fn round_trips_materialized_edits() {
         let mut studio = crate::model::Studio::new();
         studio
-            .apply_prompt(4.0, 8.0, "increase volume")
+            .apply_prompt(4.0, 8.0, "add drive to the bass")
             .expect("valid edit");
         let source = studio.project().to_json();
         let parsed = parse_project(&source).expect("valid edited graph");
         assert_eq!(parsed.to_json(), source);
+    }
+
+    #[test]
+    fn persisted_automation_is_migrated_and_cross_validated() {
+        let mut studio = crate::model::Studio::new();
+        let bass_id = studio.project().tracks[1].id;
+        studio
+            .apply_plan(
+                0.0,
+                4.0,
+                "automate bass volume",
+                crate::prompt::EditPlan {
+                    summary: "Automated bass volume".to_owned(),
+                    action: Action::Automation {
+                        track_id: bass_id,
+                        parameter: "track.volume".to_owned(),
+                        curve: "linear",
+                        points: vec![
+                            AutomationPoint {
+                                time: 0.0,
+                                value: 0.2,
+                            },
+                            AutomationPoint {
+                                time: 1.0,
+                                value: 1.2,
+                            },
+                        ],
+                        target: TrackRole::Bass,
+                    },
+                },
+            )
+            .expect("valid automation");
+        let source = studio.project().to_json();
+        parse_project(&source).expect("stable automation owner");
+
+        let mut unknown_track: JsonValue = serde_json::from_str(&source).unwrap();
+        unknown_track["edits"][0]["action"]["trackId"] = JsonValue::from(999_999_u64);
+        assert!(parse_project(&unknown_track.to_string()).is_err());
+
+        let mut out_of_range: JsonValue = serde_json::from_str(&source).unwrap();
+        out_of_range["edits"][0]["action"]["points"][1]["value"] = JsonValue::from(99.0);
+        assert!(parse_project(&out_of_range.to_string()).is_err());
+
+        let mut legacy: JsonValue = serde_json::from_str(&source).unwrap();
+        legacy["edits"][0]["action"]
+            .as_object_mut()
+            .expect("automation action")
+            .remove("trackId");
+        let migrated = parse_project(&legacy.to_string()).expect("legacy automation owner");
+        assert!(
+            migrated
+                .to_json()
+                .contains(&format!("\"trackId\":{bass_id}"))
+        );
     }
 
     #[test]
@@ -1181,6 +1393,13 @@ mod tests {
                 modulator.remove("rateMode");
                 modulator.remove("trigger");
             }
+            for effect in track["effects"].as_array_mut().expect("effects") {
+                let parameters = effect["parameters"]
+                    .as_object_mut()
+                    .expect("effect parameters");
+                parameters.remove("cutoff");
+                parameters.remove("resonance");
+            }
             track["routing"]["edges"]
                 .as_array_mut()
                 .expect("routing edges")
@@ -1205,6 +1424,12 @@ mod tests {
                 .iter()
                 .all(|modulator| modulator.rate_mode == "hz" && modulator.trigger == "free")
         }));
+        let bass_filter = &parsed.tracks[1].effects[0];
+        assert_eq!(
+            bass_filter.cutoff_hz,
+            Some(legacy_filter_cutoff_hz(TrackRole::Bass))
+        );
+        assert_eq!(bass_filter.resonance, Some(FILTER_RESONANCE_DEFAULT));
         parse_project(&parsed.to_json()).expect("migrated graph remains saveable");
     }
 
