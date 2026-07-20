@@ -31,8 +31,5 @@ often a good way to achieve coverage without bloating the suite.
 
 ## Git commits
 
-1. Git commits should use your human's name and email address for authorship. Add `Assisted-by:`
-   and your agent name at the end of the commit message. Use the same style as the
-   [Linux Kernel's coding assistant guidelines](https://github.com/torvalds/linux/blob/master/Documentation/process/coding-assistants.rst).
-2. Make one commit per feature or bug fix when opening a PR. Multiple commits or fixup commits should
+1. Make one commit per feature or bug fix when opening a PR. Multiple commits or fixup commits should
    not be merged to the default branch.
