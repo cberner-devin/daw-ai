@@ -86,36 +86,31 @@ The interface should be a local webserver with no authentication required. It sh
 The backend is written in Rust. The client code should be responsive and the UI should work on mobile or a desktop
 browser.
 
-The AI used should be the local Codex agent with the 5.6-Sol model on High reasoning. Installing and authenticating Codex is a required part of the installation
-process that the user must complete.
+The AI used is Gemini 3.5 Flash. The user must provide an API key in ~/gemini_creds.txt or a similar file.
+It can also be specified as an environment variable.
 
-Since Codex is best at writing code and config files, the internal synth and other tools that DAW-AI uses should
-be represented a way that is friendly for Codex:
-* The sound graph should be stored in a file on disk that Codex can edit directly
-* Additionally, tools should be provided that are registered with Codex and that make the
-  modifications to the sound graph and return useful error messages to Codex.
-* Codex my perform multiple edits to fulfil a request, which show to the user incrementally
+Since Gemini is best at writing code and config files, the internal synth and other tools that DAW-AI uses should
+be represented a way that is friendly for Gemini:
+* The sound graph should be stored in a file on disk that Gemini can edit directly
+* Additionally, tools should be provided that are registered with Gemini and that make the
+  modifications to the sound graph and return useful error messages to Gemini.
+* Gemini may perform multiple edits to fulfil a request, which are shown to the user incrementally
+* There is an audio rendering tool that allows Gemini to render part of the sound graph.
+  It is then returned to Gemini as audio input
 
-#### Codex "Listening"
-Codex is not able to take audio as input, so DAW AI should register a few tools to help Codex analyze
-the track to determine whether it meets the user's request. One of these should be a tool that
-takes a channel(s) and a time range and renders a Mel Spectrogram as a PNG and returns it to Codex.
-Other useful analysis tools are available as well.
-
-#### Codex loop
-Codex is told to operate in an implementation loop. It should:
+#### Gemini loop
+Gemini is told to operate in an implementation loop. It should:
 * Make edits to the sound graph
-* Use the "listening" tool(s)
+* Listen to the audio
 * Consider whether the request has been completed
 * Repeat, if necessary
 
 DAW AI MUST NOT limit the number of iterations or tools calls, except with a long timeout on the whole request.
 
-DAW AI should display incremental updates to the progress bar as Codex progresses.
+DAW AI should display incremental updates to the progress bar as the AI progresses.
 
-#### Codex sessions
-By default Codex sessions are run in "ephemeral" mode. However, a toggle is available on the Debug tab to disable this
-and keep the sessions persistent. This is intended for debugging purposes.
+#### Gemini sessions
+Sessions should be logged to disk for debugging purposes, and listed on the Debug tab by date and timestamp.
 
 ### Deployment
 
