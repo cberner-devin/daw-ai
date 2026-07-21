@@ -622,8 +622,8 @@ impl Router {
 
     fn playback_audio(&self, start_milliseconds: u64) -> Response {
         let project = self.lock_studio().project().clone();
-        let chunk_milliseconds = (audio_analysis::MAX_REGION_SECONDS * 1_000.0) as u64;
-        if start_milliseconds % chunk_milliseconds != 0 {
+        let stride_milliseconds = (audio_analysis::PLAYBACK_REGION_STRIDE_SECONDS * 1_000.0) as u64;
+        if start_milliseconds % stride_milliseconds != 0 {
             return Response::json(
                 422,
                 error_json("playback start must align to an audio chunk boundary"),

@@ -2582,6 +2582,36 @@ async function run() {
       for (let index = 0; index < 63; index += 1) {
         lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
       }
+      const NativeAudio = window.Audio;
+      const originalFetch = window.fetch;
+      let deferredNextChunk = null;
+      window.__audioBoundaryMedia = [];
+      window.__audioBoundaryRequests = [];
+      window.Audio = function Audio(...args) {
+        const media = new NativeAudio(...args);
+        window.__audioBoundaryMedia.push(media);
+        return media;
+      };
+      window.fetch = function fetch(resource, options) {
+        if (typeof resource === 'string' && resource.startsWith('/api/audio/')) {
+          window.__audioBoundaryRequests.push(resource);
+        }
+        if (resource === '/api/audio/24000') {
+          return new Promise((resolve, reject) => {
+            deferredNextChunk = { resource, options, resolve, reject };
+          });
+        }
+        return originalFetch(resource, options);
+      };
+      window.__releaseBoundaryChunk = () => {
+        const request = deferredNextChunk;
+        deferredNextChunk = null;
+        originalFetch(request.resource, request.options).then(request.resolve, request.reject);
+      };
+      window.__restoreAudioBoundary = () => {
+        window.fetch = originalFetch;
+        window.Audio = NativeAudio;
+      };
       window.__audioBoundaryStates = [document.documentElement.dataset.audioState];
       window.__audioBoundaryObserver = new MutationObserver(() => {
         window.__audioBoundaryStates.push(document.documentElement.dataset.audioState);
@@ -2597,9 +2627,51 @@ async function run() {
         cdp,
         appSession,
         `document.documentElement.dataset.audioState === 'playing' &&
-          document.querySelector('#current-time').textContent.startsWith('0:16.')`,
+          window.__audioBoundaryRequests.includes('/api/audio/8000') &&
+          window.__audioBoundaryRequests.includes('/api/audio/24000') &&
+          window.__audioBoundaryMedia.length === 1`,
       ),
-      "prefetched backend audio chunk boundary",
+      "current audio while the next chunk is pending",
+      30_000,
+    );
+    const nearBoundaryStartTime = await evaluate(
+      cdp,
+      appSession,
+      "document.querySelector('#current-time').textContent",
+    );
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.documentElement.dataset.audioState === 'playing' &&
+          document.querySelector('#current-time').textContent !== ${JSON.stringify(nearBoundaryStartTime)} &&
+          window.__audioBoundaryMedia.length === 1`,
+      ),
+      "near-boundary playback before next chunk completion",
+    );
+    await evaluate(cdp, appSession, "window.__releaseBoundaryChunk()");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        "window.__audioBoundaryMedia.length === 2 && window.__audioBoundaryMedia[1].readyState >= 1",
+      ),
+      "prefetched next media",
+      30_000,
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const current = window.__audioBoundaryMedia[0];
+      current.currentTime = Math.max(0, current.duration - 0.2);
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.documentElement.dataset.audioState === 'playing' &&
+          !window.__audioBoundaryMedia[1].paused &&
+          document.querySelector('#current-time').textContent.startsWith('0:24.')`,
+      ),
+      "prefetched backend audio chunk handoff",
       30_000,
     );
     const audioBoundary = await evaluate(cdp, appSession, `(() => {
@@ -2610,12 +2682,17 @@ async function run() {
         state: document.documentElement.dataset.audioState,
         time: document.querySelector('#current-time').textContent,
         restarted: states.slice(firstPlaying + 1).includes('starting'),
+        requests: window.__audioBoundaryRequests,
       };
     })()`);
     assert.equal(audioBoundary.state, "playing");
     assert.equal(audioBoundary.restarted, false, "chunk advancement must not restart the transport");
-    assert.match(audioBoundary.time, /^0:16\./);
-    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    assert.match(audioBoundary.time, /^0:24\./);
+    assert.deepEqual(audioBoundary.requests, ["/api/audio/8000", "/api/audio/24000"]);
+    await evaluate(cdp, appSession, `(() => {
+      window.__restoreAudioBoundary();
+      document.querySelector('#play-button').click();
+    })()`);
     await waitFor(
       async () => evaluate(cdp, appSession, "document.documentElement.dataset.audioState === 'idle'"),
       "boundary playback pause",

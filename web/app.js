@@ -73,8 +73,8 @@
   const EDIT_ACCEPTANCE_TIMEOUT_MS = 10_000;
   const PENDING_EDIT_STORAGE_KEY = "daw-ai.pending-edit.v1";
   const AUDIO_CHUNK_SECONDS = 16;
+  const AUDIO_CHUNK_STRIDE_SECONDS = AUDIO_CHUNK_SECONDS / 2;
   const AUDIO_PREFETCH_LEAD_SECONDS = 12;
-  const AUDIO_PREFETCH_GUARD_SECONDS = 4;
 
   class AudioEngine {
     constructor() {
@@ -128,18 +128,6 @@
           this.releaseMedia(chunk.media);
           return;
         }
-        const remaining = chunk.end - this.playhead;
-        const prefetch =
-          remaining <= AUDIO_PREFETCH_GUARD_SECONDS
-            ? this.beginPrefetch(chunk, generation)
-            : null;
-        if (prefetch) {
-          await prefetch.promise;
-        }
-        if (generation !== this.playbackGeneration || this.playbackState !== "starting") {
-          this.releaseMedia(chunk.media);
-          return;
-        }
         chunk.media.currentTime = clamp(this.playhead - chunk.start, 0, chunk.media.duration);
         await chunk.media.play();
         if (generation !== this.playbackGeneration || this.playbackState !== "starting") {
@@ -161,7 +149,8 @@
 
     async backendAudioChunk(position) {
       let projectVersion = this.project.version;
-      const chunkStart = Math.floor(position / AUDIO_CHUNK_SECONDS) * AUDIO_CHUNK_SECONDS;
+      const chunkStart =
+        Math.floor(position / AUDIO_CHUNK_STRIDE_SECONDS) * AUDIO_CHUNK_STRIDE_SECONDS;
       if (this.chunkCacheVersion !== projectVersion) {
         this.chunkCache.clear();
         this.chunkCacheVersion = projectVersion;
