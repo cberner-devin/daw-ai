@@ -77,6 +77,7 @@ fn install_shutdown_handlers() {}
 
 fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let response = match Request::read(stream) {
         Ok(request) => {
             if request.path.starts_with("/api/audio-stream/") {
@@ -723,8 +724,7 @@ impl Router {
                 .write(output);
         }
 
-        let sample_count =
-            ((project.duration - start) * audio_analysis::SAMPLE_RATE as f32).ceil() as usize;
+        let sample_count = audio_analysis::playback_sample_count(start, project.duration);
         write_response_head(
             output,
             200,
@@ -2661,6 +2661,10 @@ mod tests {
     #[test]
     fn streams_one_continuous_wav_through_the_reusable_media_endpoint() {
         let router = Router::demo();
+        let mut project = router.lock_studio().project().clone();
+        project.duration = 32.123_13;
+        project.bpm = 113;
+        *router.lock_studio() = Studio::from_project(project);
         let access = router.handle(&audio_request("/api/audio-access"));
         assert_eq!(access.status, 200);
         let access: serde_json::Value =
@@ -2680,12 +2684,14 @@ mod tests {
             )
             .expect("continuous WAV stream");
         let body_start = find_bytes(&stream, b"\r\n\r\n").expect("HTTP response head") + 4;
+        let response_head =
+            std::str::from_utf8(&stream[..body_start]).expect("UTF-8 response head");
         let body = &stream[body_start..];
-        let expected_samples = (router.lock_studio().project().duration
-            * audio_analysis::SAMPLE_RATE as f32)
-            .ceil() as usize;
+        let expected_samples =
+            audio_analysis::playback_sample_count(0.0, router.lock_studio().project().duration);
 
         assert!(stream.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\n"));
+        assert!(response_head.contains(&format!("Content-Length: {}\r\n", body.len())));
         assert_eq!(body.len(), 44 + expected_samples * 2);
         assert_eq!(&body[..4], b"RIFF");
         assert_eq!(&body[8..12], b"WAVE");
