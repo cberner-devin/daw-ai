@@ -72,9 +72,7 @@
   const RECONCILED_REQUEST_TIMEOUT_MS = 2000;
   const EDIT_ACCEPTANCE_TIMEOUT_MS = 10_000;
   const PENDING_EDIT_STORAGE_KEY = "daw-ai.pending-edit.v1";
-  const AUDIO_CHUNK_SECONDS = 16;
-  const AUDIO_CHUNK_STRIDE_SECONDS = AUDIO_CHUNK_SECONDS / 2;
-  const AUDIO_PREFETCH_LEAD_SECONDS = 12;
+  const AUDIO_RETRY_DELAYS_MS = [250, 500, 1000];
 
   class AudioEngine {
     constructor() {
@@ -82,15 +80,27 @@
       this.playbackGeneration = 0;
       this.playhead = 0;
       this.timer = null;
-      this.media = null;
+      this.media = new Audio();
+      this.media.preload = "auto";
       this.audioUrl = null;
       this.audioVersion = null;
       this.audioStart = 0;
-      this.audioEnd = 0;
-      this.prefetch = null;
-      this.transitioning = false;
-      this.chunkCache = new Map();
-      this.chunkCacheVersion = null;
+      this.streamToken = null;
+      this.streamAttempt = 0;
+      this.retryTimer = null;
+      this.retryAttempts = 0;
+      this.media.addEventListener("ended", () => {
+        if (this.isActive) this.stop(false);
+      });
+      this.media.addEventListener("error", () => {
+        if (this.isActive) {
+          this.retryPlayback(
+            new Error("The browser could not continue the backend audio stream."),
+            this.playbackGeneration,
+            this.streamAttempt,
+          );
+        }
+      });
     }
 
     get project() {
@@ -105,215 +115,89 @@
       return this.playbackState !== "idle";
     }
 
-    async toggle() {
-      if (this.isActive) {
-        this.stop(true);
-      } else {
-        await this.start();
+    async initialize() {
+      const access = await api("/api/audio-access", {
+        headers: { "X-DAW-AI-Audio": "1" },
+      });
+      if (typeof access?.streamToken !== "string" || access.streamToken.length < 16) {
+        throw new Error("The backend returned an invalid audio stream token.");
       }
+      this.streamToken = access.streamToken;
+      elements.playButton.disabled = false;
     }
 
-    async start() {
-      if (!this.project || this.isActive) return;
+    toggle() {
+      if (this.isActive) {
+        this.stop(true);
+        return Promise.resolve();
+      }
+      return this.start();
+    }
+
+    start() {
+      if (!this.project || !this.streamToken || this.isActive) return Promise.resolve();
       if (this.playhead >= this.project.duration - 0.01) this.playhead = 0;
       this.playbackState = "starting";
       this.playbackGeneration += 1;
+      this.retryAttempts = 0;
       const generation = this.playbackGeneration;
       updateTransport();
+      return this.startStream(generation);
+    }
 
-      let chunk = null;
+    startStream(generation) {
+      if (generation !== this.playbackGeneration || !this.isActive) return Promise.resolve();
+      const streamAttempt = (this.streamAttempt += 1);
+      const startMilliseconds = Math.round(this.playhead * 1000);
+      this.audioStart = startMilliseconds / 1000;
+      this.audioVersion = this.project.version;
+      this.audioUrl = `/api/audio-stream/${encodeURIComponent(this.streamToken)}/${this.audioVersion}/${startMilliseconds}?attempt=${streamAttempt}`;
+      this.media.src = this.audioUrl;
+      this.media.currentTime = 0;
+      this.media.load();
+
+      let playback;
       try {
-        chunk = await this.prepareChunk(this.playhead);
-        if (generation !== this.playbackGeneration || this.playbackState !== "starting") {
-          this.releaseMedia(chunk.media);
-          return;
-        }
-        chunk.media.currentTime = clamp(this.playhead - chunk.start, 0, chunk.media.duration);
-        await chunk.media.play();
-        if (generation !== this.playbackGeneration || this.playbackState !== "starting") {
-          this.releaseMedia(chunk.media);
-          return;
-        }
-        this.installChunk(chunk, generation);
-        this.playbackState = "playing";
-        this.timer = window.setInterval(() => this.tick(), 50);
-        this.tick();
-        updateTransport();
+        // Calling play before yielding preserves the initiating user gesture on WebKit.
+        playback = this.media.play();
       } catch (error) {
-        if (generation !== this.playbackGeneration) return;
-        if (chunk?.media !== this.media) this.releaseMedia(chunk?.media);
-        this.stop(true);
-        showError(error, "starting backend audio", "Could not start audio: ");
+        this.retryPlayback(error, generation, streamAttempt);
+        return Promise.resolve();
       }
-    }
-
-    async backendAudioChunk(position) {
-      let projectVersion = this.project.version;
-      const chunkStart =
-        Math.floor(position / AUDIO_CHUNK_STRIDE_SECONDS) * AUDIO_CHUNK_STRIDE_SECONDS;
-      if (this.chunkCacheVersion !== projectVersion) {
-        this.chunkCache.clear();
-        this.chunkCacheVersion = projectVersion;
-      }
-      const cached = this.chunkCache.get(chunkStart);
-      if (cached) return cached;
-      const startMilliseconds = Math.round(chunkStart * 1_000);
-      const rendered = await api(
-        `/api/audio/${startMilliseconds}`,
-        { headers: { "X-DAW-AI-Audio": "1" } },
-        60_000,
-      );
-      if (rendered?.projectVersion !== projectVersion) {
-        if (state.promptPending) {
-          projectVersion = rendered.projectVersion;
-        } else {
-          const currentProject = await api("/api/project");
-          if (currentProject.version !== rendered?.projectVersion) {
-            throw new Error("The project changed while backend audio was rendering.");
+      return Promise.resolve(playback)
+        .then(() => {
+          if (
+            generation !== this.playbackGeneration ||
+            streamAttempt !== this.streamAttempt ||
+            !this.isActive
+          ) {
+            return;
           }
-          state.project = currentProject;
-          projectVersion = currentProject.version;
-          renderProject();
-        }
-      }
-      if (
-        rendered?.channels !== 1 ||
-        !Number.isFinite(rendered?.sampleRate) ||
-        rendered.sampleRate <= 0 ||
-        !Number.isFinite(rendered?.start) ||
-        !Number.isFinite(rendered?.end) ||
-        rendered.start > position + 0.001 ||
-        rendered.end <= position ||
-        typeof rendered?.wav !== "string" ||
-        rendered.wav.length === 0
-      ) {
-        throw new Error("The backend returned invalid or stale playback audio.");
-      }
-      const bytes = base64Bytes(rendered.wav);
-      if (
-        bytes.length < 44 ||
-        String.fromCharCode(...bytes.subarray(0, 4)) !== "RIFF" ||
-        String.fromCharCode(...bytes.subarray(8, 12)) !== "WAVE"
-      ) {
-        throw new Error("The backend returned an invalid WAV file.");
-      }
-      if (this.chunkCacheVersion !== projectVersion) {
-        this.chunkCache.clear();
-        this.chunkCacheVersion = projectVersion;
-      }
-      const chunk = {
-        source: `data:audio/wav;base64,${rendered.wav}`,
-        version: projectVersion,
-        start: rendered.start,
-        end: rendered.end,
-      };
-      this.chunkCache.set(chunk.start, chunk);
-      while (this.chunkCache.size > 3) this.chunkCache.delete(this.chunkCache.keys().next().value);
-      return chunk;
-    }
-
-    async prepareChunk(position) {
-      const chunk = await this.backendAudioChunk(position);
-      const media = new Audio();
-      media.preload = "auto";
-      media.src = chunk.source;
-      try {
-        await this.waitForMetadata(media);
-        return { ...chunk, media };
-      } catch (error) {
-        this.releaseMedia(media);
-        throw error;
-      }
-    }
-
-    beginPrefetch(chunk, generation) {
-      if (chunk.end >= this.project.duration - 0.01) return null;
-      if (
-        this.prefetch &&
-        this.prefetch.generation === generation &&
-        Math.abs(this.prefetch.start - chunk.end) < 0.001
-      ) {
-        return this.prefetch;
-      }
-      const entry = {
-        generation,
-        start: chunk.end,
-        promise: this.prepareChunk(chunk.end),
-      };
-      entry.promise
-        .then((prepared) => {
-          if (generation !== this.playbackGeneration && prepared.media !== this.media) {
-            this.releaseMedia(prepared.media);
-          }
+          this.playbackState = "playing";
+          window.clearInterval(this.timer);
+          this.timer = window.setInterval(() => this.tick(), 50);
+          this.tick();
+          updateTransport();
         })
-        .catch(() => {});
-      this.prefetch = entry;
-      return entry;
-    }
-
-    installChunk(chunk, generation) {
-      this.media = chunk.media;
-      this.audioUrl = chunk.source;
-      this.audioVersion = chunk.version;
-      this.audioStart = chunk.start;
-      this.audioEnd = chunk.end;
-      chunk.media.addEventListener(
-        "ended",
-        () => {
-          if (this.media === chunk.media) void this.advanceChunk(chunk.media, generation);
-        },
-        { once: true },
-      );
-    }
-
-    releaseMedia(media) {
-      if (!media) return;
-      media.pause();
-      media.removeAttribute("src");
-      media.load();
-    }
-
-    waitForMetadata(media) {
-      if (media.readyState >= HTMLMediaElement.HAVE_METADATA) return Promise.resolve();
-      return new Promise((resolve, reject) => {
-        const loaded = () => {
-          cleanup();
-          resolve();
-        };
-        const failed = () => {
-          cleanup();
-          reject(new Error("The browser could not decode backend playback audio."));
-        };
-        const cleanup = () => {
-          media.removeEventListener("loadedmetadata", loaded);
-          media.removeEventListener("error", failed);
-        };
-        media.addEventListener("loadedmetadata", loaded, { once: true });
-        media.addEventListener("error", failed, { once: true });
-        media.load();
-      });
+        .catch((error) => {
+          this.retryPlayback(error, generation, streamAttempt);
+        });
     }
 
     stop(preservePosition) {
       if (preservePosition) this.updatePosition();
       this.playbackGeneration += 1;
       this.playbackState = "idle";
-      this.transitioning = false;
       window.clearInterval(this.timer);
       this.timer = null;
-      if (this.media) {
-        this.releaseMedia(this.media);
-        this.media = null;
-      }
-      const prefetch = this.prefetch;
-      this.prefetch = null;
-      if (prefetch) {
-        void prefetch.promise
-          .then((chunk) => {
-            if (chunk.media !== this.media) this.releaseMedia(chunk.media);
-          })
-          .catch(() => {});
-      }
+      window.clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+      this.retryAttempts = 0;
+      this.media.pause();
+      this.media.removeAttribute("src");
+      this.media.load();
+      this.audioUrl = null;
+      this.audioVersion = null;
       if (!preservePosition) this.playhead = 0;
       updateTransport();
       renderPlayhead();
@@ -329,66 +213,46 @@
     }
 
     updatePosition() {
-      if (!this.media || !Number.isFinite(this.media.currentTime)) return;
+      if (!Number.isFinite(this.media.currentTime)) return;
       this.playhead = Math.min(this.project.duration, this.audioStart + this.media.currentTime);
     }
 
-    async advanceChunk(media, generation) {
-      if (!this.isPlaying || this.transitioning || this.media !== media) return;
-      this.transitioning = true;
-      this.updatePosition();
-      if (this.audioEnd >= this.project.duration - 0.01) {
-        this.stop(false);
+    retryPlayback(error, generation, streamAttempt) {
+      if (
+        generation !== this.playbackGeneration ||
+        streamAttempt !== this.streamAttempt ||
+        !this.isActive ||
+        this.retryTimer !== null
+      ) {
         return;
       }
-      const prefetch = this.prefetch;
-      this.prefetch = null;
-      try {
-        const chunk =
-          prefetch && Math.abs(prefetch.start - this.audioEnd) < 0.001
-            ? await prefetch.promise
-            : await this.prepareChunk(this.audioEnd);
-        if (generation !== this.playbackGeneration || !this.isPlaying || this.media !== media) {
-          this.releaseMedia(chunk.media);
-          return;
-        }
-        chunk.media.currentTime = 0;
-        await chunk.media.play();
-        if (generation !== this.playbackGeneration || !this.isPlaying || this.media !== media) {
-          this.releaseMedia(chunk.media);
-          return;
-        }
-        this.installChunk(chunk, generation);
-        this.releaseMedia(media);
-        this.transitioning = false;
-        this.updatePosition();
-        updateTransport();
-        renderPlayhead();
-      } catch (error) {
-        if (generation !== this.playbackGeneration) return;
+      if (error?.name === "NotAllowedError" || this.retryAttempts >= AUDIO_RETRY_DELAYS_MS.length) {
         this.stop(true);
-        showError(error, "continuing backend audio", "Could not continue audio: ");
+        showError(error, "playing backend audio", "Could not play audio: ");
+        return;
       }
+      this.updatePosition();
+      window.clearInterval(this.timer);
+      this.timer = null;
+      this.playbackState = "starting";
+      const delay = AUDIO_RETRY_DELAYS_MS[this.retryAttempts];
+      this.retryAttempts += 1;
+      this.retryTimer = window.setTimeout(() => {
+        this.retryTimer = null;
+        if (generation === this.playbackGeneration && this.isActive) {
+          void this.startStream(generation);
+        }
+      }, delay);
+      updateTransport();
     }
 
     tick() {
       if (!this.isPlaying) return;
       this.updatePosition();
+      if (this.retryAttempts > 0 && this.media.currentTime >= 2) this.retryAttempts = 0;
       if (this.playhead >= this.project.duration) {
         this.stop(false);
         return;
-      }
-      if (
-        !this.prefetch &&
-        !this.transitioning &&
-        this.audioEnd - this.playhead <= AUDIO_PREFETCH_LEAD_SECONDS
-      ) {
-        this.beginPrefetch(
-          {
-            end: this.audioEnd,
-          },
-          this.playbackGeneration,
-        );
       }
       updateTransport();
       renderPlayhead();
@@ -396,15 +260,6 @@
   }
 
   const audio = new AudioEngine();
-
-  function base64Bytes(source) {
-    const binary = window.atob(source);
-    const bytes = new Uint8Array(binary.length);
-    for (let index = 0; index < binary.length; index += 1) {
-      bytes[index] = binary.charCodeAt(index);
-    }
-    return bytes;
-  }
 
   class ApiError extends Error {
     constructor(message, status, retryable) {
@@ -1857,7 +1712,7 @@
       `Viewport: ${window.innerWidth}x${window.innerHeight} at ${window.devicePixelRatio || 1}x`,
       `Network: ${navigator.onLine ? "online" : "offline"}`,
       `View: ${state.activeView}`,
-      `Audio: ${audio.playbackState}; backend WAV ${audio.audioVersion ?? "not loaded"}`,
+      `Audio: ${audio.playbackState}; continuous stream ${audio.audioVersion ?? "not loaded"}`,
       `AI edit: ${state.promptPending ? "pending" : "idle"}`,
       `Gemini sessions: ${state.geminiSessions.length} retained locally`,
       `Selection: ${state.selectionStart.toFixed(1)}s - ${state.selectionEnd.toFixed(1)}s`,
@@ -2049,6 +1904,11 @@
     if (pending) {
       if (!elements.promptInput.value) elements.promptInput.value = pending.submittedText;
       showPendingEdit("Reconnecting to the active AI edit");
+    }
+    try {
+      await audio.initialize();
+    } catch (error) {
+      showError(error, "initializing audio", "Could not initialize audio: ");
     }
     await loadProject();
     await loadGeminiSessions();

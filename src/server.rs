@@ -79,6 +79,9 @@ fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let response = match Request::read(stream) {
         Ok(request) => {
+            if request.path.starts_with("/api/audio-stream/") {
+                return router.write_playback_stream(&request, stream);
+            }
             let response = router.handle(&request);
             log_http_response(&request, &response);
             response
@@ -98,6 +101,7 @@ struct Router {
     planner: Planner,
     edit_jobs: Arc<EditJobs>,
     audio_cache: Arc<AudioCache>,
+    audio_token: Arc<String>,
 }
 
 #[derive(Clone)]
@@ -288,6 +292,39 @@ impl AudioCache {
         self.completed.notify_all();
         rendered.map_err(AudioCacheError::Render)
     }
+
+    fn stream_region(
+        &self,
+        project: &crate::model::Project,
+        start: f32,
+    ) -> Result<(audio_analysis::AudioRegion, f32), AudioCacheError> {
+        let render_key = format!("stream:{start:.3}\n{}", project.to_json());
+        loop {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.rendering.is_some() {
+                drop(
+                    self.completed
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+            } else {
+                state.rendering = Some(render_key.clone());
+                break;
+            }
+        }
+
+        let rendered = audio_analysis::render_project_region(project, start);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.rendering = None;
+        self.completed.notify_all();
+        rendered.map_err(AudioCacheError::Render)
+    }
 }
 
 impl EditJobs {
@@ -458,6 +495,7 @@ impl Router {
             planner,
             edit_jobs: Arc::new(EditJobs::new()),
             audio_cache: Arc::new(AudioCache::default()),
+            audio_token: Arc::new(new_operation_id(0)),
         })
     }
 
@@ -469,6 +507,7 @@ impl Router {
             planner: Planner::Demo,
             edit_jobs: Arc::new(EditJobs::new()),
             audio_cache: Arc::new(AudioCache::default()),
+            audio_token: Arc::new("test-audio-token".to_owned()),
         }
     }
 
@@ -478,6 +517,19 @@ impl Router {
         };
         if request.is_mutation() && !request.is_trusted_mutation(public_host) {
             return Response::json(403, error_json("cross-origin request rejected"));
+        }
+        if request.path == "/api/audio-access" {
+            if request.method != "GET" {
+                return Response::json(405, error_json("method not allowed"))
+                    .with_header("Allow", "GET");
+            }
+            if !request.is_trusted_audio(public_host) {
+                return Response::json(403, error_json("cross-origin audio request rejected"));
+            }
+            return Response::json(
+                200,
+                format!("{{\"streamToken\":{}}}", json_string(&self.audio_token)),
+            );
         }
         if let Some(start_milliseconds) = playback_audio_start(&request.path) {
             if request.method != "GET" {
@@ -640,6 +692,64 @@ impl Router {
                 Response::json(500, error_json("could not render playback audio"))
             }
         }
+    }
+
+    fn write_playback_stream(&self, request: &Request, output: &mut impl Write) -> io::Result<()> {
+        let Some(public_host) = request.public_host() else {
+            return Response::json(400, error_json("invalid host")).write(output);
+        };
+        if request.method != "GET" {
+            return Response::json(405, error_json("method not allowed"))
+                .with_header("Allow", "GET")
+                .write(output);
+        }
+        let Some((token, version, start_milliseconds)) = playback_audio_stream(&request.path)
+        else {
+            return Response::json(404, error_json("audio stream not found")).write(output);
+        };
+        if token != self.audio_token.as_str() || !request.is_trusted_request(public_host) {
+            return Response::json(403, error_json("cross-origin audio request rejected"))
+                .write(output);
+        }
+
+        let project = self.lock_studio().project().clone();
+        if version != project.version {
+            return Response::json(409, error_json("project changed before playback started"))
+                .write(output);
+        }
+        let start = start_milliseconds as f32 / 1_000.0;
+        if !start.is_finite() || start < 0.0 || start >= project.duration {
+            return Response::json(422, error_json("playback start is outside the project"))
+                .write(output);
+        }
+
+        let sample_count =
+            ((project.duration - start) * audio_analysis::SAMPLE_RATE as f32).ceil() as usize;
+        write_response_head(
+            output,
+            200,
+            "audio/wav",
+            44_usize.saturating_add(sample_count.saturating_mul(2)),
+            &[("Cache-Control", "no-store")],
+        )?;
+        output.write_all(&audio_analysis::wav_header(sample_count))?;
+
+        let mut remaining = sample_count;
+        let mut cursor = start;
+        while remaining > 0 {
+            let (region, end) = match self.audio_cache.stream_region(&project, cursor) {
+                Ok(rendered) => rendered,
+                Err(AudioCacheError::Render(error)) => {
+                    eprintln!("error: could not render playback stream: {error}");
+                    return Err(io::Error::other("could not render playback stream"));
+                }
+            };
+            let count = region.samples.len().min(remaining);
+            output.write_all(&audio_analysis::pcm_bytes(&region.samples[..count]))?;
+            remaining -= count;
+            cursor = end;
+        }
+        Ok(())
     }
 
     fn edit_status(&self, job_id: u64) -> Response {
@@ -1263,41 +1373,54 @@ impl Response {
     }
 
     fn write(&self, stream: &mut impl Write) -> io::Result<()> {
-        let reason = match self.status {
-            200 => "OK",
-            202 => "Accepted",
-            400 => "Bad Request",
-            403 => "Forbidden",
-            404 => "Not Found",
-            405 => "Method Not Allowed",
-            409 => "Conflict",
-            422 => "Unprocessable Content",
-            _ => "Error",
-        };
-        let mut head = format!(
-            concat!(
-                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n",
-                "Connection: close\r\nX-Content-Type-Options: nosniff\r\n",
-                "Content-Security-Policy: default-src 'self'; script-src 'self'; ",
-                "style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; ",
-                "media-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none';\r\n",
-                "Referrer-Policy: no-referrer\r\n"
-            ),
+        write_response_head(
+            stream,
             self.status,
-            reason,
             self.content_type,
-            self.body.len()
-        );
-        for (name, value) in &self.headers {
-            head.push_str(name);
-            head.push_str(": ");
-            head.push_str(value);
-            head.push_str("\r\n");
-        }
-        head.push_str("\r\n");
-        stream.write_all(head.as_bytes())?;
+            self.body.len(),
+            &self.headers,
+        )?;
         stream.write_all(self.body.as_bytes())
     }
+}
+
+fn write_response_head(
+    stream: &mut impl Write,
+    status: u16,
+    content_type: &str,
+    content_length: usize,
+    headers: &[(&str, &str)],
+) -> io::Result<()> {
+    let reason = match status {
+        200 => "OK",
+        202 => "Accepted",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        422 => "Unprocessable Content",
+        _ => "Error",
+    };
+    let mut head = format!(
+        concat!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n",
+            "Connection: close\r\nX-Content-Type-Options: nosniff\r\n",
+            "Content-Security-Policy: default-src 'self'; script-src 'self'; ",
+            "style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; ",
+            "media-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none';\r\n",
+            "Referrer-Policy: no-referrer\r\n"
+        ),
+        status, reason, content_type, content_length
+    );
+    for (name, value) in headers {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes())
 }
 
 fn new_operation_id(id: u64) -> String {
@@ -1433,6 +1556,17 @@ fn playback_audio_start(path: &str) -> Option<u64> {
         return Some(0);
     }
     path.strip_prefix("/api/audio/")?.parse::<u64>().ok()
+}
+
+fn playback_audio_stream(path: &str) -> Option<(&str, u64, u64)> {
+    let mut parts = path.strip_prefix("/api/audio-stream/")?.split('/');
+    let token = parts.next()?;
+    let version = parts.next()?.parse::<u64>().ok()?;
+    let start_milliseconds = parts.next()?.parse::<u64>().ok()?;
+    if token.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some((token, version, start_milliseconds))
 }
 
 fn edit_operation_id(path: &str) -> Option<&str> {
@@ -1679,6 +1813,7 @@ mod tests {
                 planner: Planner::Demo,
                 edit_jobs: Arc::new(EditJobs::new()),
                 audio_cache: Arc::new(AudioCache::default()),
+                audio_token: Arc::new("test-audio-token".to_owned()),
             },
             path,
         )
@@ -2061,6 +2196,7 @@ mod tests {
             planner: Planner::Demo,
             edit_jobs: Arc::new(EditJobs::new()),
             audio_cache: Arc::new(AudioCache::default()),
+            audio_token: Arc::new("test-audio-token".to_owned()),
         };
         let retried = restarted.handle(&request(
             "POST",
@@ -2505,6 +2641,12 @@ mod tests {
     fn rejects_untrusted_audio_requests() {
         let router = Router::demo();
         assert_eq!(router.handle(&request("GET", "/api/audio", "")).status, 403);
+        assert_eq!(
+            router
+                .handle(&request("GET", "/api/audio-access", ""))
+                .status,
+            403
+        );
 
         let mut hostile = audio_request("/api/audio");
         hostile
@@ -2514,6 +2656,60 @@ mod tests {
             .headers
             .insert("sec-fetch-site".to_owned(), "cross-site".to_owned());
         assert_eq!(router.handle(&hostile).status, 403);
+    }
+
+    #[test]
+    fn streams_one_continuous_wav_through_the_reusable_media_endpoint() {
+        let router = Router::demo();
+        let access = router.handle(&audio_request("/api/audio-access"));
+        assert_eq!(access.status, 200);
+        let access: serde_json::Value =
+            serde_json::from_str(&access.body).expect("audio access JSON");
+        assert_eq!(access["streamToken"], "test-audio-token");
+
+        let version = router.lock_studio().project().version;
+        let mut stream = Vec::new();
+        router
+            .write_playback_stream(
+                &request(
+                    "GET",
+                    &format!("/api/audio-stream/test-audio-token/{version}/0"),
+                    "",
+                ),
+                &mut stream,
+            )
+            .expect("continuous WAV stream");
+        let body_start = find_bytes(&stream, b"\r\n\r\n").expect("HTTP response head") + 4;
+        let body = &stream[body_start..];
+        let expected_samples = (router.lock_studio().project().duration
+            * audio_analysis::SAMPLE_RATE as f32)
+            .ceil() as usize;
+
+        assert!(stream.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\n"));
+        assert_eq!(body.len(), 44 + expected_samples * 2);
+        assert_eq!(&body[..4], b"RIFF");
+        assert_eq!(&body[8..12], b"WAVE");
+        assert_eq!(
+            u32::from_le_bytes(body[40..44].try_into().expect("WAV data length")) as usize,
+            expected_samples * 2
+        );
+        let render_boundary = 44
+            + (audio_analysis::MAX_REGION_SECONDS * audio_analysis::SAMPLE_RATE as f32) as usize
+                * 2;
+        assert_ne!(&body[render_boundary..render_boundary + 4], b"RIFF");
+
+        let mut rejected = Vec::new();
+        router
+            .write_playback_stream(
+                &request(
+                    "GET",
+                    &format!("/api/audio-stream/wrong-token/{version}/0"),
+                    "",
+                ),
+                &mut rejected,
+            )
+            .expect("rejected stream response");
+        assert!(rejected.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
     }
 
     #[test]

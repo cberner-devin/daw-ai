@@ -301,7 +301,6 @@ async function run() {
       "--disable-gpu",
       "--disable-dev-shm-usage",
       "--mute-audio",
-      "--autoplay-policy=no-user-gesture-required",
       `--remote-debugging-port=${debugPort}`,
       `--user-data-dir=${profile}`,
       "about:blank",
@@ -842,7 +841,24 @@ async function run() {
       document.querySelector('#prompt-input').value = '';
     })()`);
 
-    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    await evaluate(cdp, appSession, `(() => {
+      const originalPlay = HTMLMediaElement.prototype.play;
+      window.__transportMedia = null;
+      window.__transportPlayCalls = [];
+      HTMLMediaElement.prototype.play = function play(...args) {
+        if (window.__transportMedia === null) window.__transportMedia = this;
+        window.__transportPlayCalls.push({
+          activeUserGesture: navigator.userActivation.isActive,
+          sameElement: window.__transportMedia === this,
+          source: this.getAttribute('src'),
+        });
+        return originalPlay.apply(this, args);
+      };
+      window.__restoreMediaPlay = () => {
+        HTMLMediaElement.prototype.play = originalPlay;
+      };
+      document.querySelector('#play-button').click();
+    })()`);
     await waitFor(
       async () => {
         const playback = await evaluate(cdp, appSession, `({
@@ -857,6 +873,14 @@ async function run() {
       "playback before prompted edit",
       30_000,
     );
+    const initialPlayCall = await evaluate(
+      cdp,
+      appSession,
+      "window.__transportPlayCalls[0]",
+    );
+    assert.equal(initialPlayCall.activeUserGesture, true, "initial media.play() must retain the Play-button gesture");
+    assert.equal(initialPlayCall.sameElement, true);
+    assert.match(initialPlayCall.source, /^\/api\/audio-stream\//);
     const initialPromptPlaybackTime = await evaluate(
       cdp,
       appSession,
@@ -2522,10 +2546,12 @@ async function run() {
         audioContext: source.includes('AudioContext'),
         offlineContext: source.includes('OfflineAudioContext'),
         oscillator: source.includes('createOscillator'),
-        backendEndpoint: source.includes('/api/audio'),
+        backendEndpoint: source.includes('/api/audio-stream/'),
         mediaClock: engine.includes('media.currentTime'),
         performanceClock: engine.includes('performance.now'),
         prefetch: engine.includes('beginPrefetch'),
+        reusableMedia: (engine.match(/new Audio\(\)/g) || []).length,
+        boundedRetry: engine.includes('AUDIO_RETRY_DELAYS_MS') && engine.includes('retryPlayback'),
       };
     })()`);
     assert.deepEqual(
@@ -2537,9 +2563,11 @@ async function run() {
         backendEndpoint: true,
         mediaClock: true,
         performanceClock: false,
-        prefetch: true,
+        prefetch: false,
+        reusableMedia: 1,
+        boundedRetry: true,
       },
-      "the browser client must only transport audio rendered by the backend",
+      "the browser client must use one retryable transport for backend-rendered audio",
     );
 
     await evaluate(cdp, appSession, "document.querySelector('#rewind-button').click()");
@@ -2582,36 +2610,50 @@ async function run() {
       for (let index = 0; index < 63; index += 1) {
         lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
       }
-      const NativeAudio = window.Audio;
-      const originalFetch = window.fetch;
-      let deferredNextChunk = null;
-      window.__audioBoundaryMedia = [];
-      window.__audioBoundaryRequests = [];
-      window.Audio = function Audio(...args) {
-        const media = new NativeAudio(...args);
-        window.__audioBoundaryMedia.push(media);
-        return media;
-      };
-      window.fetch = function fetch(resource, options) {
-        if (typeof resource === 'string' && resource.startsWith('/api/audio/')) {
-          window.__audioBoundaryRequests.push(resource);
-        }
-        if (resource === '/api/audio/24000') {
-          return new Promise((resolve, reject) => {
-            deferredNextChunk = { resource, options, resolve, reject };
-          });
-        }
-        return originalFetch(resource, options);
-      };
-      window.__releaseBoundaryChunk = () => {
-        const request = deferredNextChunk;
-        deferredNextChunk = null;
-        originalFetch(request.resource, request.options).then(request.resolve, request.reject);
-      };
-      window.__restoreAudioBoundary = () => {
-        window.fetch = originalFetch;
-        window.Audio = NativeAudio;
-      };
+      window.__audioPlayCountBeforeBoundary = window.__transportPlayCalls.length;
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.documentElement.dataset.audioState === 'playing' &&
+          window.__transportPlayCalls.length === window.__audioPlayCountBeforeBoundary + 1 &&
+          window.__transportMedia.getAttribute('src').startsWith('/api/audio-stream/')`,
+      ),
+      "continuous backend audio stream",
+      30_000,
+    );
+    const playCountBeforeRetry = await evaluate(
+      cdp,
+      appSession,
+      "window.__transportPlayCalls.length",
+    );
+    await evaluate(cdp, appSession, "window.__transportMedia.dispatchEvent(new Event('error'))");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.documentElement.dataset.audioState === 'playing' &&
+          window.__transportPlayCalls.length === ${playCountBeforeRetry + 1}`,
+      ),
+      "successful retry after a transient audio stream failure",
+      30_000,
+    );
+    const retriedTransport = await evaluate(cdp, appSession, `({
+      sameElement: window.__transportPlayCalls.every((call) => call.sameElement),
+      latestSource: window.__transportPlayCalls.at(-1).source,
+      previousSource: window.__transportPlayCalls.at(-2).source,
+    })`);
+    assert.equal(retriedTransport.sameElement, true, "every playback and retry must reuse one media element");
+    assert.notEqual(
+      retriedTransport.latestSource,
+      retriedTransport.previousSource,
+      "a retry must request a fresh stream from the preserved playhead",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      window.__audioBoundaryPlayCount = window.__transportPlayCalls.length;
+      window.__audioBoundarySource = window.__transportMedia.getAttribute('src');
       window.__audioBoundaryStates = [document.documentElement.dataset.audioState];
       window.__audioBoundaryObserver = new MutationObserver(() => {
         window.__audioBoundaryStates.push(document.documentElement.dataset.audioState);
@@ -2620,79 +2662,34 @@ async function run() {
         attributes: true,
         attributeFilter: ['data-audio-state'],
       });
-      document.querySelector('#play-button').click();
+      window.__transportMedia.currentTime = 16.05;
     })()`);
     await waitFor(
       async () => evaluate(
         cdp,
         appSession,
         `document.documentElement.dataset.audioState === 'playing' &&
-          window.__audioBoundaryRequests.includes('/api/audio/8000') &&
-          window.__audioBoundaryRequests.includes('/api/audio/24000') &&
-          window.__audioBoundaryMedia.length === 1`,
+          document.querySelector('#current-time').textContent.startsWith('0:31.')`,
       ),
-      "current audio while the next chunk is pending",
-      30_000,
-    );
-    const nearBoundaryStartTime = await evaluate(
-      cdp,
-      appSession,
-      "document.querySelector('#current-time').textContent",
-    );
-    await waitFor(
-      async () => evaluate(
-        cdp,
-        appSession,
-        `document.documentElement.dataset.audioState === 'playing' &&
-          document.querySelector('#current-time').textContent !== ${JSON.stringify(nearBoundaryStartTime)} &&
-          window.__audioBoundaryMedia.length === 1`,
-      ),
-      "near-boundary playback before next chunk completion",
-    );
-    await evaluate(cdp, appSession, "window.__releaseBoundaryChunk()");
-    await waitFor(
-      async () => evaluate(
-        cdp,
-        appSession,
-        "window.__audioBoundaryMedia.length === 2 && window.__audioBoundaryMedia[1].readyState >= 1",
-      ),
-      "prefetched next media",
-      30_000,
-    );
-    await evaluate(cdp, appSession, `(() => {
-      const current = window.__audioBoundaryMedia[0];
-      current.currentTime = Math.max(0, current.duration - 0.2);
-    })()`);
-    await waitFor(
-      async () => evaluate(
-        cdp,
-        appSession,
-        `document.documentElement.dataset.audioState === 'playing' &&
-          !window.__audioBoundaryMedia[1].paused &&
-          document.querySelector('#current-time').textContent.startsWith('0:24.')`,
-      ),
-      "prefetched backend audio chunk handoff",
+      "playback across the backend render boundary",
       30_000,
     );
     const audioBoundary = await evaluate(cdp, appSession, `(() => {
       window.__audioBoundaryObserver.disconnect();
-      const states = window.__audioBoundaryStates;
-      const firstPlaying = states.indexOf('playing');
       return {
         state: document.documentElement.dataset.audioState,
         time: document.querySelector('#current-time').textContent,
-        restarted: states.slice(firstPlaying + 1).includes('starting'),
-        requests: window.__audioBoundaryRequests,
+        restarted: window.__audioBoundaryStates.includes('starting'),
+        playCalls: window.__transportPlayCalls.length - window.__audioBoundaryPlayCount,
+        sameSource: window.__transportMedia.getAttribute('src') === window.__audioBoundarySource,
       };
     })()`);
     assert.equal(audioBoundary.state, "playing");
-    assert.equal(audioBoundary.restarted, false, "chunk advancement must not restart the transport");
-    assert.match(audioBoundary.time, /^0:24\./);
-    assert.deepEqual(audioBoundary.requests, ["/api/audio/8000", "/api/audio/24000"]);
-    await evaluate(cdp, appSession, `(() => {
-      window.__restoreAudioBoundary();
-      document.querySelector('#play-button').click();
-    })()`);
+    assert.equal(audioBoundary.restarted, false, "render boundaries must not restart the transport");
+    assert.equal(audioBoundary.playCalls, 0, "render boundaries must not invoke another media player");
+    assert.equal(audioBoundary.sameSource, true, "render boundaries must remain in one media resource");
+    assert.match(audioBoundary.time, /^0:31\./);
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await waitFor(
       async () => evaluate(cdp, appSession, "document.documentElement.dataset.audioState === 'idle'"),
       "boundary playback pause",
