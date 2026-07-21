@@ -390,11 +390,16 @@ async function run() {
       appSession,
       `(async () => {
         const project = await fetch('/api/project').then((response) => response.json());
-        const rendered = await fetch('/api/audio', {
+        const access = await fetch('/api/audio-access', {
           headers: { 'X-DAW-AI-Audio': '1' },
         }).then((response) => response.json());
-        const binary = atob(rendered.wav);
-        const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+        const duration = 16;
+        const lastByte = 44 + duration * 16000 * 2 - 1;
+        const response = await fetch(
+          '/api/audio-stream/' + encodeURIComponent(access.streamToken) + '/' + project.version + '/0',
+          { headers: { Range: 'bytes=0-' + lastByte } },
+        );
+        const bytes = new Uint8Array(await response.arrayBuffer());
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
         let maximum = 0;
         for (let offset = 44; offset < bytes.length; offset += 2) {
@@ -406,11 +411,11 @@ async function run() {
           channels: view.getUint16(22, true),
           sampleRate: view.getUint32(24, true),
           length: bytes.length,
-          expectedLength: 44 + Math.ceil((rendered.end - rendered.start) * view.getUint32(24, true)) * 2,
-          projectVersion: rendered.projectVersion,
+          expectedLength: lastByte + 1,
+          projectVersion: project.version,
           expectedVersion: project.version,
-          start: rendered.start,
-          end: rendered.end,
+          start: 0,
+          end: duration,
           maximum,
         };
       })()`,
@@ -2806,10 +2811,19 @@ async function run() {
 
     const backendRenderChange = await evaluate(cdp, appSession, `(async () => {
       const project = await fetch('/api/project').then((response) => response.json());
-      const bass = project.tracks.find((track) => track.role === 'bass');
-      const before = await fetch('/api/audio', {
+      const access = await fetch('/api/audio-access', {
         headers: { 'X-DAW-AI-Audio': '1' },
       }).then((response) => response.json());
+      const render = async (version) => {
+        const response = await fetch(
+          '/api/audio-stream/' + encodeURIComponent(access.streamToken) + '/' + version + '/0',
+          { headers: { Range: 'bytes=44-4095' } },
+        );
+        if (!response.ok) throw new Error(await response.text());
+        return new Uint8Array(await response.arrayBuffer());
+      };
+      const bass = project.tracks.find((track) => track.role === 'bass');
+      const before = await render(project.version);
       const changedVolume = bass.volume > 0.4 ? 0.25 : 0.75;
       const changed = await fetch('/api/mix', {
         method: 'POST',
@@ -2817,15 +2831,14 @@ async function run() {
         body: new URLSearchParams({ track_id: bass.id, volume: changedVolume }),
       });
       if (!changed.ok) throw new Error(await changed.text());
-      const after = await fetch('/api/audio', {
-        headers: { 'X-DAW-AI-Audio': '1' },
-      }).then((response) => response.json());
+      const changedProject = await changed.json();
+      const after = await render(changedProject.version);
       const undone = await fetch('/api/undo', { method: 'POST' });
       if (!undone.ok) throw new Error(await undone.text());
       return {
-        beforeVersion: before.projectVersion,
-        afterVersion: after.projectVersion,
-        changed: before.wav !== after.wav,
+        beforeVersion: project.version,
+        afterVersion: changedProject.version,
+        changed: before.some((value, index) => value !== after[index]),
       };
     })()`);
     assert.equal(backendRenderChange.afterVersion, backendRenderChange.beforeVersion + 1);
