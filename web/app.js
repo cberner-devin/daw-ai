@@ -46,7 +46,8 @@
     debugReport: document.querySelector("#debug-report"),
     copyDebug: document.querySelector("#copy-debug"),
     clearDebug: document.querySelector("#clear-debug"),
-    persistentCodexSessions: document.querySelector("#persistent-codex-sessions"),
+    refreshGeminiSessions: document.querySelector("#refresh-gemini-sessions"),
+    geminiSessionList: document.querySelector("#gemini-session-list"),
     toast: document.querySelector("#toast"),
   };
 
@@ -64,7 +65,7 @@
     toastTimer: null,
     activeView: "ai",
     clientIssues: [],
-    ephemeralCodexSessions: true,
+    geminiSessions: [],
   };
 
   let projectMutationQueue = Promise.resolve();
@@ -73,7 +74,8 @@
   const PENDING_EDIT_STORAGE_KEY = "daw-ai.pending-edit.v1";
 
   class AudioEngine {
-    constructor() {
+    constructor(project = null) {
+      this.renderProject = project;
       this.context = null;
       this.master = null;
       this.playbackState = "idle";
@@ -90,6 +92,10 @@
       this.trackGraphs = new Map();
       this.modulatorPhaseCurves = new Map();
       this.activeSources = new Set();
+    }
+
+    get project() {
+      return this.renderProject ?? state.project;
     }
 
     get isPlaying() {
@@ -109,7 +115,7 @@
     }
 
     async start() {
-      if (!state.project || this.isActive) return;
+      if (!this.project || this.isActive) return;
       this.playbackState = "starting";
       this.playbackGeneration += 1;
       const generation = this.playbackGeneration;
@@ -131,7 +137,7 @@
       ) {
         return;
       }
-      if (this.playhead >= state.project.duration - 0.01) this.playhead = 0;
+      if (this.playhead >= this.project.duration - 0.01) this.playhead = 0;
 
       this.createTrackGraphs();
       this.contextStartedAt = this.context.currentTime;
@@ -184,15 +190,15 @@
     seek(time) {
       const wasActive = this.isActive;
       if (wasActive) this.stop(true);
-      this.playhead = clamp(time, 0, state.project?.duration ?? 0);
+      this.playhead = clamp(time, 0, this.project?.duration ?? 0);
       renderPlayhead();
       updateTransport();
       if (wasActive) void this.start();
     }
 
-    createContext() {
+    createContext(context = null) {
       const AudioContext = window.AudioContext || window.webkitAudioContext;
-      this.context = new AudioContext();
+      this.context = context ?? new AudioContext();
       const compressor = this.context.createDynamicsCompressor();
       compressor.threshold.value = -12;
       compressor.knee.value = 16;
@@ -217,10 +223,31 @@
       }
     }
 
+    async renderOffline(trackIds, start, end) {
+      const selectedTrackIds = new Set(trackIds.map(Number));
+      const project = structuredClone(this.project);
+      for (const track of project.tracks) {
+        if (!selectedTrackIds.has(track.id)) track.muted = true;
+      }
+      const sampleRate = 48_000;
+      const frameCount = Math.ceil((end - start) * sampleRate);
+      const renderer = new AudioEngine(project);
+      renderer.createContext(new OfflineAudioContext(2, frameCount, sampleRate));
+      renderer.createTrackGraphs();
+      renderer.contextStartedAt = 0;
+      renderer.projectStartedAt = start;
+      renderer.nextAutomationTime = start;
+      renderer.scheduleTrackExactBoundaries();
+      renderer.chaseActiveVoices();
+      renderer.scheduleTrackAutomation(start, end);
+      renderer.scheduleWindow(start, end);
+      return renderer.context.startRendering();
+    }
+
     createTrackGraphs() {
       this.trackGraphs.clear();
       this.modulatorPhaseCurves.clear();
-      for (const track of state.project.tracks) {
+      for (const track of this.project.tracks) {
         for (const modulator of track.modulators) {
           this.modulatorPhaseCurves.set(
             `${track.id}:${modulator.id}`,
@@ -262,7 +289,7 @@
         chorusSend.gain.value = 0;
         driveSend.gain.value = 0;
         compressorSend.gain.value = 0;
-        delay.delayTime.value = 60 / state.project.bpm / 2;
+        delay.delayTime.value = 60 / this.project.bpm / 2;
         delay.dawAiEffect = "echo";
         delayFeedback.gain.value = 0.24;
         reverb.buffer = this.reverbImpulse;
@@ -356,9 +383,9 @@
     }
 
     scheduleTrackExactBoundaries() {
-      for (const track of state.project.tracks) {
+      for (const track of this.project.tracks) {
         const boundaries = new Set([this.projectStartedAt]);
-        for (const edit of state.project.edits) {
+        for (const edit of this.project.edits) {
           if (edit.start >= this.projectStartedAt) boundaries.add(edit.start);
           if (edit.end >= this.projectStartedAt) boundaries.add(edit.end);
           this.addExactActionBoundaries(
@@ -368,7 +395,7 @@
             edit.end,
             boundaries,
             this.projectStartedAt,
-            state.project.duration,
+            this.project.duration,
           );
         }
         for (const clip of track.clips) {
@@ -384,11 +411,11 @@
 
     scheduleTrackAutomation(windowStart, windowEnd) {
       if (windowEnd <= windowStart) return;
-      for (const track of state.project.tracks) {
+      for (const track of this.project.tracks) {
         const graphModulators = track.modulators.filter(
           (modulator) => modulator.enabled && !this.isVoiceModulationTarget(modulator.target),
         );
-        const hasAutomation = state.project.edits.some(
+        const hasAutomation = this.project.edits.some(
           (edit) => this.actionAutomatesTrack(edit.action, track.id),
         );
         const interval = Math.min(
@@ -507,8 +534,8 @@
 
     buildModulatorPhaseCurve(track, modulator) {
       const targetId = `modulator:${modulator.id}.rate`;
-      const boundaries = new Set([0, state.project.duration]);
-      for (const edit of state.project.edits) {
+      const boundaries = new Set([0, this.project.duration]);
+      for (const edit of this.project.edits) {
         this.collectRateAutomationBoundaries(
           edit.action,
           track.id,
@@ -522,8 +549,8 @@
       const segments = [];
       let cumulativeCycles = 0;
       for (let index = 1; index < ordered.length; index += 1) {
-        const start = clamp(ordered[index - 1], 0, state.project.duration);
-        const end = clamp(ordered[index], 0, state.project.duration);
+        const start = clamp(ordered[index - 1], 0, this.project.duration);
+        const end = clamp(ordered[index], 0, this.project.duration);
         const duration = end - start;
         if (duration <= 0.000001) continue;
         const firstTime = start + duration * 0.25;
@@ -629,7 +656,7 @@
           );
         }
       }
-      for (const edit of state.project.edits) {
+      for (const edit of this.project.edits) {
         if (time >= edit.start && time < edit.end) {
           this.applyAutomationAction(edit.action, track.role, automation, edit, time);
         }
@@ -646,7 +673,7 @@
       }
       let cycles = this.modulatorCyclesAt(track, modulator, time) -
         this.modulatorCyclesAt(track, modulator, phaseOrigin);
-      if (modulator.rateMode === "tempo") cycles *= state.project.bpm / 60;
+      if (modulator.rateMode === "tempo") cycles *= this.project.bpm / 60;
       const phase = cycles * Math.PI * 2;
       let value;
       if (modulator.shape === "triangle") {
@@ -674,10 +701,10 @@
           const target = `modulator:${modulator.id}.rate`;
           const automatedMaximum = Math.max(
             modulator.parameters.rate,
-            ...state.project.edits.flatMap((edit) => this.automationPointValues(edit.action, target)),
+            ...this.project.edits.flatMap((edit) => this.automationPointValues(edit.action, target)),
           );
           return modulator.rateMode === "tempo"
-            ? automatedMaximum * state.project.bpm / 60
+            ? automatedMaximum * this.project.bpm / 60
             : automatedMaximum;
         }),
         0.01,
@@ -712,7 +739,7 @@
     }
 
     hasParameterAutomation(track, targetId) {
-      return state.project.edits.some((edit) => this.actionAutomates(edit.action, track.id, targetId));
+      return this.project.edits.some((edit) => this.actionAutomates(edit.action, track.id, targetId));
     }
 
     isVoiceModulationTarget(target) {
@@ -722,7 +749,7 @@
     }
 
     lastMidiOnset(track, time) {
-      const beatDuration = 60 / state.project.bpm;
+      const beatDuration = 60 / this.project.bpm;
       let latest = null;
       for (const clip of track.clips) {
         if (time < clip.start) continue;
@@ -757,7 +784,7 @@
 
     automatedParameterAt(track, targetId, baseValue, time) {
       let value = baseValue;
-      for (const edit of state.project.edits) {
+      for (const edit of this.project.edits) {
         const automated = this.automationActionValue(
           edit.action,
           track.id,
@@ -959,13 +986,13 @@
     }
 
     stepDuration() {
-      return 60 / state.project.bpm / 4;
+      return 60 / this.project.bpm / 4;
     }
 
     updatePosition() {
       if (!this.isPlaying || !this.context) return;
       this.playhead = Math.min(
-        state.project.duration,
+        this.project.duration,
         this.projectStartedAt + this.context.currentTime - this.contextStartedAt,
       );
     }
@@ -973,7 +1000,7 @@
     animate() {
       if (!this.isPlaying) return;
       this.updatePosition();
-      if (this.playhead >= state.project.duration) {
+      if (this.playhead >= this.project.duration) {
         this.stop(false);
         return;
       }
@@ -983,22 +1010,22 @@
     }
 
     pump() {
-      if (!this.isPlaying || !state.project) return;
+      if (!this.isPlaying || !this.project) return;
       this.updatePosition();
-      const scheduleUntil = Math.min(this.playhead + 0.22, state.project.duration);
+      const scheduleUntil = Math.min(this.playhead + 0.22, this.project.duration);
       this.nextAutomationTime = Math.max(this.nextAutomationTime, this.playhead);
       this.scheduleTrackAutomation(this.nextAutomationTime, scheduleUntil);
       this.nextAutomationTime = scheduleUntil;
       const stepDuration = this.stepDuration();
-      while (this.nextStep < scheduleUntil && this.nextStep < state.project.duration) {
-        const windowEnd = Math.min(this.nextStep + stepDuration, state.project.duration);
+      while (this.nextStep < scheduleUntil && this.nextStep < this.project.duration) {
+        const windowEnd = Math.min(this.nextStep + stepDuration, this.project.duration);
         this.scheduleWindow(this.nextStep, windowEnd);
         this.nextStep = windowEnd;
       }
     }
 
     scheduleWindow(windowStart, windowEnd) {
-      for (const track of state.project.tracks) {
+      for (const track of this.project.tracks) {
         if (track.muted) continue;
         for (const clip of track.clips) {
           if (clip.end <= windowStart || clip.start >= windowEnd) continue;
@@ -1050,7 +1077,7 @@
         }
       }
 
-      const beatDuration = 60 / state.project.bpm;
+      const beatDuration = 60 / this.project.bpm;
       const loopDuration = clip.loopBeats * beatDuration;
       const sourceStart = clip.sourceStart ?? clip.start;
       const firstCycle = Math.max(0, Math.floor((windowStart - sourceStart) / loopDuration) - 1);
@@ -1085,7 +1112,7 @@
         return;
       }
 
-      const beatDuration = 60 / state.project.bpm;
+      const beatDuration = 60 / this.project.bpm;
       const frequency = 440 * 2 ** ((event.pitch - 69) / 12);
       const roleLevel = { bass: 0.24, chords: 0.09, lead: 0.13, texture: 0.07 }[track.role] ?? 0.1;
       this.tone(
@@ -1105,9 +1132,9 @@
     chaseActiveVoices() {
       if (this.projectStartedAt <= 0) return;
       const audioTime = this.context.currentTime + 0.005;
-      for (const track of state.project.tracks) {
+      for (const track of this.project.tracks) {
         if (track.muted) continue;
-        const beatDuration = 60 / state.project.bpm;
+        const beatDuration = 60 / this.project.bpm;
         const longestEvent = Math.max(
           ...track.clips.flatMap((clip) => clip.events.map((event) => event.duration * beatDuration)),
           0,
@@ -1141,7 +1168,7 @@
 
     modifiers(track, time) {
       const result = { rhythm: 0 };
-      for (const edit of state.project.edits) {
+      for (const edit of this.project.edits) {
         if (time < edit.start || time >= edit.end) continue;
         this.applyPatternAction(edit.action, track.role, result, edit, time);
       }
@@ -1214,7 +1241,7 @@
     }
 
     drum(event, track, time, projectTime, elapsed, instrument) {
-      const beatDuration = 60 / state.project.bpm;
+      const beatDuration = 60 / this.project.bpm;
       const bodyDuration = Math.max(0.01, event.duration * beatDuration);
       const totalDuration = bodyDuration + instrument.release;
       const remaining = totalDuration - elapsed;
@@ -1467,6 +1494,107 @@
 
   const audio = new AudioEngine();
 
+  function wavBytes(buffer) {
+    const channels = buffer.numberOfChannels;
+    const frameCount = buffer.length;
+    const bytesPerFrame = channels * 2;
+    const dataSize = frameCount * bytesPerFrame;
+    const bytes = new Uint8Array(44 + dataSize);
+    const view = new DataView(bytes.buffer);
+    const writeText = (offset, value) => {
+      for (let index = 0; index < value.length; index += 1) {
+        view.setUint8(offset + index, value.charCodeAt(index));
+      }
+    };
+    writeText(0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    writeText(8, "WAVE");
+    writeText(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, channels, true);
+    view.setUint32(24, buffer.sampleRate, true);
+    view.setUint32(28, buffer.sampleRate * bytesPerFrame, true);
+    view.setUint16(32, bytesPerFrame, true);
+    view.setUint16(34, 16, true);
+    writeText(36, "data");
+    view.setUint32(40, dataSize, true);
+    const channelData = Array.from(
+      { length: channels },
+      (_unused, channel) => buffer.getChannelData(channel),
+    );
+    let offset = 44;
+    for (let frame = 0; frame < frameCount; frame += 1) {
+      for (let channel = 0; channel < channels; channel += 1) {
+        const sample = clamp(channelData[channel][frame], -1, 1);
+        view.setInt16(offset, Math.round(sample * (sample < 0 ? 32768 : 32767)), true);
+        offset += 2;
+      }
+    }
+    return bytes;
+  }
+
+  function bytesBase64(bytes) {
+    let binary = "";
+    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+    }
+    return window.btoa(binary);
+  }
+
+  function validateAudioRenderRequest(request) {
+    if (!request || !/^[A-Za-z0-9_-]{1,128}$/.test(String(request.id))) {
+      throw new Error("The studio sent an invalid audio render ID.");
+    }
+    if (!request.project || !Array.isArray(request.project.tracks)) {
+      throw new Error("The studio sent an invalid audio render project.");
+    }
+    if (!Array.isArray(request.trackIds) || request.trackIds.length === 0) {
+      throw new Error("The studio sent no channels to render.");
+    }
+    if (
+      !Number.isFinite(request.start) ||
+      !Number.isFinite(request.end) ||
+      request.start < 0 ||
+      request.end <= request.start ||
+      request.end > request.project.duration
+    ) {
+      throw new Error("The studio sent an invalid audio render range.");
+    }
+  }
+
+  async function renderServerAudio(token) {
+    const request = await api(`/api/server-audio-renders/${encodeURIComponent(token)}`);
+    let body;
+    try {
+      validateAudioRenderRequest(request);
+      const buffer = await new AudioEngine(request.project).renderOffline(
+        request.trackIds,
+        request.start,
+        request.end,
+      );
+      body = { wav: bytesBase64(wavBytes(buffer)) };
+    } catch (error) {
+      reportClientIssue("error", error, "rendering audio for Gemini");
+      body = { error: errorMessage(error).slice(0, 500) };
+    }
+    await api(
+      `/api/server-audio-renders/${encodeURIComponent(token)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+      30_000,
+    );
+    document.documentElement.dataset.serverAudioRender = body.wav ? "completed" : "failed";
+  }
+
+  window.__dawAiRenderAudio = async (project, trackIds, start, end) => {
+    const buffer = await new AudioEngine(project).renderOffline(trackIds, start, end);
+    return wavBytes(buffer);
+  };
+
   class ApiError extends Error {
     constructor(message, status, retryable) {
       super(message);
@@ -1676,7 +1804,7 @@
     const edits = state.project.edits;
     elements.editCount.textContent = `${edits.length} ${edits.length === 1 ? "edit" : "edits"}`;
     if (edits.length === 0) {
-      elements.editLog.innerHTML = '<div class="empty-log">Select part of the timeline and ask Codex to shape it.</div>';
+      elements.editLog.innerHTML = '<div class="empty-log">Select part of the timeline and ask Gemini to shape it.</div>';
       return;
     }
     elements.editLog.innerHTML = [...edits]
@@ -2319,7 +2447,7 @@
   function showEditProgress(job) {
     const elapsed = Math.max(0, Number(job.elapsedSeconds) || 0);
     const timeout = Math.max(1, Number(job.timeoutSeconds) || 20 * 60);
-    const detail = job.detail || "Codex is working on the edit";
+    const detail = job.detail || "Gemini is working on the edit";
     const appliedSteps = Math.max(0, Number(job.appliedSteps) || 0);
     let nextActivityPercent = 5;
     if (job.status === "completed") {
@@ -2351,7 +2479,7 @@
         ? "Refreshing project..."
         : job.phase === "applying"
           ? "Applying change..."
-          : "Codex is working...";
+          : "Gemini is working...";
   }
 
   function hideEditProgress() {
@@ -2497,12 +2625,12 @@
       if (Number.isFinite(publishedVersion) && publishedVersion > (state.project?.version ?? 0)) {
         try {
           await refreshAuthoritativeProject(
-            `Showing Codex step ${Number(job.appliedSteps) || 1}`,
+            `Showing Gemini step ${Number(job.appliedSteps) || 1}`,
             Math.min(visibilityDeadline, performance.now() + RECONCILED_REQUEST_TIMEOUT_MS),
           );
           showEditProgress(job);
         } catch (_error) {
-          job = { ...job, detail: "Codex applied a step; retrying the project refresh" };
+          job = { ...job, detail: "Gemini applied a step; retrying the project refresh" };
           showEditProgress(job);
         }
       }
@@ -2588,7 +2716,7 @@
       status: completed ? "completed" : "failed",
       phase: completed ? "completed" : "failed",
       message: completed ? operation.message : undefined,
-      error: completed ? undefined : "Codex stopped before completing the edit.",
+      error: completed ? undefined : "Gemini stopped before completing the edit.",
       errorStatus: completed ? undefined : 500,
       appliedSteps: Number(operation.appliedSteps) || 0,
       projectVersion: Number(operation.projectVersion) || null,
@@ -2653,7 +2781,7 @@
     const rawReason =
       outcome.status === "unavailable"
         ? "The edit status was lost."
-        : `${outcome.error || "Codex could not complete the edit."}`.trim();
+        : `${outcome.error || "Gemini could not complete the edit."}`.trim();
     const reason = /[.!?]$/.test(rawReason) ? rawReason : `${rawReason}.`;
     const savedChanges = steps === 1 ? "1 partial change was saved" : `${steps} partial changes were saved`;
     const refreshWarning = refreshError
@@ -2680,7 +2808,7 @@
       if (hasPublishedChanges) {
         let refreshError = null;
         try {
-          await refreshAuthoritativeProject("Codex stopped; refreshing its partial changes");
+          await refreshAuthoritativeProject("Gemini stopped; refreshing its partial changes");
         } catch (error) {
           refreshError = error;
         }
@@ -2691,7 +2819,7 @@
       }
       return {
         kind: "failed",
-        error: new Error(outcome.error || "Codex could not complete the edit."),
+        error: new Error(outcome.error || "Gemini could not complete the edit."),
       };
     }
 
@@ -2701,8 +2829,8 @@
   function showPendingEdit(detail) {
     state.promptPending = true;
     elements.composeButton.disabled = true;
-    elements.composeButton.querySelector("span").textContent = "Starting Codex...";
-    elements.savedState.textContent = "Waiting for Codex";
+    elements.composeButton.querySelector("span").textContent = "Starting Gemini...";
+    elements.savedState.textContent = "Waiting for Gemini";
     showEditProgress({
       phase: "queued",
       detail,
@@ -2884,6 +3012,7 @@
 
   function openDebug() {
     setView("debug");
+    void loadGeminiSessions();
   }
 
   function skipToTimeline(event) {
@@ -2919,7 +3048,7 @@
       `View: ${state.activeView}`,
       `Audio: ${audio.playbackState}; context ${audio.context?.state || "not initialized"}`,
       `AI edit: ${state.promptPending ? "pending" : "idle"}`,
-      `Codex sessions: ${state.ephemeralCodexSessions ? "ephemeral" : "persistent"}`,
+      `Gemini sessions: ${state.geminiSessions.length} retained locally`,
       `Selection: ${state.selectionStart.toFixed(1)}s - ${state.selectionEnd.toFixed(1)}s`,
     ];
     if (project) {
@@ -2930,6 +3059,17 @@
       );
     } else {
       lines.push("Project: unavailable");
+    }
+    lines.push("", "Recent Gemini sessions:");
+    if (state.geminiSessions.length === 0) {
+      lines.push("None found.");
+    } else {
+      for (const session of state.geminiSessions.slice(0, 10)) {
+        lines.push(
+          `${new Date(Number(session.createdAt) || 0).toISOString()} [${session.status || "unknown"}] ` +
+            `${session.appliedSteps || 0} edit actions, ${session.audioListens || 0} listens: ${session.prompt || ""}`,
+        );
+      }
     }
     lines.push("", "Recent browser errors and warnings:");
     if (state.clientIssues.length === 0) {
@@ -2945,6 +3085,20 @@
 
   function renderDebug() {
     elements.debugReport.value = debugReport();
+    if (state.geminiSessions.length === 0) {
+      elements.geminiSessionList.innerHTML = '<div class="empty-log">No Gemini sessions recorded yet.</div>';
+      return;
+    }
+    elements.geminiSessionList.innerHTML = state.geminiSessions
+      .slice(0, 20)
+      .map(
+        (session) => `<article class="gemini-session-item">
+          <div><strong>${escapeHtml(new Date(Number(session.createdAt) || 0).toLocaleString())}</strong>
+          <span>${escapeHtml(session.status || "unknown")} · ${Number(session.appliedSteps) || 0} actions · ${Number(session.audioListens) || 0} listens</span></div>
+          <p>${escapeHtml(session.prompt || "Untitled edit")}</p>
+        </article>`,
+      )
+      .join("");
   }
 
   async function copyDebugReport() {
@@ -2970,35 +3124,13 @@
     showToast("Browser issues cleared");
   }
 
-  async function loadSettings() {
+  async function loadGeminiSessions() {
     try {
-      const settings = await api("/api/settings");
-      state.ephemeralCodexSessions = settings.ephemeralCodexSessions !== false;
-      elements.persistentCodexSessions.checked = !state.ephemeralCodexSessions;
+      const response = await api("/api/gemini-sessions");
+      state.geminiSessions = Array.isArray(response.sessions) ? response.sessions : [];
       renderDebug();
     } catch (error) {
-      showError(error, "loading Codex session settings");
-    }
-  }
-
-  async function changeCodexSessionMode() {
-    const persistent = elements.persistentCodexSessions.checked;
-    elements.persistentCodexSessions.disabled = true;
-    try {
-      const settings = await api("/api/settings", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ ephemeral: String(!persistent) }),
-      });
-      state.ephemeralCodexSessions = settings.ephemeralCodexSessions !== false;
-      elements.persistentCodexSessions.checked = !state.ephemeralCodexSessions;
-      renderDebug();
-      showToast(`Codex sessions are now ${state.ephemeralCodexSessions ? "ephemeral" : "persistent"}`);
-    } catch (error) {
-      elements.persistentCodexSessions.checked = !state.ephemeralCodexSessions;
-      showError(error, "changing Codex session settings");
-    } finally {
-      elements.persistentCodexSessions.disabled = false;
+      showError(error, "loading Gemini sessions");
     }
   }
 
@@ -3066,7 +3198,7 @@
   });
   elements.copyDebug.addEventListener("click", () => void copyDebugReport());
   elements.clearDebug.addEventListener("click", clearDebugIssues);
-  elements.persistentCodexSessions.addEventListener("change", () => void changeCodexSessionMode());
+  elements.refreshGeminiSessions.addEventListener("click", () => void loadGeminiSessions());
   document.querySelectorAll("[data-prompt]").forEach((button) => {
     button.addEventListener("click", () => {
       elements.promptInput.value = button.dataset.prompt;
@@ -3101,13 +3233,18 @@
   });
 
   async function initialize() {
+    const serverAudioToken = new URLSearchParams(window.location.search).get("server-audio-render");
+    if (serverAudioToken) {
+      await renderServerAudio(serverAudioToken);
+      return;
+    }
     const pending = readPendingEdit();
     if (pending) {
       if (!elements.promptInput.value) elements.promptInput.value = pending.submittedText;
       showPendingEdit("Reconnecting to the active AI edit");
     }
     await loadProject();
-    await loadSettings();
+    await loadGeminiSessions();
     if (pending && state.project) await runPendingEdit(pending, false);
   }
 

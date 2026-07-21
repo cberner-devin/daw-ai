@@ -41,7 +41,8 @@
             ]
           },
           "value": {
-            "type": "number"
+            "type": "number",
+            "description": "Primary numeric value. For configure actions, put numeric parameter values here; use 0 when setting carries a textual parameter value."
           },
           "trackId": {
             "type": "integer",
@@ -66,7 +67,8 @@
           },
           "setting": {
             "type": "string",
-            "maxLength": 64
+            "maxLength": 64,
+            "description": "Text value for configure parameters such as waveform, enabled, shape, rateMode, trigger, or target. Numeric configure parameters may use this string for compatibility but should normally use value."
           },
           "start": {
             "type": "number",
