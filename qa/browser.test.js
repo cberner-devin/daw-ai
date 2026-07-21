@@ -407,6 +407,41 @@ async function run() {
       async () => evaluate(cdp, appSession, "document.querySelectorAll('.track-row').length === 3"),
       "initial arrangement",
     );
+    const offlineRender = await evaluate(
+      cdp,
+      appSession,
+      `(async () => {
+        const project = await fetch('/api/project').then((response) => response.json());
+        const bytes = await window.__dawAiRenderAudio(
+          project,
+          project.tracks.map((track) => track.id),
+          0,
+          1,
+        );
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        let maximum = 0;
+        for (let offset = 44; offset < bytes.length; offset += 2) {
+          maximum = Math.max(maximum, Math.abs(view.getInt16(offset, true)));
+        }
+        return {
+          riff: String.fromCharCode(...bytes.slice(0, 4)),
+          wave: String.fromCharCode(...bytes.slice(8, 12)),
+          channels: view.getUint16(22, true),
+          sampleRate: view.getUint32(24, true),
+          length: bytes.length,
+          maximum,
+        };
+      })()`,
+    );
+    assert.deepEqual(offlineRender, {
+      riff: "RIFF",
+      wave: "WAVE",
+      channels: 2,
+      sampleRate: 48000,
+      length: 192044,
+      maximum: offlineRender.maximum,
+    });
+    assert.ok(offlineRender.maximum > 100, "offline Web Audio render should contain music");
     assert.deepEqual(
       await evaluate(cdp, appSession, `({
         containerRole: document.querySelector('#edit-progress').getAttribute('role'),
@@ -444,7 +479,7 @@ async function run() {
                 }
               : {
                   id: 'reload-job', operationId: 'reload-operation', status: 'running', phase: 'planning',
-                  detail: 'Codex is planning the reloaded edit', elapsedSeconds: 13,
+                  detail: 'Gemini is planning the reloaded edit', elapsedSeconds: 13,
                   timeoutSeconds: 1200, pollAfterMs: 20,
                 };
             return Promise.resolve(new Response(JSON.stringify(job), {
@@ -464,7 +499,7 @@ async function run() {
       end: 16,
       acceptedJob: {
         id: 'reload-job', operationId: 'reload-operation', status: 'running', phase: 'planning',
-        detail: 'Codex is planning the reloaded edit', elapsedSeconds: 13,
+        detail: 'Gemini is planning the reloaded edit', elapsedSeconds: 13,
         timeoutSeconds: 1200, pollAfterMs: 20,
       },
     }))`);
@@ -476,7 +511,7 @@ async function run() {
         `window.__reloadPollCount >= 1 &&
           document.querySelector('#compose-button').disabled &&
           !document.querySelector('#edit-progress').hidden &&
-          document.querySelector('#edit-progress-label').textContent === 'Codex is planning the reloaded edit' &&
+          document.querySelector('#edit-progress-label').textContent === 'Gemini is planning the reloaded edit' &&
           document.querySelector('#prompt-input').value === 'resume after reload'`,
       ),
       "pending edit recovery after page reload",
@@ -558,29 +593,17 @@ async function run() {
     assert.equal(debugView.debugVisible && debugView.aiHidden, true, "Debug must replace the AI Mode panel");
     assert.match(debugView.report, /Synthetic browser failure/);
     assert.match(debugView.report, /Backend warnings and errors are written/);
-    assert.match(debugView.report, /Codex sessions: ephemeral/);
-    await evaluate(cdp, appSession, `(() => {
-      const toggle = document.querySelector('#persistent-codex-sessions');
-      toggle.checked = true;
-      toggle.dispatchEvent(new Event('change', { bubbles: true }));
-    })()`);
-    await waitFor(async () => {
-      const settings = await evaluate(cdp, appSession, "fetch('/api/settings').then((response) => response.json())");
-      return settings.codexSessionMode === "persistent";
-    }, "persistent Codex session toggle");
+    assert.match(debugView.report, /Gemini sessions: 0 retained locally/);
     assert.match(
-      await evaluate(cdp, appSession, "document.querySelector('#debug-report').value"),
-      /Codex sessions: persistent/,
+      await evaluate(cdp, appSession, "document.querySelector('#gemini-session-list').textContent"),
+      /No Gemini sessions recorded yet/,
     );
-    await evaluate(cdp, appSession, `(() => {
-      const toggle = document.querySelector('#persistent-codex-sessions');
-      toggle.checked = false;
-      toggle.dispatchEvent(new Event('change', { bubbles: true }));
-    })()`);
-    await waitFor(async () => {
-      const settings = await evaluate(cdp, appSession, "fetch('/api/settings').then((response) => response.json())");
-      return settings.codexSessionMode === "ephemeral";
-    }, "ephemeral Codex session restore");
+    const sessions = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/gemini-sessions').then((response) => response.json())",
+    );
+    assert.deepEqual(sessions, { sessions: [] }, "Gemini sessions must be persistently listable");
     await evaluate(cdp, appSession, `(() => {
       Object.defineProperty(navigator, 'clipboard', {
         configurable: true,
@@ -911,7 +934,7 @@ async function run() {
               operationId: window.__acceptedOperationId,
               status: 'running',
               phase: 'planning',
-              detail: 'Codex is arranging the requested change',
+              detail: 'Gemini is arranging the requested change',
               elapsedSeconds: 73,
               timeoutSeconds: 1200,
               pollAfterMs: 100,
@@ -1030,12 +1053,12 @@ async function run() {
         evaluate(
           cdp,
           appSession,
-          `document.querySelector('#edit-progress-label').textContent === 'Codex is arranging the requested change' &&
+          `document.querySelector('#edit-progress-label').textContent === 'Gemini is arranging the requested change' &&
             document.querySelector('#edit-progress-time').textContent === '1:13 / 20:00' &&
             document.querySelector('#edit-progress-fill').style.width === '14%' &&
             document.querySelector('#edit-progress-track').getAttribute('aria-valuenow') === null`,
         ),
-      "running Codex progress",
+      "running Gemini progress",
     );
     await waitFor(
       async () => evaluate(cdp, appSession, "window.__editPollCount >= 7"),
@@ -1225,7 +1248,7 @@ async function run() {
           if (!window.__releaseConflictStatus) {
             return new Response(JSON.stringify({
               id: 'conflict-test', operationId: window.__conflictOperationId, status: 'running', phase: 'planning',
-              detail: 'Codex is planning the edit', pollAfterMs: 20,
+              detail: 'Gemini is planning the edit', pollAfterMs: 20,
               elapsedSeconds: 1, timeoutSeconds: 1200,
             }), { status: 200, headers: { 'Content-Type': 'application/json' } });
           }
@@ -1477,9 +1500,9 @@ async function run() {
           if (window.__incrementalFailed) {
             return new Response(JSON.stringify({
               id: 'incremental-job', operationId: window.__incrementalOperationId, status: 'failed',
-              phase: 'failed', detail: 'Codex stopped unexpectedly', elapsedSeconds: 2,
+              phase: 'failed', detail: 'Gemini stopped unexpectedly', elapsedSeconds: 2,
               timeoutSeconds: 1200, pollAfterMs: 20, appliedSteps: 1, projectVersion: published.version,
-              error: 'Codex stopped unexpectedly',
+              error: 'Gemini stopped unexpectedly',
             }), {
               status: 200,
               headers: { 'Content-Type': 'application/json' },
@@ -1526,16 +1549,16 @@ async function run() {
         cdp,
         appSession,
         `window.__incrementalProjectPending &&
-          document.querySelector('#edit-progress-label').textContent === 'Showing Codex step 1'`,
+          document.querySelector('#edit-progress-label').textContent === 'Showing Gemini step 1'`,
       ),
-      "delayed incremental Codex project refresh",
+      "delayed incremental Gemini project refresh",
     );
     assert.deepEqual(
       await evaluate(cdp, appSession, `({
         width: document.querySelector('#edit-progress-fill').style.width,
         ariaText: document.querySelector('#edit-progress-track').getAttribute('aria-valuetext'),
       })`),
-      { width: "55%", ariaText: "Showing Codex step 1" },
+      { width: "55%", ariaText: "Showing Gemini step 1" },
       "project syncing must preserve the current edit activity progress",
     );
     await evaluate(cdp, appSession, "window.__releaseIncrementalProject()");
@@ -1553,7 +1576,7 @@ async function run() {
           document.querySelector('#edit-progress-track').getAttribute('aria-valuetext') ===
             '1 edit step applied. Applied step 1 of 2: Added the first staged layer'`,
       ),
-      "incremental Codex project publication",
+      "incremental Gemini project publication",
     );
     assert.equal(
       await evaluate(
@@ -1571,7 +1594,7 @@ async function run() {
         appSession,
         `!document.querySelector('#compose-button').disabled &&
           document.querySelector('#toast').textContent ===
-            'Codex stopped unexpectedly. 1 partial change was saved; review the project before retrying.' &&
+            'Gemini stopped unexpectedly. 1 partial change was saved; review the project before retrying.' &&
           document.querySelector('#toast').classList.contains('is-error') &&
           document.querySelector('#prompt-input').value === '' &&
           document.querySelectorAll('.edit-item').length === window.__incrementalBaseEditCount + 1 &&
@@ -1630,7 +1653,7 @@ async function run() {
         if (typeof resource === 'string' && resource.startsWith('/api/edit-operations/')) {
           return new Response(JSON.stringify({
             id: 'recovered', operationId: window.__acceptanceLossOperationId, status: 'failed', phase: 'failed',
-            errorStatus: 500, error: 'Codex stopped before completing the edit.', elapsedSeconds: 0,
+            errorStatus: 500, error: 'Gemini stopped before completing the edit.', elapsedSeconds: 0,
             timeoutSeconds: 1200, appliedSteps: 1, projectVersion: published.version,
           }), { status: 200, headers: { 'Content-Type': 'application/json' } });
         }
@@ -1655,7 +1678,7 @@ async function run() {
         `!document.querySelector('#compose-button').disabled &&
           window.__acceptanceLossPosts === 2 &&
           document.querySelector('#toast').textContent ===
-            'Codex stopped before completing the edit. 1 partial change was saved; review the project before retrying.' &&
+            'Gemini stopped before completing the edit. 1 partial change was saved; review the project before retrying.' &&
           document.querySelector('#toast').classList.contains('is-error') &&
           document.querySelector('#prompt-input').value === '' &&
           document.querySelectorAll('.edit-item').length === ${acceptanceLossBase.edits + 1} &&

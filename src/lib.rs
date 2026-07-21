@@ -1,6 +1,7 @@
+#[allow(dead_code)]
 mod audio_analysis;
-pub mod codex;
-mod codex_mcp;
+pub mod gemini;
+mod gemini_tools;
 pub mod model;
 mod project_file;
 pub mod prompt;

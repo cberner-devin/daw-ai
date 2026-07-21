@@ -1167,6 +1167,42 @@ main {
   accent-color: var(--accent);
 }
 
+.gemini-session-list {
+  display: grid;
+  gap: 8px;
+  max-width: 760px;
+  margin: -12px 0 24px;
+}
+
+.gemini-session-item {
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.012);
+}
+
+.gemini-session-item div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.gemini-session-item strong {
+  font-size: 10px;
+}
+
+.gemini-session-item span,
+.gemini-session-item p {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.gemini-session-item p {
+  margin: 6px 0 0;
+  line-height: 1.5;
+}
+
 .debug-report {
   width: 100%;
   min-height: min(540px, calc(100vh - 365px));

@@ -3441,7 +3441,7 @@ mod tests {
     }
 
     #[test]
-    fn replaces_a_codex_graph_as_one_undoable_edit() {
+    fn replaces_a_gemini_graph_as_one_undoable_edit() {
         let mut studio = Studio::new();
         let before = studio.project().to_json();
         let plan = crate::prompt::EditPlan {
