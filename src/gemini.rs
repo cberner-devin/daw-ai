@@ -850,7 +850,7 @@ fn system_instruction() -> String {
             "its own absolute project start and end, so include surrounding context when useful. Before ",
             "the first edit, read the graph and hear the original music. After every successful edit ",
             "batch, hear the updated music and reason from the ",
-            "actual audio—not event-count proxies—about groove, beat subdivision, energy contour, ",
+            "actual audio - not event-count proxies - about groove, beat subdivision, energy contour, ",
             "tension, impact, timbre, and contrast. If a style depends on intensification, express it ",
             "through composition and rhythmic subdivision when appropriate; do not assume the project ",
             "tempo must change. Continue until the audible result fulfills the request. A separate fresh ",
@@ -1334,9 +1334,9 @@ fn concise_model_text(object: &Object, name: &str, maximum: usize) -> Result<Str
     }
     let mut shortened = value
         .chars()
-        .take(maximum.saturating_sub(1))
+        .take(maximum.saturating_sub(3))
         .collect::<String>();
-    shortened.push('…');
+    shortened.push_str("...");
     Ok(shortened)
 }
 
@@ -1801,7 +1801,7 @@ mod tests {
         assert!(instruction.contains("chooses its own absolute project start and end"));
         assert!(instruction.contains("hear the original music"));
         assert!(instruction.contains("hear the updated music"));
-        assert!(instruction.contains("actual audio—not event-count proxies"));
+        assert!(instruction.contains("actual audio - not event-count proxies"));
         assert!(instruction.contains("rhythmic subdivision"));
         assert!(instruction.contains("tempo must change"));
         assert!(instruction.contains("separate fresh audio judge"));
@@ -2136,7 +2136,7 @@ mod tests {
         .to_string();
         let plan = plan_from_json(&source).expect("valid edit with verbose prose");
         assert_eq!(plan.summary.chars().count(), 160);
-        assert!(plan.summary.ends_with('…'));
+        assert!(plan.summary.ends_with("..."));
     }
 
     #[test]
