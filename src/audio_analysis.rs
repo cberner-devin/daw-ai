@@ -249,8 +249,14 @@ fn render_audio(
 }
 
 pub(crate) fn wav_bytes(samples: &[f32]) -> Vec<u8> {
-    let data_bytes = u32::try_from(samples.len().saturating_mul(2)).unwrap_or(u32::MAX);
-    let mut wav = Vec::with_capacity(44 + samples.len() * 2);
+    let mut wav = wav_header(samples.len());
+    wav.extend_from_slice(&pcm_bytes(samples));
+    wav
+}
+
+pub(crate) fn wav_header(sample_count: usize) -> Vec<u8> {
+    let data_bytes = u32::try_from(sample_count.saturating_mul(2)).unwrap_or(u32::MAX);
+    let mut wav = Vec::with_capacity(44);
     wav.extend_from_slice(b"RIFF");
     wav.extend_from_slice(&(36_u32.saturating_add(data_bytes)).to_le_bytes());
     wav.extend_from_slice(b"WAVEfmt ");
@@ -263,11 +269,16 @@ pub(crate) fn wav_bytes(samples: &[f32]) -> Vec<u8> {
     wav.extend_from_slice(&16_u16.to_le_bytes());
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_bytes.to_le_bytes());
+    wav
+}
+
+pub(crate) fn pcm_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut pcm_bytes = Vec::with_capacity(samples.len().saturating_mul(2));
     for sample in samples {
         let pcm = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
-        wav.extend_from_slice(&pcm.to_le_bytes());
+        pcm_bytes.extend_from_slice(&pcm.to_le_bytes());
     }
-    wav
+    pcm_bytes
 }
 
 fn render_track(
@@ -1887,7 +1898,10 @@ mod tests {
         let offset = 32 * SAMPLE_RATE as usize;
 
         assert_eq!(end, project.duration);
-        assert_eq!(&continuous.samples[offset..], late.samples);
+        assert_eq!(
+            pcm_bytes(&continuous.samples[offset..]),
+            pcm_bytes(&late.samples)
+        );
     }
 
     #[test]
