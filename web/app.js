@@ -73,6 +73,7 @@
   const EDIT_ACCEPTANCE_TIMEOUT_MS = 10_000;
   const PENDING_EDIT_STORAGE_KEY = "daw-ai.pending-edit.v1";
   const AUDIO_RETRY_DELAYS_MS = [250, 500, 1000];
+  const AUDIO_SEEK_DEBOUNCE_MS = 200;
 
   class AudioEngine {
     constructor() {
@@ -89,6 +90,7 @@
       this.streamAttempt = 0;
       this.retryTimer = null;
       this.retryAttempts = 0;
+      this.seekTimer = null;
       this.media.addEventListener("ended", () => {
         if (this.isActive) this.stop(false);
       });
@@ -112,7 +114,7 @@
     }
 
     get isActive() {
-      return this.playbackState !== "idle";
+      return this.playbackState !== "idle" || this.seekTimer !== null;
     }
 
     async initialize() {
@@ -123,7 +125,6 @@
         throw new Error("The backend returned an invalid audio stream token.");
       }
       this.streamToken = access.streamToken;
-      elements.playButton.disabled = false;
     }
 
     toggle() {
@@ -135,7 +136,9 @@
     }
 
     start() {
-      if (!this.project || !this.streamToken || this.isActive) return Promise.resolve();
+      window.clearTimeout(this.seekTimer);
+      this.seekTimer = null;
+      if (!this.project || !this.streamToken || this.playbackState !== "idle") return Promise.resolve();
       if (this.playhead >= this.project.duration - 0.01) this.playhead = 0;
       this.playbackState = "starting";
       this.playbackGeneration += 1;
@@ -185,13 +188,15 @@
     }
 
     stop(preservePosition) {
-      if (preservePosition && this.isActive) this.updatePosition();
+      if (preservePosition && this.playbackState !== "idle") this.updatePosition();
       this.playbackGeneration += 1;
       this.playbackState = "idle";
       window.clearInterval(this.timer);
       this.timer = null;
       window.clearTimeout(this.retryTimer);
       this.retryTimer = null;
+      window.clearTimeout(this.seekTimer);
+      this.seekTimer = null;
       this.retryAttempts = 0;
       this.media.pause();
       this.media.removeAttribute("src");
@@ -209,7 +214,13 @@
       this.playhead = clamp(time, 0, this.project?.duration ?? 0);
       renderPlayhead();
       updateTransport();
-      if (wasActive) void this.start();
+      if (wasActive) {
+        this.seekTimer = window.setTimeout(() => {
+          this.seekTimer = null;
+          void this.start();
+        }, AUDIO_SEEK_DEBOUNCE_MS);
+        updateTransport();
+      }
     }
 
     updatePosition() {
@@ -1911,6 +1922,7 @@
       showError(error, "initializing audio", "Could not initialize audio: ");
     }
     await loadProject();
+    elements.playButton.disabled = !(audio.streamToken && state.project);
     await loadGeminiSessions();
     if (pending && state.project) await runPendingEdit(pending, false);
   }

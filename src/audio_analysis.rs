@@ -188,26 +188,63 @@ pub(crate) fn render_project_region(
     if !start.is_finite() || start < 0.0 || start >= project.duration {
         return Err("playback start must be inside the project".to_owned());
     }
-    let end = (start + MAX_REGION_SECONDS).min(project.duration);
+    let (region, end_sample) = render_project_samples(project, playback_start_sample(start))?;
+    let project_end_sample = playback_end_sample(project.duration);
+    let end = if end_sample == project_end_sample {
+        project.duration
+    } else {
+        sample_time(end_sample)
+    };
+    Ok((region, end))
+}
+
+pub(crate) fn render_project_samples(
+    project: &Project,
+    start_sample: usize,
+) -> Result<(AudioRegion, usize), String> {
+    let project_end_sample = playback_end_sample(project.duration);
+    if start_sample >= project_end_sample {
+        return Err("playback start must be inside the project".to_owned());
+    }
+    let maximum_samples = (MAX_REGION_SECONDS * SAMPLE_RATE as f32) as usize;
+    let end_sample = start_sample
+        .saturating_add(maximum_samples)
+        .min(project_end_sample);
+    let start = sample_time(start_sample);
     let track_ids = project
         .tracks
         .iter()
         .map(|track| track.id)
         .collect::<Vec<_>>();
     let preroll_start = playback_preroll_start(project, start);
-    let region = render_audio(project, &track_ids, preroll_start, end)?;
-    let sample_start = ((start - preroll_start) * SAMPLE_RATE as f32).round() as usize;
-    let sample_count = playback_sample_count(start, end);
-    let mut region = region.slice(sample_start, sample_start + sample_count, start, end);
-    region.samples.resize(sample_count, 0.0);
-    Ok((region, end))
+    let preroll_sample = playback_start_sample(preroll_start);
+    let region = render_audio_samples(project, &track_ids, preroll_sample, end_sample)?;
+    let sample_start = start_sample - preroll_sample;
+    Ok((
+        region.slice(
+            sample_start,
+            sample_start + end_sample - start_sample,
+            start,
+            sample_time(end_sample),
+        ),
+        end_sample,
+    ))
 }
 
 pub(crate) fn playback_sample_count(start: f32, end: f32) -> usize {
-    let sample_rate = f64::from(SAMPLE_RATE);
-    let start_sample = (f64::from(start) * sample_rate).round() as usize;
-    let end_sample = (f64::from(end) * sample_rate).ceil() as usize;
-    end_sample.saturating_sub(start_sample)
+    playback_end_sample(end).saturating_sub(playback_start_sample(start))
+}
+
+pub(crate) fn playback_start_sample(time: f32) -> usize {
+    (f64::from(time) * f64::from(SAMPLE_RATE)).round() as usize
+}
+
+fn playback_end_sample(time: f32) -> usize {
+    (f64::from(time) * f64::from(SAMPLE_RATE)).ceil() as usize
+}
+
+fn sample_time(sample: usize) -> f32 {
+    (sample as f64 / f64::from(SAMPLE_RATE)) as f32
 }
 
 fn render_audio(
@@ -216,10 +253,29 @@ fn render_audio(
     start: f32,
     end: f32,
 ) -> Result<AudioRegion, String> {
+    render_audio_samples(
+        project,
+        track_ids,
+        playback_start_sample(start),
+        playback_end_sample(end),
+    )
+}
+
+fn render_audio_samples(
+    project: &Project,
+    track_ids: &[u64],
+    start_sample: usize,
+    end_sample: usize,
+) -> Result<AudioRegion, String> {
     if track_ids.is_empty() {
         return Err("at least one channel ID is required".to_owned());
     }
-    let sample_count = ((end - start) * SAMPLE_RATE as f32).ceil() as usize;
+    if end_sample <= start_sample {
+        return Err("audio range must contain at least one sample".to_owned());
+    }
+    let start = sample_time(start_sample);
+    let end = sample_time(end_sample);
+    let sample_count = end_sample - start_sample;
     let mut mix = vec![0.0; sample_count.max(1)];
     let mut event_onsets = Vec::new();
     for &track_id in track_ids {
@@ -1897,6 +1953,41 @@ mod tests {
         assert_eq!(
             differing, 0,
             "overlap contained {differing} differing samples"
+        );
+    }
+
+    #[test]
+    fn millisecond_restart_chunks_match_continuous_pcm() {
+        let project = Project::demo();
+        let track_ids = project
+            .tracks
+            .iter()
+            .map(|track| track.id)
+            .collect::<Vec<_>>();
+        let continuous =
+            render_audio(&project, &track_ids, 0.0, project.duration).expect("continuous render");
+        let start = 0.274;
+        let start_sample = (start * SAMPLE_RATE as f32).round() as usize;
+        let (first, next_start) = render_project_region(&project, start).expect("first chunk");
+        let (second, _) = render_project_region(&project, next_start).expect("second chunk");
+        let joined = first
+            .samples
+            .iter()
+            .chain(&second.samples)
+            .copied()
+            .collect::<Vec<_>>();
+        let joined = pcm_bytes(&joined);
+        let continuous = pcm_bytes(&continuous.samples[start_sample..]);
+        let differing = joined
+            .chunks_exact(2)
+            .zip(continuous.chunks_exact(2))
+            .filter(|(left, right)| left != right)
+            .count();
+
+        assert_eq!(joined.len(), continuous.len());
+        assert_eq!(
+            differing, 0,
+            "millisecond restart contained {differing} differing samples"
         );
     }
 
