@@ -20,6 +20,10 @@ const MAX_REQUEST_BYTES: usize = 6 * 1024 * 1024;
 const MAX_ACTIVE_EDIT_JOBS: usize = 4;
 const MAX_RETAINED_EDIT_JOBS: usize = 64;
 const AUDIO_REQUEST_HEADER: &str = "x-daw-ai-audio";
+const WAV_HEADER_BYTES: usize = 44;
+const AUDIO_RANGE_SAMPLES: usize =
+    (audio_analysis::MAX_REGION_SECONDS * audio_analysis::SAMPLE_RATE as f32) as usize;
+const AUDIO_STREAM_LOOKAHEAD_SAMPLES: usize = AUDIO_RANGE_SAMPLES * 2;
 const GEMINI_POLL_INTERVAL_MS: u64 = 1_000;
 const DEMO_POLL_INTERVAL_MS: u64 = 25;
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -119,6 +123,81 @@ fn stream_disconnected(stream: &TcpStream) -> bool {
             false
         }
         Err(_) => true,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ByteRange {
+    start: usize,
+    end: usize,
+}
+
+impl ByteRange {
+    fn len(self) -> usize {
+        self.end - self.start + 1
+    }
+}
+
+fn audio_byte_range(value: &str, total_length: usize) -> Result<ByteRange, ()> {
+    let (unit, requested) = value.trim().split_once('=').ok_or(())?;
+    if !unit.eq_ignore_ascii_case("bytes") || requested.contains(',') {
+        return Err(());
+    }
+    let (first, last) = requested.split_once('-').ok_or(())?;
+    let (start, end) = if first.is_empty() {
+        let suffix = last.parse::<usize>().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        (total_length.saturating_sub(suffix), total_length - 1)
+    } else {
+        let start = first.parse::<usize>().map_err(|_| ())?;
+        if start >= total_length {
+            return Err(());
+        }
+        let end = if last.is_empty() {
+            total_length - 1
+        } else {
+            last.parse::<usize>().map_err(|_| ())?.min(total_length - 1)
+        };
+        if end < start {
+            return Err(());
+        }
+        (start, end)
+    };
+
+    let first_pcm_sample = start.saturating_sub(WAV_HEADER_BYTES) / 2;
+    let bounded_end = WAV_HEADER_BYTES
+        .saturating_add(
+            first_pcm_sample
+                .saturating_add(AUDIO_RANGE_SAMPLES)
+                .saturating_mul(2),
+        )
+        .saturating_sub(1)
+        .min(end);
+    Ok(ByteRange {
+        start,
+        end: bounded_end,
+    })
+}
+
+fn wait_for_stream_window(
+    generated_samples: usize,
+    stream_started: Instant,
+    is_cancelled: &impl Fn() -> bool,
+) -> bool {
+    let paced_samples = generated_samples.saturating_sub(AUDIO_STREAM_LOOKAHEAD_SAMPLES);
+    let target =
+        Duration::from_secs_f64(paced_samples as f64 / f64::from(audio_analysis::SAMPLE_RATE));
+    loop {
+        if is_cancelled() {
+            return false;
+        }
+        let elapsed = stream_started.elapsed();
+        if elapsed >= target {
+            return true;
+        }
+        thread::sleep((target - elapsed).min(Duration::from_millis(50)));
     }
 }
 
@@ -328,11 +407,33 @@ impl AudioCache {
         start_sample: usize,
         is_cancelled: &impl Fn() -> bool,
     ) -> Result<(audio_analysis::AudioRegion, usize), AudioCacheError> {
+        let project_end_sample = audio_analysis::playback_sample_count(0.0, project.duration);
+        let end_sample = start_sample
+            .saturating_add(AUDIO_RANGE_SAMPLES)
+            .min(project_end_sample);
         self.stream_region_with(
             project,
             start_sample,
+            end_sample,
             is_cancelled,
-            audio_analysis::render_project_samples,
+            audio_analysis::render_project_sample_range,
+        )
+        .map(|region| (region, end_sample))
+    }
+
+    fn stream_sample_range(
+        &self,
+        project: &crate::model::Project,
+        start_sample: usize,
+        end_sample: usize,
+        is_cancelled: &impl Fn() -> bool,
+    ) -> Result<audio_analysis::AudioRegion, AudioCacheError> {
+        self.stream_region_with(
+            project,
+            start_sample,
+            end_sample,
+            is_cancelled,
+            audio_analysis::render_project_sample_range,
         )
     }
 
@@ -340,13 +441,15 @@ impl AudioCache {
         &self,
         project: &crate::model::Project,
         start_sample: usize,
+        end_sample: usize,
         is_cancelled: &impl Fn() -> bool,
         render: impl FnOnce(
             &crate::model::Project,
             usize,
-        ) -> Result<(audio_analysis::AudioRegion, usize), String>,
-    ) -> Result<(audio_analysis::AudioRegion, usize), AudioCacheError> {
-        let render_key = format!("stream:{start_sample}\n{}", project.to_json());
+            usize,
+        ) -> Result<audio_analysis::AudioRegion, String>,
+    ) -> Result<audio_analysis::AudioRegion, AudioCacheError> {
+        let render_key = format!("stream:{start_sample}:{end_sample}\n{}", project.to_json());
         loop {
             if is_cancelled() {
                 return Err(AudioCacheError::Cancelled);
@@ -376,7 +479,7 @@ impl AudioCache {
             self.completed.notify_all();
             return Err(AudioCacheError::Cancelled);
         }
-        let rendered = render(project, start_sample);
+        let rendered = render(project, start_sample, end_sample);
         let mut state = self
             .state
             .lock()
@@ -788,8 +891,10 @@ impl Router {
             return Response::json(409, error_json("project changed before playback started"))
                 .write(output);
         }
-        let start = start_milliseconds as f32 / 1_000.0;
-        if !start.is_finite() || start < 0.0 || start >= project.duration {
+        let stream_start_sample =
+            audio_analysis::playback_start_sample_milliseconds(start_milliseconds);
+        let project_end_sample = audio_analysis::playback_sample_count(0.0, project.duration);
+        if stream_start_sample >= project_end_sample {
             return Response::json(422, error_json("playback start is outside the project"))
                 .write(output);
         }
@@ -797,19 +902,66 @@ impl Router {
             return Ok(());
         }
 
-        let sample_count = audio_analysis::playback_sample_count(start, project.duration);
+        let sample_count = project_end_sample - stream_start_sample;
+        let total_length = WAV_HEADER_BYTES.saturating_add(sample_count.saturating_mul(2));
+        if let Some(range_value) = request.headers.get("range") {
+            let range = match audio_byte_range(range_value, total_length) {
+                Ok(range) => range,
+                Err(()) => {
+                    let content_range = format!("bytes */{total_length}");
+                    return write_response_head(
+                        output,
+                        416,
+                        "audio/wav",
+                        0,
+                        &[
+                            ("Cache-Control", "no-store"),
+                            ("Accept-Ranges", "bytes"),
+                            ("Content-Range", content_range.as_str()),
+                        ],
+                    );
+                }
+            };
+            let content_range = format!("bytes {}-{}/{total_length}", range.start, range.end);
+            write_response_head(
+                output,
+                206,
+                "audio/wav",
+                range.len(),
+                &[
+                    ("Cache-Control", "no-store"),
+                    ("Accept-Ranges", "bytes"),
+                    ("Content-Range", content_range.as_str()),
+                ],
+            )?;
+            return self.write_playback_byte_range(
+                &project,
+                stream_start_sample,
+                sample_count,
+                range,
+                output,
+                &is_cancelled,
+            );
+        }
+
         write_response_head(
             output,
             200,
             "audio/wav",
-            44_usize.saturating_add(sample_count.saturating_mul(2)),
-            &[("Cache-Control", "no-store")],
+            total_length,
+            &[("Cache-Control", "no-store"), ("Accept-Ranges", "bytes")],
         )?;
         output.write_all(&audio_analysis::wav_header(sample_count))?;
 
         let mut remaining = sample_count;
-        let mut cursor = audio_analysis::playback_start_sample(start);
+        let mut cursor = stream_start_sample;
+        let stream_started = Instant::now();
         while remaining > 0 {
+            let next_region_samples = remaining.min(AUDIO_RANGE_SAMPLES);
+            let generated_samples = cursor - stream_start_sample + next_region_samples;
+            if !wait_for_stream_window(generated_samples, stream_started, &is_cancelled) {
+                return Ok(());
+            }
             let (region, end) =
                 match self
                     .audio_cache
@@ -831,6 +983,51 @@ impl Router {
             cursor = end;
         }
         Ok(())
+    }
+
+    fn write_playback_byte_range(
+        &self,
+        project: &crate::model::Project,
+        stream_start_sample: usize,
+        sample_count: usize,
+        range: ByteRange,
+        output: &mut impl Write,
+        is_cancelled: &impl Fn() -> bool,
+    ) -> io::Result<()> {
+        let header = audio_analysis::wav_header(sample_count);
+        let mut cursor = range.start;
+        if cursor < WAV_HEADER_BYTES {
+            let header_end = (range.end + 1).min(WAV_HEADER_BYTES);
+            output.write_all(&header[cursor..header_end])?;
+            cursor = header_end;
+        }
+        if cursor > range.end || is_cancelled() {
+            return Ok(());
+        }
+
+        let pcm_start = cursor - WAV_HEADER_BYTES;
+        let pcm_end = range.end + 1 - WAV_HEADER_BYTES;
+        let first_sample = pcm_start / 2;
+        let end_sample = pcm_end.div_ceil(2);
+        let region = match self.audio_cache.stream_sample_range(
+            project,
+            stream_start_sample + first_sample,
+            stream_start_sample + end_sample,
+            is_cancelled,
+        ) {
+            Ok(region) => region,
+            Err(AudioCacheError::Render(error)) => {
+                eprintln!("error: could not render playback range: {error}");
+                return Err(io::Error::other("could not render playback range"));
+            }
+            Err(AudioCacheError::Cancelled) => return Ok(()),
+        };
+        if is_cancelled() {
+            return Ok(());
+        }
+        let pcm = audio_analysis::pcm_bytes(&region.samples);
+        let first_sample_byte = first_sample * 2;
+        output.write_all(&pcm[pcm_start - first_sample_byte..pcm_end - first_sample_byte])
     }
 
     fn edit_status(&self, job_id: u64) -> Response {
@@ -1475,11 +1672,13 @@ fn write_response_head(
     let reason = match status {
         200 => "OK",
         202 => "Accepted",
+        206 => "Partial Content",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        416 => "Range Not Satisfiable",
         422 => "Unprocessable Content",
         _ => "Error",
     };
@@ -2773,6 +2972,7 @@ mod tests {
 
         assert!(stream.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\n"));
         assert!(response_head.contains(&format!("Content-Length: {}\r\n", body.len())));
+        assert!(response_head.contains("Accept-Ranges: bytes\r\n"));
         assert_eq!(body.len(), 44 + expected_samples * 2);
         assert_eq!(&body[..4], b"RIFF");
         assert_eq!(&body[8..12], b"WAVE");
@@ -2797,6 +2997,42 @@ mod tests {
             )
             .expect("rejected stream response");
         assert!(rejected.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
+    }
+
+    #[test]
+    fn serves_bounded_byte_ranges_for_day_long_audio() {
+        let router = Router::demo();
+        let mut project = router.lock_studio().project().clone();
+        project.duration = 24.0 * 60.0 * 60.0;
+        *router.lock_studio() = Studio::from_project(project);
+        let version = router.lock_studio().project().version;
+        let mut range_request = request(
+            "GET",
+            &format!("/api/audio-stream/test-audio-token/{version}/0"),
+            "",
+        );
+        range_request
+            .headers
+            .insert("range".to_owned(), "bytes=0-99".to_owned());
+        let mut response = Vec::new();
+
+        router
+            .write_playback_stream(&range_request, &mut response)
+            .expect("partial WAV response");
+
+        let body_start = find_bytes(&response, b"\r\n\r\n").expect("HTTP response head") + 4;
+        let head = std::str::from_utf8(&response[..body_start]).expect("UTF-8 response head");
+        let total_length =
+            WAV_HEADER_BYTES + audio_analysis::playback_sample_count(0.0, 24.0 * 60.0 * 60.0) * 2;
+        assert!(head.starts_with("HTTP/1.1 206 Partial Content\r\n"));
+        assert!(head.contains("Content-Length: 100\r\n"));
+        assert!(head.contains("Accept-Ranges: bytes\r\n"));
+        assert!(head.contains(&format!("Content-Range: bytes 0-99/{total_length}\r\n")));
+        assert_eq!(response.len() - body_start, 100);
+        assert_eq!(&response[body_start..body_start + 4], b"RIFF");
+
+        let open_range = audio_byte_range("bytes=44-", total_length).expect("open byte range");
+        assert_eq!(open_range.len(), AUDIO_RANGE_SAMPLES * 2);
     }
 
     #[test]
@@ -2900,13 +3136,14 @@ mod tests {
             second_cache.stream_region_with(
                 &project,
                 1,
+                2,
                 &|| {
                     if first_check.swap(false, Ordering::SeqCst) {
                         second_checked.wait();
                     }
                     second_cancelled.load(Ordering::SeqCst)
                 },
-                |_, _| panic!("a cancelled queued stream must not render"),
+                |_, _, _| panic!("a cancelled queued stream must not render"),
             )
         });
 

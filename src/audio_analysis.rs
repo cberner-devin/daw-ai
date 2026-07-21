@@ -64,7 +64,7 @@ struct PatternEvent<'a> {
 
 struct ClipOccurrence<'a> {
     event: &'a ClipEvent,
-    time: f32,
+    time: f64,
     duration: f32,
     velocity: f32,
 }
@@ -75,16 +75,16 @@ struct OscillatorTargetIds {
 }
 
 struct RateSegment {
-    start: f32,
-    end: f32,
-    start_rate: f32,
-    slope: f32,
-    cumulative_cycles: f32,
+    start: f64,
+    end: f64,
+    start_rate: f64,
+    slope: f64,
+    cumulative_cycles: f64,
 }
 
 struct RatePhaseCurve {
     segments: Vec<RateSegment>,
-    total_cycles: f32,
+    total_cycles: f64,
 }
 
 struct ModulatorPhaseCurve {
@@ -106,7 +106,7 @@ struct AutomationIndex<'a> {
 
 struct TrackRenderState<'a> {
     occurrences: Vec<ClipOccurrence<'a>>,
-    midi_onsets: Vec<f32>,
+    midi_onsets: Vec<f64>,
     oscillator_targets: Vec<OscillatorTargetIds>,
     modulator_phases: Vec<ModulatorPhaseCurve>,
     automation: AutomationIndex<'a>,
@@ -215,13 +215,30 @@ pub(crate) fn render_project_samples(
     let end_sample = start_sample
         .saturating_add(maximum_samples)
         .min(project_end_sample);
+    let region = render_project_sample_range(project, start_sample, end_sample)?;
+    Ok((region, end_sample))
+}
+
+pub(crate) fn render_project_sample_range(
+    project: &Project,
+    start_sample: usize,
+    end_sample: usize,
+) -> Result<AudioRegion, String> {
+    let project_end_sample = playback_end_sample(project.duration);
+    let maximum_samples = (MAX_REGION_SECONDS * SAMPLE_RATE as f32) as usize;
+    if start_sample >= project_end_sample
+        || end_sample <= start_sample
+        || end_sample > project_end_sample
+        || end_sample - start_sample > maximum_samples
+    {
+        return Err("playback sample range must be inside one project region".to_owned());
+    }
     let track_ids = project
         .tracks
         .iter()
         .map(|track| track.id)
         .collect::<Vec<_>>();
-    let region = render_tracks_samples(project, &track_ids, start_sample, end_sample)?;
-    Ok((region, end_sample))
+    render_tracks_samples(project, &track_ids, start_sample, end_sample)
 }
 
 fn render_tracks_samples(
@@ -231,8 +248,7 @@ fn render_tracks_samples(
     end_sample: usize,
 ) -> Result<AudioRegion, String> {
     let start = sample_time(start_sample);
-    let preroll_start = playback_preroll_start(project, start);
-    let preroll_sample = playback_start_sample(preroll_start);
+    let preroll_sample = playback_preroll_sample(project, start_sample);
     let region = render_audio_samples(project, track_ids, preroll_sample, end_sample)?;
     let sample_start = start_sample - preroll_sample;
     Ok(region.slice(
@@ -251,12 +267,23 @@ pub(crate) fn playback_start_sample(time: f32) -> usize {
     (f64::from(time) * f64::from(SAMPLE_RATE)).round() as usize
 }
 
+pub(crate) fn playback_start_sample_milliseconds(milliseconds: u64) -> usize {
+    (milliseconds
+        .saturating_mul(u64::from(SAMPLE_RATE))
+        .saturating_add(500)
+        / 1_000) as usize
+}
+
 fn playback_end_sample(time: f32) -> usize {
     (f64::from(time) * f64::from(SAMPLE_RATE)).ceil() as usize
 }
 
 fn sample_time(sample: usize) -> f32 {
-    (sample as f64 / f64::from(SAMPLE_RATE)) as f32
+    precise_sample_time(sample) as f32
+}
+
+fn precise_sample_time(sample: usize) -> f64 {
+    sample as f64 / f64::from(SAMPLE_RATE)
 }
 
 #[cfg(test)]
@@ -286,8 +313,8 @@ fn render_audio_samples(
     if end_sample <= start_sample {
         return Err("audio range must contain at least one sample".to_owned());
     }
-    let start = sample_time(start_sample);
-    let end = sample_time(end_sample);
+    let start = precise_sample_time(start_sample);
+    let end = precise_sample_time(end_sample);
     let sample_count = end_sample - start_sample;
     let mut mix = vec![0.0; sample_count.max(1)];
     let mut event_onsets = Vec::new();
@@ -307,10 +334,11 @@ fn render_audio_samples(
             track,
             &render_state,
             start,
+            start_sample,
             &mut rendered,
             &mut event_onsets,
         );
-        process_track_audio(project, track, &render_state, start, &mut rendered);
+        process_track_audio(project, track, &render_state, start_sample, &mut rendered);
         for (output, sample) in mix.iter_mut().zip(rendered) {
             *output += sample;
         }
@@ -363,14 +391,15 @@ fn render_track(
     project: &Project,
     track: &Track,
     render_state: &TrackRenderState<'_>,
-    start: f32,
+    start: f64,
+    start_sample: usize,
     output: &mut [f32],
     event_onsets: &mut Vec<f32>,
 ) {
-    let beat_duration = 60.0 / project.bpm as f32;
+    let beat_duration = 60.0 / f64::from(project.bpm);
     for occurrence in &render_state.occurrences {
         let onset = occurrence.time;
-        let body_duration = (occurrence.duration * beat_duration).max(0.01);
+        let body_duration = (f64::from(occurrence.duration) * beat_duration).max(0.01);
         let attack = parameter_at(
             project,
             track,
@@ -387,12 +416,12 @@ fn render_track(
             track.instrument.release,
             onset,
         );
-        if onset + body_duration + release <= start {
+        if onset + body_duration + f64::from(release) <= start {
             continue;
         }
-        let region_end = start + output.len() as f32 / SAMPLE_RATE as f32;
+        let region_end = start + output.len() as f64 / f64::from(SAMPLE_RATE);
         if onset >= start && onset < region_end {
-            event_onsets.push(onset);
+            event_onsets.push(onset as f32);
         }
         render_event(
             project,
@@ -403,10 +432,10 @@ fn render_track(
             occurrence.event.pitch,
             occurrence.velocity,
             onset,
-            body_duration,
+            body_duration as f32,
             attack,
             release,
-            start,
+            start_sample,
             output,
         );
     }
@@ -421,16 +450,20 @@ fn render_event(
     event_kind: &str,
     pitch: u8,
     velocity: f32,
-    onset: f32,
+    onset: f64,
     body_duration: f32,
     attack: f32,
     release: f32,
-    region_start: f32,
+    region_start_sample: usize,
     output: &mut [f32],
 ) {
-    let first = (((onset - region_start) * SAMPLE_RATE as f32).floor() as i64).max(0) as usize;
-    let last = (((onset + body_duration + release - region_start) * SAMPLE_RATE as f32).ceil()
-        as usize)
+    let onset_sample = (onset * f64::from(SAMPLE_RATE)).floor() as usize;
+    let voice_end_sample = ((onset + f64::from(body_duration) + f64::from(release))
+        * f64::from(SAMPLE_RATE))
+    .ceil() as usize;
+    let first = onset_sample.saturating_sub(region_start_sample);
+    let last = voice_end_sample
+        .saturating_sub(region_start_sample)
         .min(output.len());
     let frequency = 440.0 * 2.0_f32.powf((pitch as f32 - 69.0) / 12.0);
     let drum_kind = if track.role == TrackRole::Drums || event_kind != "note" {
@@ -446,8 +479,8 @@ fn render_event(
         TrackRole::Texture => 0.07,
     };
     let level = velocity.clamp(0.01, 1.0) * role_level;
-    let first_project_time = project_sample_time(region_start, first);
-    let elapsed_at_start = (first_project_time - onset).max(0.0);
+    let first_project_time = project_sample_time(region_start_sample, first);
+    let elapsed_at_start = (first_project_time - onset).max(0.0) as f32;
     let mut phases = track
         .instrument
         .oscillators
@@ -457,11 +490,12 @@ fn render_event(
         })
         .collect::<Vec<_>>();
     for (index, sample) in output.iter_mut().enumerate().take(last).skip(first) {
-        let project_time = project_sample_time(region_start, index);
+        let project_time = project_sample_time(region_start_sample, index);
         let elapsed = project_time - onset;
         if elapsed < 0.0 {
             continue;
         }
+        let elapsed = elapsed as f32;
         let envelope = voice_envelope(elapsed, attack, body_duration, release);
         let pitch_offset = parameter_at(
             project,
@@ -494,10 +528,14 @@ fn render_event(
                     &mut phases,
                     current_frequency,
                     project_time,
-                ) + 0.78 * deterministic_noise(event_id, project_sample_index(region_start, index))
+                ) + 0.78
+                    * deterministic_noise(
+                        event_id,
+                        project_sample_index(region_start_sample, index),
+                    )
             }
             "hat" | "cymbal" => {
-                deterministic_noise(event_id, project_sample_index(region_start, index))
+                deterministic_noise(event_id, project_sample_index(region_start_sample, index))
             }
             "percussion" => {
                 0.45 * oscillator_sample(
@@ -507,7 +545,11 @@ fn render_event(
                     &mut phases,
                     current_frequency,
                     project_time,
-                ) + 0.55 * deterministic_noise(event_id, project_sample_index(region_start, index))
+                ) + 0.55
+                    * deterministic_noise(
+                        event_id,
+                        project_sample_index(region_start_sample, index),
+                    )
             }
             _ => oscillator_sample(
                 project,
@@ -535,7 +577,7 @@ fn oscillator_sample(
     render_state: &TrackRenderState<'_>,
     phases: &mut [f32],
     frequency: f32,
-    time: f32,
+    time: f64,
 ) -> f32 {
     let mut sample = 0.0;
     for ((oscillator, phase), targets) in track
@@ -624,11 +666,11 @@ fn clip_events_in_window<'a>(
     project: &Project,
     track: &Track,
     clip: &'a Clip,
-    window_start: f32,
-    window_end: f32,
+    window_start: f64,
+    window_end: f64,
 ) -> Vec<ClipOccurrence<'a>> {
-    let beat_duration = 60.0 / project.bpm as f32;
-    let loop_duration = clip.loop_beats * beat_duration;
+    let beat_duration = 60.0 / f64::from(project.bpm);
+    let loop_duration = f64::from(clip.loop_beats) * beat_duration;
     if loop_duration <= 0.0 || window_end <= window_start {
         return Vec::new();
     }
@@ -637,14 +679,17 @@ fn clip_events_in_window<'a>(
         return Vec::new();
     }
     let first_cycle =
-        ((((window_start - clip.source_start) / loop_duration).floor() as i64) - 1).max(0);
-    let last_cycle = (((window_end - clip.source_start) / loop_duration).floor() as i64).max(0);
+        ((((window_start - f64::from(clip.source_start)) / loop_duration).floor() as i64) - 1)
+            .max(0);
+    let last_cycle =
+        (((window_end - f64::from(clip.source_start)) / loop_duration).floor() as i64).max(0);
     let mut occurrences = Vec::new();
     for cycle in first_cycle..=last_cycle {
         for candidate in &pattern {
-            let time =
-                clip.source_start + cycle as f32 * loop_duration + candidate.time * beat_duration;
-            if time < clip.start || time >= clip.end {
+            let time = f64::from(clip.source_start)
+                + cycle as f64 * loop_duration
+                + f64::from(candidate.time) * beat_duration;
+            if time < f64::from(clip.start) || time >= f64::from(clip.end) {
                 continue;
             }
             if time < window_start - 0.000_001 || time >= window_end - 0.000_001 {
@@ -673,19 +718,19 @@ fn clip_events_in_window<'a>(
 }
 
 impl<'a> TrackRenderState<'a> {
-    fn new(project: &'a Project, track: &'a Track, start: f32, end: f32) -> Self {
+    fn new(project: &'a Project, track: &'a Track, start: f64, end: f64) -> Self {
         let automation = AutomationIndex::new(project, track);
-        let beat_duration = 60.0 / project.bpm as f32;
-        let maximum_voice = maximum_voice_lifetime(project, track, &automation);
+        let beat_duration = 60.0 / f64::from(project.bpm);
+        let maximum_voice = f64::from(maximum_voice_lifetime(project, track, &automation));
         let render_lookback = (start - maximum_voice).max(0.0);
         let mut occurrences = Vec::new();
         for clip in &track.clips {
-            let loop_duration = clip.loop_beats * beat_duration;
+            let loop_duration = f64::from(clip.loop_beats) * beat_duration;
             if loop_duration <= 0.0 {
                 continue;
             }
-            let onset_lookback = (render_lookback - loop_duration * 2.0).max(clip.start);
-            let window_end = end.min(clip.end) + 0.000_002;
+            let onset_lookback = (render_lookback - loop_duration * 2.0).max(f64::from(clip.start));
+            let window_end = end.min(f64::from(clip.end)) + 0.000_002;
             occurrences.extend(clip_events_in_window(
                 project,
                 track,
@@ -735,12 +780,12 @@ impl<'a> TrackRenderState<'a> {
         }
     }
 
-    fn last_midi_onset(&self, time: f32) -> Option<f32> {
+    fn last_midi_onset(&self, time: f64) -> Option<f64> {
         let index = self.midi_onsets.partition_point(|onset| *onset <= time);
         index.checked_sub(1).map(|index| self.midi_onsets[index])
     }
 
-    fn modulator_cycles(&self, modulator_id: u64, time: f32) -> f32 {
+    fn modulator_cycles(&self, modulator_id: u64, time: f64) -> f64 {
         self.modulator_phases
             .iter()
             .find(|phase| phase.id == modulator_id)
@@ -757,7 +802,7 @@ impl<'a> AutomationIndex<'a> {
         index
     }
 
-    fn value_at(&self, target: &str, base: f32, time: f32) -> f32 {
+    fn value_at(&self, target: &str, base: f32, time: f64) -> f32 {
         self.lanes.get(target).map_or(base, |spans| {
             spans
                 .iter()
@@ -777,31 +822,33 @@ impl<'a> AutomationIndex<'a> {
 }
 
 impl AutomationSpan<'_> {
-    fn value_at(&self, time: f32) -> Option<f32> {
-        if time < self.start || time >= self.end {
+    fn value_at(&self, time: f64) -> Option<f32> {
+        let start = f64::from(self.start);
+        let end = f64::from(self.end);
+        if time < start || time >= end {
             return None;
         }
-        let progress = ((time - self.start) / (self.end - self.start)).clamp(0.0, 1.0);
+        let progress = ((time - start) / (end - start)).clamp(0.0, 1.0);
         if self.curve == "hold" {
             return self
                 .points
                 .iter()
                 .rev()
-                .find(|point| point.time <= progress)
+                .find(|point| f64::from(point.time) <= progress)
                 .map(|point| point.value);
         }
         let upper = self
             .points
             .iter()
-            .position(|point| point.time >= progress)
+            .position(|point| f64::from(point.time) >= progress)
             .unwrap_or(self.points.len() - 1);
         if upper == 0 {
             return Some(self.points[0].value);
         }
         let previous = &self.points[upper - 1];
         let next = &self.points[upper];
-        let amount = (progress - previous.time) / (next.time - previous.time);
-        Some(previous.value + (next.value - previous.value) * amount)
+        let amount = (progress - f64::from(previous.time)) / f64::from(next.time - previous.time);
+        Some(previous.value + (next.value - previous.value) * amount as f32)
     }
 }
 
@@ -886,17 +933,20 @@ impl RatePhaseCurve {
             }
             let first_time = start + duration * 0.25;
             let second_time = start + duration * 0.75;
-            let first_rate = automation.value_at(target, base_rate, first_time);
-            let second_rate = automation.value_at(target, base_rate, second_time);
-            let slope = (second_rate - first_rate) / (second_time - first_time);
-            let start_rate = first_rate - slope * (first_time - start);
+            let first_rate =
+                f64::from(automation.value_at(target, base_rate, f64::from(first_time)));
+            let second_rate =
+                f64::from(automation.value_at(target, base_rate, f64::from(second_time)));
+            let slope = (second_rate - first_rate) / f64::from(second_time - first_time);
+            let start_rate = first_rate - slope * f64::from(first_time - start);
             segments.push(RateSegment {
-                start,
-                end,
+                start: f64::from(start),
+                end: f64::from(end),
                 start_rate,
                 slope,
                 cumulative_cycles,
             });
+            let duration = f64::from(duration);
             cumulative_cycles += start_rate * duration + 0.5 * slope * duration * duration;
         }
         Self {
@@ -905,7 +955,7 @@ impl RatePhaseCurve {
         }
     }
 
-    fn cycles_at(&self, time: f32) -> f32 {
+    fn cycles_at(&self, time: f64) -> f64 {
         let time = time.max(0.0);
         let Some(segment) = self
             .segments
@@ -960,10 +1010,19 @@ fn playback_preroll_seconds(project: &Project) -> f32 {
     maximum_voice + DSP_SETTLING_SECONDS
 }
 
-fn playback_preroll_start(project: &Project, start: f32) -> f32 {
-    let unaligned = (start - playback_preroll_seconds(project)).max(0.0);
+fn playback_preroll_sample(project: &Project, start_sample: usize) -> usize {
+    let unaligned =
+        (precise_sample_time(start_sample) - f64::from(playback_preroll_seconds(project))).max(0.0);
     // Whole seconds keep the audio and control-rate grids absolute even at the 24-hour limit.
-    unaligned.floor()
+    (unaligned.floor() * f64::from(SAMPLE_RATE)) as usize
+}
+
+#[cfg(test)]
+fn playback_preroll_start(project: &Project, start: f32) -> f32 {
+    sample_time(playback_preroll_sample(
+        project,
+        playback_start_sample(start),
+    ))
 }
 
 fn voice_envelope(elapsed: f32, attack: f32, body: f32, release: f32) -> f32 {
@@ -987,12 +1046,12 @@ fn waveform(kind: &str, phase: f32) -> f32 {
     }
 }
 
-fn project_sample_index(region_start: f32, index: usize) -> u64 {
-    (f64::from(region_start) * f64::from(SAMPLE_RATE)).round() as u64 + index as u64
+fn project_sample_index(region_start_sample: usize, index: usize) -> u64 {
+    region_start_sample.saturating_add(index) as u64
 }
 
-fn project_sample_time(region_start: f32, index: usize) -> f32 {
-    project_sample_index(region_start, index) as f32 / SAMPLE_RATE as f32
+fn project_sample_time(region_start_sample: usize, index: usize) -> f64 {
+    project_sample_index(region_start_sample, index) as f64 / f64::from(SAMPLE_RATE)
 }
 
 fn deterministic_noise(event_id: u64, sample: u64) -> f32 {
@@ -1026,11 +1085,18 @@ fn drum_kind(event_kind: &str, pitch: u8) -> &'static str {
     }
 }
 
-fn regional_rhythm(project: &Project, role: TrackRole, time: f32) -> f32 {
+fn regional_rhythm(project: &Project, role: TrackRole, time: f64) -> f32 {
     let mut rhythm = 0.0;
     for edit in &project.edits {
-        if time >= edit.start && time < edit.end {
-            apply_regional_rhythm(&edit.action, role, time, edit.start, edit.end, &mut rhythm);
+        if time >= f64::from(edit.start) && time < f64::from(edit.end) {
+            apply_regional_rhythm(
+                &edit.action,
+                role,
+                time,
+                f64::from(edit.start),
+                f64::from(edit.end),
+                &mut rhythm,
+            );
         }
     }
     rhythm
@@ -1039,9 +1105,9 @@ fn regional_rhythm(project: &Project, role: TrackRole, time: f32) -> f32 {
 fn apply_regional_rhythm(
     action: &Action,
     role: TrackRole,
-    time: f32,
-    start: f32,
-    end: f32,
+    time: f64,
+    start: f64,
+    end: f64,
     rhythm: &mut f32,
 ) {
     match action {
@@ -1056,8 +1122,8 @@ fn apply_regional_rhythm(
             action,
         } => {
             let duration = end - start;
-            let scoped_start = start + duration * relative_start;
-            let scoped_end = start + duration * relative_end;
+            let scoped_start = start + duration * f64::from(*relative_start);
+            let scoped_end = start + duration * f64::from(*relative_end);
             if time >= scoped_start && time < scoped_end {
                 apply_regional_rhythm(action, role, time, scoped_start, scoped_end, rhythm);
             }
@@ -1075,7 +1141,7 @@ fn parameter_at(
     render_state: &TrackRenderState<'_>,
     target: &str,
     base: f32,
-    time: f32,
+    time: f64,
 ) -> f32 {
     let base = render_state.automation.value_at(target, base, time);
     let amount = track
@@ -1120,7 +1186,7 @@ fn modulator_value(
     project: &Project,
     render_state: &TrackRenderState<'_>,
     modulator: &crate::model::Modulator,
-    time: f32,
+    time: f64,
 ) -> f32 {
     let phase_origin = if modulator.trigger == "midi" {
         let Some(onset) = render_state.last_midi_onset(time) else {
@@ -1133,13 +1199,13 @@ fn modulator_value(
     let cycles = render_state.modulator_cycles(modulator.id, time)
         - render_state.modulator_cycles(modulator.id, phase_origin);
     let cycles = if modulator.rate_mode == "tempo" {
-        cycles * project.bpm as f32 / 60.0
+        cycles * f64::from(project.bpm) / 60.0
     } else {
         cycles
     };
-    let phase = cycles * PI * 2.0;
+    let phase = cycles * f64::from(PI) * 2.0;
     let value = match modulator.shape.as_str() {
-        "triangle" => 2.0 / PI * phase.sin().asin(),
+        "triangle" => 2.0 / f64::from(PI) * phase.sin().asin(),
         "square" => {
             if phase.sin() >= 0.0 {
                 1.0
@@ -1148,10 +1214,10 @@ fn modulator_value(
             }
         }
         "envelope" => phase.sin().abs() * 2.0 - 1.0,
-        "random" => ((cycles * 8.0).floor() * 91.17 + modulator.id as f32).sin() * 0.8,
+        "random" => ((cycles * 8.0).floor() * 91.17 + modulator.id as f64).sin() * 0.8,
         _ => phase.sin(),
     };
-    value
+    value as f32
         * render_state.automation.value_at(
             &format!("modulator:{}.depth", modulator.id),
             modulator.depth,
@@ -1163,13 +1229,13 @@ fn process_track_audio(
     project: &Project,
     track: &Track,
     render_state: &TrackRenderState<'_>,
-    start: f32,
+    start_sample: usize,
     samples: &mut [f32],
 ) {
     let frame_count = samples.len().div_ceil(AUTOMATION_SAMPLES);
     let frames = (0..frame_count)
         .map(|index| {
-            let time = project_sample_time(start, index * AUTOMATION_SAMPLES);
+            let time = project_sample_time(start_sample, index * AUTOMATION_SAMPLES);
             automation_at(project, track, render_state, time)
         })
         .collect::<Vec<_>>();
@@ -1271,12 +1337,12 @@ fn automation_at(
     project: &Project,
     track: &Track,
     render_state: &TrackRenderState<'_>,
-    time: f32,
+    time: f64,
 ) -> AutomationFrame {
     let clip_active = track
         .clips
         .iter()
-        .any(|clip| time >= clip.start && time < clip.end);
+        .any(|clip| time >= f64::from(clip.start) && time < f64::from(clip.end));
     let mut gain = if clip_active {
         parameter_at(
             project,
@@ -1335,8 +1401,13 @@ fn automation_at(
         effects: &mut effects,
     };
     for edit in &project.edits {
-        if time >= edit.start && time < edit.end {
-            apply_regional_automation(&edit.action, edit.start, edit.end, &mut regional);
+        if time >= f64::from(edit.start) && time < f64::from(edit.end) {
+            apply_regional_automation(
+                &edit.action,
+                f64::from(edit.start),
+                f64::from(edit.end),
+                &mut regional,
+            );
         }
     }
     let role_filter = base_filter_for_role(track.role);
@@ -1373,7 +1444,7 @@ fn automation_at(
 
 struct RegionalAutomation<'a> {
     role: TrackRole,
-    time: f32,
+    time: f64,
     gain: &'a mut f32,
     filter: &'a mut f32,
     effects: &'a mut EffectMixes,
@@ -1381,8 +1452,8 @@ struct RegionalAutomation<'a> {
 
 fn apply_regional_automation(
     action: &Action,
-    start: f32,
-    end: f32,
+    start: f64,
+    end: f64,
     regional: &mut RegionalAutomation<'_>,
 ) {
     match action {
@@ -1397,8 +1468,8 @@ fn apply_regional_automation(
             action,
         } => {
             let duration = end - start;
-            let scoped_start = start + duration * relative_start;
-            let scoped_end = start + duration * relative_end;
+            let scoped_start = start + duration * f64::from(*relative_start);
+            let scoped_end = start + duration * f64::from(*relative_end);
             if regional.time >= scoped_start && regional.time < scoped_end {
                 apply_regional_automation(action, scoped_start, scoped_end, regional);
             }
@@ -1876,17 +1947,22 @@ mod tests {
     use crate::prompt::AutomationPoint;
 
     fn automation_frame_at(project: &Project, track: &Track, time: f32) -> AutomationFrame {
+        let time = f64::from(time);
         let render_state = TrackRenderState::new(project, track, time, time + 0.000_01);
         automation_at(project, track, &render_state, time)
     }
 
     fn first_modulator_value_at(project: &Project, track: &Track, time: f32) -> f32 {
+        let time = f64::from(time);
         let render_state = TrackRenderState::new(project, track, time, time + 0.000_01);
         modulator_value(project, &render_state, &track.modulators[0], time)
     }
 
     fn midi_onset_at(project: &Project, track: &Track, time: f32) -> Option<f32> {
-        TrackRenderState::new(project, track, time, time + 0.000_01).last_midi_onset(time)
+        let time = f64::from(time);
+        TrackRenderState::new(project, track, time, time + 0.000_01)
+            .last_midi_onset(time)
+            .map(|onset| onset as f32)
     }
 
     #[test]
@@ -2025,6 +2101,43 @@ mod tests {
             differing, 0,
             "millisecond restart contained {differing} differing samples"
         );
+    }
+
+    #[test]
+    fn late_project_modulation_uses_distinct_control_frames() {
+        let mut project = Project::demo();
+        project.duration = 24.0 * 60.0 * 60.0;
+        project.tracks.retain(|track| track.role == TrackRole::Bass);
+        let modulator = &mut project.tracks[0].modulators[0];
+        modulator.enabled = true;
+        modulator.target = "instrument.pitch".to_owned();
+        modulator.rate = 1.37;
+        modulator.rate_mode = "hz".to_owned();
+        modulator.trigger = "free".to_owned();
+        let track = &project.tracks[0];
+        let render_state = TrackRenderState::new(&project, track, 80_000.0, 80_001.0);
+        let start_sample = 80_000 * SAMPLE_RATE as usize;
+        assert_eq!(
+            playback_start_sample_milliseconds(80_000_001),
+            start_sample + SAMPLE_RATE as usize / 1_000
+        );
+        let sample_times = [
+            project_sample_time(start_sample, 0),
+            project_sample_time(start_sample, 1),
+        ];
+        let values = (0..4)
+            .map(|frame| {
+                modulator_value(
+                    &project,
+                    &render_state,
+                    &track.modulators[0],
+                    project_sample_time(start_sample, frame * AUTOMATION_SAMPLES),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!((sample_times[1] - sample_times[0] - 1.0 / f64::from(SAMPLE_RATE)).abs() < 1e-10);
+        assert!(values.windows(2).all(|pair| pair[0] != pair[1]));
     }
 
     #[test]
