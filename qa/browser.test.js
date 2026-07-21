@@ -357,7 +357,9 @@ async function run() {
       appSession,
       `(async () => {
         const project = await fetch('/api/project').then((response) => response.json());
-        const rendered = await fetch('/api/audio').then((response) => response.json());
+        const rendered = await fetch('/api/audio', {
+          headers: { 'X-DAW-AI-Audio': '1' },
+        }).then((response) => response.json());
         const binary = atob(rendered.wav);
         const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -2515,11 +2517,15 @@ async function run() {
 
     const clientAudioBoundary = await evaluate(cdp, appSession, `(async () => {
       const source = await fetch('/app.js').then((response) => response.text());
+      const engine = source.slice(source.indexOf('class AudioEngine'), source.indexOf('const audio = new AudioEngine'));
       return {
         audioContext: source.includes('AudioContext'),
         offlineContext: source.includes('OfflineAudioContext'),
         oscillator: source.includes('createOscillator'),
         backendEndpoint: source.includes('/api/audio'),
+        mediaClock: engine.includes('media.currentTime'),
+        performanceClock: engine.includes('performance.now'),
+        prefetch: engine.includes('beginPrefetch'),
       };
     })()`);
     assert.deepEqual(
@@ -2529,6 +2535,9 @@ async function run() {
         offlineContext: false,
         oscillator: false,
         backendEndpoint: true,
+        mediaClock: true,
+        performanceClock: false,
+        prefetch: true,
       },
       "the browser client must only transport audio rendered by the backend",
     );
@@ -2567,10 +2576,57 @@ async function run() {
       "backend audio transport pause",
     );
 
+    await evaluate(cdp, appSession, `(() => {
+      const lane = document.querySelector('.track-lane');
+      lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true, cancelable: true }));
+      for (let index = 0; index < 63; index += 1) {
+        lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
+      }
+      window.__audioBoundaryStates = [document.documentElement.dataset.audioState];
+      window.__audioBoundaryObserver = new MutationObserver(() => {
+        window.__audioBoundaryStates.push(document.documentElement.dataset.audioState);
+      });
+      window.__audioBoundaryObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-audio-state'],
+      });
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.documentElement.dataset.audioState === 'playing' &&
+          document.querySelector('#current-time').textContent.startsWith('0:16.')`,
+      ),
+      "prefetched backend audio chunk boundary",
+      30_000,
+    );
+    const audioBoundary = await evaluate(cdp, appSession, `(() => {
+      window.__audioBoundaryObserver.disconnect();
+      const states = window.__audioBoundaryStates;
+      const firstPlaying = states.indexOf('playing');
+      return {
+        state: document.documentElement.dataset.audioState,
+        time: document.querySelector('#current-time').textContent,
+        restarted: states.slice(firstPlaying + 1).includes('starting'),
+      };
+    })()`);
+    assert.equal(audioBoundary.state, "playing");
+    assert.equal(audioBoundary.restarted, false, "chunk advancement must not restart the transport");
+    assert.match(audioBoundary.time, /^0:16\./);
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.documentElement.dataset.audioState === 'idle'"),
+      "boundary playback pause",
+    );
+
     const backendRenderChange = await evaluate(cdp, appSession, `(async () => {
       const project = await fetch('/api/project').then((response) => response.json());
       const bass = project.tracks.find((track) => track.role === 'bass');
-      const before = await fetch('/api/audio').then((response) => response.json());
+      const before = await fetch('/api/audio', {
+        headers: { 'X-DAW-AI-Audio': '1' },
+      }).then((response) => response.json());
       const changedVolume = bass.volume > 0.4 ? 0.25 : 0.75;
       const changed = await fetch('/api/mix', {
         method: 'POST',
@@ -2578,7 +2634,9 @@ async function run() {
         body: new URLSearchParams({ track_id: bass.id, volume: changedVolume }),
       });
       if (!changed.ok) throw new Error(await changed.text());
-      const after = await fetch('/api/audio').then((response) => response.json());
+      const after = await fetch('/api/audio', {
+        headers: { 'X-DAW-AI-Audio': '1' },
+      }).then((response) => response.json());
       const undone = await fetch('/api/undo', { method: 'POST' });
       if (!undone.ok) throw new Error(await undone.text());
       return {
