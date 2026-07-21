@@ -38,10 +38,10 @@ but all execution of it is in the backend server process.
 Contains notes, including their timing, duration, pitch, and velocity.
 
 #### Instrument:
-Produces sound from MIDI events. Instruments may be synthesizers or sample-based instruments and expose configurable parameters.
-At a minimum, this should include at least two oscillators, independently configurable waveform, tuning, and level all with configurable parameters.
+Produces sound from MIDI events.
 
-For the current MVP, this should be a basic implementation, but in the future plugin support for VST plugins like Vital or Serum will be added.
+For the current MVP, this should be a basic implementation, which relying on [Surge XT](https://surge-synthesizer.github.io/) as the only synthesizer
+and exposes basic presets and parameters. Use the official surge-rs Rust bindings. They are alpha quality, so if there are critical bugs, it is ok to vendor it and patch the bugs.
 
 #### Effect
 Processes sound produced by an instrument, such as a filter, distortion, compressor, delay, or reverb, and exposes configurable parameters. May be chained with previous Effect.
