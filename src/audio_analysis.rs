@@ -178,7 +178,12 @@ pub(crate) fn render_region(
             "analysis range must be inside the project and no longer than {MAX_REGION_SECONDS} seconds"
         ));
     }
-    render_audio(project, track_ids, start, end)
+    render_tracks_samples(
+        project,
+        track_ids,
+        playback_start_sample(start),
+        playback_end_sample(end),
+    )
 }
 
 pub(crate) fn render_project_region(
@@ -210,24 +215,31 @@ pub(crate) fn render_project_samples(
     let end_sample = start_sample
         .saturating_add(maximum_samples)
         .min(project_end_sample);
-    let start = sample_time(start_sample);
     let track_ids = project
         .tracks
         .iter()
         .map(|track| track.id)
         .collect::<Vec<_>>();
+    let region = render_tracks_samples(project, &track_ids, start_sample, end_sample)?;
+    Ok((region, end_sample))
+}
+
+fn render_tracks_samples(
+    project: &Project,
+    track_ids: &[u64],
+    start_sample: usize,
+    end_sample: usize,
+) -> Result<AudioRegion, String> {
+    let start = sample_time(start_sample);
     let preroll_start = playback_preroll_start(project, start);
     let preroll_sample = playback_start_sample(preroll_start);
-    let region = render_audio_samples(project, &track_ids, preroll_sample, end_sample)?;
+    let region = render_audio_samples(project, track_ids, preroll_sample, end_sample)?;
     let sample_start = start_sample - preroll_sample;
-    Ok((
-        region.slice(
-            sample_start,
-            sample_start + end_sample - start_sample,
-            start,
-            sample_time(end_sample),
-        ),
-        end_sample,
+    Ok(region.slice(
+        sample_start,
+        sample_start + end_sample - start_sample,
+        start,
+        sample_time(end_sample),
     ))
 }
 
@@ -247,6 +259,7 @@ fn sample_time(sample: usize) -> f32 {
     (sample as f64 / f64::from(SAMPLE_RATE)) as f32
 }
 
+#[cfg(test)]
 fn render_audio(
     project: &Project,
     track_ids: &[u64],
@@ -1953,6 +1966,29 @@ mod tests {
         assert_eq!(
             differing, 0,
             "overlap contained {differing} differing samples"
+        );
+    }
+
+    #[test]
+    fn selected_track_analysis_matches_nonzero_playback() {
+        let mut project = Project::demo();
+        project.tracks.retain(|track| track.role == TrackRole::Bass);
+        let track_id = project.tracks[0].id;
+        let (playback, _) = render_project_region(&project, 16.0).expect("nonzero playback render");
+        let analysis =
+            render_region(&project, &[track_id], 16.0, 32.0).expect("nonzero analysis render");
+        let playback = pcm_bytes(&playback.samples);
+        let analysis = pcm_bytes(&analysis.samples);
+        let differing = playback
+            .chunks_exact(2)
+            .zip(analysis.chunks_exact(2))
+            .filter(|(left, right)| left != right)
+            .count();
+
+        assert_eq!(playback.len(), analysis.len());
+        assert_eq!(
+            differing, 0,
+            "selected-track analysis contained {differing} differing samples"
         );
     }
 
