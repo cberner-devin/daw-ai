@@ -176,6 +176,31 @@ pub(crate) fn render_region(
             "analysis range must be inside the project and no longer than {MAX_REGION_SECONDS} seconds"
         ));
     }
+    render_audio(project, track_ids, start, end)
+}
+
+pub(crate) fn render_project_region(
+    project: &Project,
+    start: f32,
+) -> Result<(AudioRegion, f32), String> {
+    if !start.is_finite() || start < 0.0 || start >= project.duration {
+        return Err("playback start must be inside the project".to_owned());
+    }
+    let end = (start + MAX_REGION_SECONDS).min(project.duration);
+    let track_ids = project
+        .tracks
+        .iter()
+        .map(|track| track.id)
+        .collect::<Vec<_>>();
+    render_audio(project, &track_ids, start, end).map(|region| (region, end))
+}
+
+fn render_audio(
+    project: &Project,
+    track_ids: &[u64],
+    start: f32,
+    end: f32,
+) -> Result<AudioRegion, String> {
     if track_ids.is_empty() {
         return Err("at least one channel ID is required".to_owned());
     }
@@ -215,6 +240,28 @@ pub(crate) fn render_region(
         event_count,
         event_onsets,
     })
+}
+
+pub(crate) fn wav_bytes(samples: &[f32]) -> Vec<u8> {
+    let data_bytes = u32::try_from(samples.len().saturating_mul(2)).unwrap_or(u32::MAX);
+    let mut wav = Vec::with_capacity(44 + samples.len() * 2);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36_u32.saturating_add(data_bytes)).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_bytes.to_le_bytes());
+    for sample in samples {
+        let pcm = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+        wav.extend_from_slice(&pcm.to_le_bytes());
+    }
+    wav
 }
 
 fn render_track(
@@ -1724,6 +1771,18 @@ mod tests {
         assert!(spectrogram.png.len() > 1_000);
         assert_eq!(spectrogram.height, 256);
         assert!(spectrogram.maximum_db > spectrogram.minimum_db);
+    }
+
+    #[test]
+    fn project_playback_is_bounded_to_one_audio_chunk() {
+        let mut project = Project::demo();
+        project.duration = 86_400.0;
+        let (region, end) = render_project_region(&project, 0.0).expect("playback region");
+        assert_eq!(end, MAX_REGION_SECONDS);
+        assert_eq!(
+            region.samples.len(),
+            (MAX_REGION_SECONDS * SAMPLE_RATE as f32) as usize
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 DAW-AI is a local, prompt-driven music studio for making music without learning a traditional DAW. Select a region of the timeline, describe the change in everyday language, and hear the arrangement update immediately.
 
-The project is a small Rust server with a responsive browser client. Audio is synthesized with the Web Audio API, so the included session is playable without samples. Prompted edits are produced by Gemini 3.5 Flash, which hears stereo WAV renders made by the same Web Audio engine used for playback.
+The project is a small Rust server with a responsive browser client. A custom Rust audio engine executes the sound graph in the backend, and the browser only plays the resulting WAV. Prompted edits are produced by Gemini 3.5 Flash, which hears renders made by that same backend engine.
 
 ## Run it
 
@@ -10,7 +10,6 @@ Prerequisites:
 
 - Rust 1.85 or newer
 - `curl`
-- Chrome or Chromium for server-side Web Audio rendering
 - A [Gemini API key](https://ai.google.dev/gemini-api/docs/api-key)
 - `just` (optional, but recommended)
 
@@ -20,7 +19,7 @@ Set the standard environment variable:
 export GEMINI_API_KEY="your-key"
 ```
 
-For a system service, use systemd's `LoadCredential=` with a credential named `gemini-api-key`; DAW-AI automatically reads it from `CREDENTIALS_DIRECTORY`. This keeps the key out of the unit environment, process arguments, and home directories. Set `DAW_AI_CHROME_PATH` to an executable Chrome or Chromium bundle that the service can read; the tracked unit uses `/opt/daw-ai/chromium/chrome`. For interactive use, `~/gemini_creds.txt` remains a fallback. A raw key, `GEMINI_API_KEY=...`, `Gemini API key: ...`, and `export GEMINI_API_KEY=...` are accepted. `DAW_AI_GEMINI_API_KEY` and `DAW_AI_GEMINI_CREDENTIALS` provide explicit overrides.
+For a system service, use systemd's `LoadCredential=` with a credential named `gemini-api-key`; DAW-AI automatically reads it from `CREDENTIALS_DIRECTORY`. This keeps the key out of the unit environment, process arguments, and home directories. For interactive use, `~/gemini_creds.txt` remains a fallback. A raw key, `GEMINI_API_KEY=...`, `Gemini API key: ...`, and `export GEMINI_API_KEY=...` are accepted. `DAW_AI_GEMINI_API_KEY` and `DAW_AI_GEMINI_CREDENTIALS` provide explicit overrides.
 
 Start the studio on the charter's default port:
 
@@ -51,7 +50,7 @@ cargo run -- --port 8888
 
 The current project is stored as `sound-graph.json` in the working directory. Set `DAW_AI_PROJECT_PATH` to use another path. DAW-AI validates an existing file at startup, creates the demo graph when it is missing, and safely saves every accepted prompt, mixer change, Advanced edit, undo, and reset. This makes the graph directly inspectable and editable while the server is stopped.
 
-For each prompt, Gemini receives the selected edit range and the checked-in synth contract under `gemini/`. It can read the latest graph, apply validated edit batches, search for musical context, and choose the channels plus absolute project start/end times to render as WAV audio directly into its next multimodal turn. Listening is independent of edit scope, so Gemini can hear context before or after a transition. Each render runs in a short-lived headless browser owned by the server, using the client engine's oscillators, filters, effect routing, convolution reverb, drive, automation, and master compressor at stereo 48 kHz. It does not depend on the user's tab remaining connected. The integration enforces an audible baseline before the first edit and another listen after every successful batch. Gemini evaluates pulse, subdivision, groove, tension, impact, timbre, and contrast from the audio itself, then iterates as needed. This allows faster sixteenth-note motion or a convincing half-time drop without treating BPM as the only representation of rhythmic intensity.
+For each prompt, Gemini receives the selected edit range and the checked-in synth contract under `gemini/`. It can read the latest graph, apply validated edit batches, search for musical context, and choose the channels plus absolute project start/end times to render as WAV audio directly into its next multimodal turn. Listening is independent of edit scope, so Gemini can hear context before or after a transition. The Rust backend renders the oscillators, MIDI-triggered voices, filters, ordered effects, routing, automation, modulators, and master mix without depending on the user's tab. The integration enforces an audible baseline before the first edit and another listen after every successful batch. Gemini evaluates pulse, subdivision, groove, tension, impact, timbre, and contrast from the audio itself, then iterates as needed. This allows faster sixteenth-note motion or a convincing half-time drop without treating BPM as the only representation of rhythmic intensity.
 
 When the producer claims completion, a fresh Gemini interaction receives the user request and exact latest WAV but none of the producer transcript. This independent judge accepts the result or returns detailed audible evidence and required corrections. A rejection forces another concrete edit and listen before the producer can request a new verdict. There is no predetermined iteration, judge-review, or tool-call limit; the overall 20-minute request timeout is the loop boundary. The server publishes each successful tool batch as an undoable edit while Gemini is still working, then records a completion marker only after the judge accepts. Direct Advanced edits and channel creation or deletion use the same persisted graph.
 
@@ -61,7 +60,7 @@ Every Gemini session is retained locally with request/response JSON, graph state
 
 ## Development
 
-Development checks additionally require Node.js 22 or newer and Chrome or Chromium. Set `CHROME_PATH` for the browser workflow suite and `DAW_AI_CHROME_PATH` for a live Gemini edit when the executable is outside the standard system locations. Verify browser discovery with `just qa-browser-setup`.
+Development checks additionally require Node.js 22 or newer and Chrome or Chromium. Set `CHROME_PATH` when the browser workflow suite cannot discover the executable. Verify browser discovery with `just qa-browser-setup`.
 
 Run formatting checks, Clippy with warnings denied, Rust tests, and the headless-browser workflow suite:
 

@@ -7,9 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value as JsonValue;
 
-#[cfg(test)]
-use crate::audio_analysis;
-use crate::audio_analysis::MAX_REGION_SECONDS;
+use crate::audio_analysis::{self, MAX_REGION_SECONDS};
 use crate::gemini::{EDIT_SCHEMA, plan_from_json};
 use crate::model::{Project, StudioError, json_string};
 use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS};
@@ -314,7 +312,7 @@ pub(crate) fn prepare_audio_render(
     let project = current_project(session_path)?;
     let (track_ids, start, end) = audio_region_arguments(&project, arguments)?;
     let description = format!(
-        "Rendered {} from {:.3} to {:.3} seconds through the same stereo 48 kHz Web Audio engine used for DAW playback. Listen to the audio itself and describe the audible rhythm, subdivision, energy contour, timbre, transitions, and shortcomings before deciding what to do next.",
+        "Rendered {} from {:.3} to {:.3} seconds through the same custom Rust audio engine used for DAW playback. Listen to the audio itself and describe the audible rhythm, subdivision, energy contour, timbre, transitions, and shortcomings before deciding what to do next.",
         selected_channel_labels(&project, &track_ids),
         start,
         end,
@@ -328,7 +326,6 @@ pub(crate) fn prepare_audio_render(
     })
 }
 
-#[cfg(test)]
 pub(crate) fn render_audio_request(request: AudioRenderRequest) -> Result<AudioRender, String> {
     let region = audio_analysis::render_region(
         &request.project,
@@ -338,7 +335,7 @@ pub(crate) fn render_audio_request(request: AudioRenderRequest) -> Result<AudioR
     )?;
     Ok(AudioRender {
         description: request.description,
-        wav: wav_bytes(&region.samples),
+        wav: audio_analysis::wav_bytes(&region.samples),
     })
 }
 
@@ -442,29 +439,6 @@ fn base64(bytes: &[u8]) -> String {
 
 pub(crate) fn base64_audio(bytes: &[u8]) -> String {
     base64(bytes)
-}
-
-#[cfg(test)]
-fn wav_bytes(samples: &[f32]) -> Vec<u8> {
-    let data_bytes = u32::try_from(samples.len().saturating_mul(2)).unwrap_or(u32::MAX);
-    let mut wav = Vec::with_capacity(44 + samples.len() * 2);
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&(36_u32.saturating_add(data_bytes)).to_le_bytes());
-    wav.extend_from_slice(b"WAVEfmt ");
-    wav.extend_from_slice(&16_u32.to_le_bytes());
-    wav.extend_from_slice(&1_u16.to_le_bytes());
-    wav.extend_from_slice(&1_u16.to_le_bytes());
-    wav.extend_from_slice(&audio_analysis::SAMPLE_RATE.to_le_bytes());
-    wav.extend_from_slice(&(audio_analysis::SAMPLE_RATE * 2).to_le_bytes());
-    wav.extend_from_slice(&2_u16.to_le_bytes());
-    wav.extend_from_slice(&16_u16.to_le_bytes());
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_bytes.to_le_bytes());
-    for sample in samples {
-        let pcm = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
-        wav.extend_from_slice(&pcm.to_le_bytes());
-    }
-    wav
 }
 
 fn apply_graph_edits(session_path: &Path, source: &str) -> Result<String, String> {

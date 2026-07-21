@@ -1,12 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as FmtWrite;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 #[cfg(test)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,8 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::audio_analysis;
 use crate::gemini::{EDIT_TIMEOUT_SECONDS, GeminiEdit, GeminiPlanner, PlannerError};
-use crate::gemini_tools::{AudioRender, AudioRenderRequest};
+use crate::gemini_tools::{base64_audio, render_audio_request};
 use crate::model::{ChannelOperationAction, Studio, StudioError, json_string};
 use crate::prompt::{EditPlan, PromptEngine};
 use crate::storage::ProjectStore;
@@ -100,8 +97,7 @@ struct Router {
     store: Option<ProjectStore>,
     planner: Planner,
     edit_jobs: Arc<EditJobs>,
-    server_origin: Option<String>,
-    server_audio_renders: Arc<ServerAudioRenders>,
+    audio_cache: Arc<AudioCache>,
 }
 
 #[derive(Clone)]
@@ -199,14 +195,42 @@ struct EditFailure {
     message: String,
 }
 
-struct ServerAudioRenders {
-    next_id: AtomicU64,
-    renders: Mutex<HashMap<String, ServerAudioRenderSlot>>,
+#[derive(Default)]
+struct AudioCache {
+    entry: Mutex<Option<(String, String)>>,
 }
 
-struct ServerAudioRenderSlot {
-    request: AudioRenderRequest,
-    result: Option<Result<Vec<u8>, String>>,
+impl AudioCache {
+    fn playback_json(&self, project: &crate::model::Project, start: f32) -> Result<String, String> {
+        let graph = project.to_json();
+        let cache_key = format!("{start:.3}\n{graph}");
+        if let Some((_, response)) = self
+            .entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|(cached_key, _)| cached_key == &cache_key)
+        {
+            return Ok(response.clone());
+        }
+        let (region, end) = audio_analysis::render_project_region(project, start)?;
+        let wav = audio_analysis::wav_bytes(&region.samples);
+        let response = serde_json::json!({
+            "projectVersion": project.version,
+            "sampleRate": audio_analysis::SAMPLE_RATE,
+            "channels": 1,
+            "start": start,
+            "end": end,
+            "wav": base64_audio(&wav),
+        })
+        .to_string();
+        *self
+            .entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((cache_key, response.clone()));
+        Ok(response)
+    }
 }
 
 impl EditJobs {
@@ -346,258 +370,6 @@ impl EditJobs {
     }
 }
 
-enum AudioRenderSubmitError {
-    NotFound,
-    AlreadyCompleted,
-    Invalid(String),
-}
-
-impl ServerAudioRenders {
-    fn new() -> Self {
-        Self {
-            next_id: AtomicU64::new(1),
-            renders: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn render(&self, origin: &str, request: AudioRenderRequest) -> Result<AudioRender, String> {
-        let id = new_operation_id(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let description = request.description.clone();
-        self.lock().insert(
-            id.clone(),
-            ServerAudioRenderSlot {
-                request,
-                result: None,
-            },
-        );
-
-        let profile = std::env::temp_dir().join(format!("daw-ai-audio-render-{id}"));
-        let run_result = self.run_browser(origin, &id, &profile);
-        remove_browser_profile(&profile);
-        let slot = self.lock().remove(&id);
-        let result = slot.and_then(|slot| slot.result).unwrap_or_else(|| {
-            Err(run_result.err().unwrap_or_else(|| {
-                "the server-side browser exited without returning rendered audio".to_owned()
-            }))
-        });
-        result.map(|wav| AudioRender { description, wav })
-    }
-
-    fn run_browser(&self, origin: &str, id: &str, profile: &Path) -> Result<(), String> {
-        fs::create_dir(profile)
-            .map_err(|error| format!("could not create the browser audio profile: {error}"))?;
-        let browser = server_browser_path()?;
-        let url = format!("{origin}/?server-audio-render={id}");
-        let mut command = Command::new(&browser);
-        command
-            .arg("--headless")
-            .arg("--no-sandbox")
-            .arg("--disable-gpu")
-            .arg("--disable-dev-shm-usage")
-            .arg("--disable-breakpad")
-            .arg("--disable-crash-reporter")
-            .arg("--no-first-run")
-            .arg("--mute-audio")
-            .arg("--autoplay-policy=no-user-gesture-required")
-            .arg("--dump-dom")
-            .arg("--virtual-time-budget=30000")
-            .arg(format!("--user-data-dir={}", profile.display()))
-            .arg(url)
-            .env("HOME", profile)
-            .env("XDG_CONFIG_HOME", profile.join("config"))
-            .env("XDG_CACHE_HOME", profile.join("cache"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(unix)]
-        command.process_group(0);
-        let mut child = command.spawn().map_err(|error| {
-            format!(
-                "could not start the server-side Web Audio browser at {}: {error}",
-                browser.display()
-            )
-        })?;
-        let deadline = Instant::now() + Duration::from_secs(45);
-        loop {
-            if self
-                .lock()
-                .get(id)
-                .is_some_and(|slot| slot.result.is_some())
-            {
-                terminate_browser(&mut child);
-                return Ok(());
-            }
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|error| format!("could not monitor the Web Audio browser: {error}"))?
-            {
-                return status.success().then_some(()).ok_or_else(|| {
-                    format!("the server-side Web Audio browser exited with status {status}")
-                });
-            }
-            if Instant::now() >= deadline {
-                terminate_browser(&mut child);
-                return Err("the server-side Web Audio render timed out".to_owned());
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
-    }
-
-    fn request_json(&self, id: &str) -> Option<String> {
-        let renders = self.lock();
-        let slot = renders.get(id)?;
-        let project = serde_json::from_str::<serde_json::Value>(&slot.request.project.to_json())
-            .expect("validated project JSON remains valid");
-        Some(
-            serde_json::json!({
-                "id": id,
-                "project": project,
-                "trackIds": slot.request.track_ids,
-                "start": slot.request.start,
-                "end": slot.request.end
-            })
-            .to_string(),
-        )
-    }
-
-    fn submit(
-        &self,
-        id: &str,
-        result: Result<Vec<u8>, String>,
-    ) -> Result<(), AudioRenderSubmitError> {
-        let mut renders = self.lock();
-        let slot = renders
-            .get_mut(id)
-            .ok_or(AudioRenderSubmitError::NotFound)?;
-        if slot.result.is_some() {
-            return Err(AudioRenderSubmitError::AlreadyCompleted);
-        }
-        if let Ok(wav) = &result {
-            validate_browser_wav(wav, slot.request.end - slot.request.start)
-                .map_err(AudioRenderSubmitError::Invalid)?;
-        }
-        slot.result = Some(result);
-        Ok(())
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ServerAudioRenderSlot>> {
-        self.renders
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-fn terminate_browser(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        const SIGKILL: i32 = 9;
-        unsafe extern "C" {
-            fn kill(process: i32, signal: i32) -> i32;
-        }
-        let process_group = -(child.id() as i32);
-        let _ = unsafe { kill(process_group, SIGKILL) };
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn remove_browser_profile(profile: &Path) {
-    for attempt in 0..10 {
-        match fs::remove_dir_all(profile) {
-            Ok(()) => return,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            Err(error) if attempt == 9 => {
-                eprintln!(
-                    "warning: could not remove Web Audio browser profile {}: {error}",
-                    profile.display()
-                );
-            }
-            Err(_) => thread::sleep(Duration::from_millis(20)),
-        }
-    }
-}
-
-fn server_browser_path() -> Result<PathBuf, String> {
-    let configured = std::env::var_os("DAW_AI_CHROME_PATH").map(PathBuf::from);
-    let candidates = configured.into_iter().chain([
-        PathBuf::from("/opt/daw-ai/chromium/chrome"),
-        PathBuf::from("/usr/bin/google-chrome"),
-        PathBuf::from("/usr/bin/google-chrome-stable"),
-        PathBuf::from("/usr/bin/chromium"),
-        PathBuf::from("/usr/bin/chromium-browser"),
-    ]);
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .ok_or_else(|| {
-            "server-side Web Audio requires Chrome or Chromium; set DAW_AI_CHROME_PATH".to_owned()
-        })
-}
-
-fn validate_browser_wav(wav: &[u8], duration: f32) -> Result<(), String> {
-    const HEADER_BYTES: usize = 44;
-    const SAMPLE_RATE: u32 = 48_000;
-    const CHANNELS: u16 = 2;
-    const BYTES_PER_FRAME: usize = CHANNELS as usize * 2;
-    if wav.len() < HEADER_BYTES
-        || &wav[0..4] != b"RIFF"
-        || &wav[8..12] != b"WAVE"
-        || &wav[12..16] != b"fmt "
-        || &wav[36..40] != b"data"
-        || u16::from_le_bytes([wav[20], wav[21]]) != 1
-        || u16::from_le_bytes([wav[22], wav[23]]) != CHANNELS
-        || u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]) != SAMPLE_RATE
-        || u16::from_le_bytes([wav[34], wav[35]]) != 16
-    {
-        return Err("the browser returned an unsupported WAV format".to_owned());
-    }
-    let data_bytes = u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]) as usize;
-    if data_bytes != wav.len() - HEADER_BYTES || data_bytes % BYTES_PER_FRAME != 0 {
-        return Err("the browser returned a malformed WAV length".to_owned());
-    }
-    let actual_frames = data_bytes / BYTES_PER_FRAME;
-    let expected_frames = (duration * SAMPLE_RATE as f32).ceil() as usize;
-    if actual_frames.abs_diff(expected_frames) > 1 {
-        return Err("the browser returned WAV audio with the wrong duration".to_owned());
-    }
-    Ok(())
-}
-
-fn decode_base64(source: &str) -> Option<Vec<u8>> {
-    if source.is_empty() || source.len() % 4 != 0 {
-        return None;
-    }
-    let mut output = Vec::with_capacity(source.len() / 4 * 3);
-    for (chunk_index, chunk) in source.as_bytes().chunks_exact(4).enumerate() {
-        let final_chunk = chunk_index + 1 == source.len() / 4;
-        let value = |byte: u8| match byte {
-            b'A'..=b'Z' => Some(byte - b'A'),
-            b'a'..=b'z' => Some(byte - b'a' + 26),
-            b'0'..=b'9' => Some(byte - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        };
-        let first = value(chunk[0])?;
-        let second = value(chunk[1])?;
-        let third_padding = chunk[2] == b'=';
-        let fourth_padding = chunk[3] == b'=';
-        if third_padding && !fourth_padding || fourth_padding && !final_chunk {
-            return None;
-        }
-        let third = if third_padding { 0 } else { value(chunk[2])? };
-        let fourth = if fourth_padding { 0 } else { value(chunk[3])? };
-        output.push((first << 2) | (second >> 4));
-        if !third_padding {
-            output.push((second << 4) | (third >> 2));
-        }
-        if !fourth_padding {
-            output.push((third << 6) | fourth);
-        }
-    }
-    Some(output)
-}
-
 impl EditFailure {
     fn new(status: u16, message: impl Into<String>) -> Self {
         Self {
@@ -617,7 +389,7 @@ fn planner_failure(error: PlannerError) -> EditFailure {
 }
 
 impl Router {
-    fn new(port: u16) -> io::Result<Self> {
+    fn new(_port: u16) -> io::Result<Self> {
         let planner = match std::env::var("DAW_AI_PROMPT_ENGINE") {
             Ok(value) if value == "demo" => Planner::Demo,
             _ => Planner::Gemini,
@@ -628,8 +400,7 @@ impl Router {
             store: Some(store),
             planner,
             edit_jobs: Arc::new(EditJobs::new()),
-            server_origin: Some(format!("http://127.0.0.1:{port}")),
-            server_audio_renders: Arc::new(ServerAudioRenders::new()),
+            audio_cache: Arc::new(AudioCache::default()),
         })
     }
 
@@ -640,8 +411,7 @@ impl Router {
             store: None,
             planner: Planner::Demo,
             edit_jobs: Arc::new(EditJobs::new()),
-            server_origin: None,
-            server_audio_renders: Arc::new(ServerAudioRenders::new()),
+            audio_cache: Arc::new(AudioCache::default()),
         }
     }
 
@@ -652,22 +422,15 @@ impl Router {
         if request.is_mutation() && !request.is_trusted_mutation(public_host) {
             return Response::json(403, error_json("cross-origin request rejected"));
         }
-        if let Some(render_id) = server_audio_render_id(&request.path) {
-            return match request.method.as_str() {
-                "GET" => self
-                    .server_audio_renders
-                    .request_json(render_id)
-                    .map_or_else(
-                        || Response::json(404, error_json("audio render request not found")),
-                        |body| Response::json(200, body),
-                    ),
-                "POST" => self.submit_server_audio_render(render_id, &request.body),
-                _ => Response::json(405, error_json("method not allowed"))
-                    .with_header("Allow", "GET, POST"),
+        if let Some(start) = playback_audio_start(&request.path) {
+            return if request.method == "GET" {
+                self.playback_audio(start)
+            } else {
+                Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
             };
         }
-        if request.path.starts_with("/api/server-audio-renders/") {
-            return Response::json(404, error_json("audio render request not found"));
+        if request.path.starts_with("/api/audio") {
+            return Response::json(404, error_json("audio region not found"));
         }
         if let Some(operation_id) = edit_operation_id(&request.path) {
             return if request.method == "GET" {
@@ -797,30 +560,17 @@ impl Router {
         )
     }
 
-    fn submit_server_audio_render(&self, id: &str, body: &str) -> Response {
-        let value = match serde_json::from_str::<serde_json::Value>(body) {
-            Ok(value) => value,
-            Err(_) => return Response::json(422, error_json("invalid audio render response")),
-        };
-        let result = if let Some(wav) = value.get("wav").and_then(serde_json::Value::as_str) {
-            decode_base64(wav).ok_or_else(|| "the browser returned invalid WAV data".to_owned())
-        } else if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
-            Err(format!(
-                "server-side Web Audio failed: {}",
-                single_line(error)
-            ))
-        } else {
-            return Response::json(422, error_json("audio render response omitted its result"));
-        };
-        match self.server_audio_renders.submit(id, result) {
-            Ok(()) => Response::json(200, "{\"status\":\"accepted\"}".to_owned()),
-            Err(AudioRenderSubmitError::NotFound) => {
-                Response::json(404, error_json("audio render request not found"))
+    fn playback_audio(&self, start: f32) -> Response {
+        let project = self.lock_studio().project().clone();
+        if !start.is_finite() || start < 0.0 || start >= project.duration {
+            return Response::json(422, error_json("playback start is outside the project"));
+        }
+        match self.audio_cache.playback_json(&project, start) {
+            Ok(body) => Response::json(200, body),
+            Err(error) => {
+                eprintln!("error: could not render playback audio: {error}");
+                Response::json(500, error_json("could not render playback audio"))
             }
-            Err(AudioRenderSubmitError::AlreadyCompleted) => {
-                Response::json(409, error_json("audio render was already completed"))
-            }
-            Err(AudioRenderSubmitError::Invalid(error)) => Response::json(422, error_json(&error)),
         }
     }
 
@@ -905,10 +655,6 @@ impl Router {
     fn perform_gemini_edit(&self, job_id: u64, edit: EditRequest) -> Result<String, EditFailure> {
         let mut expected_version = edit.project.version;
         let mut published_update = false;
-        let origin = self
-            .server_origin
-            .as_deref()
-            .ok_or_else(|| EditFailure::new(503, "server-side Web Audio is unavailable"))?;
         let completed = GeminiPlanner::interpret_with_audio_renderer_updates(
             &edit.prompt,
             edit.start,
@@ -918,13 +664,13 @@ impl Router {
                 self.edit_jobs.set_running(
                     job_id,
                     "rendering",
-                    "Rendering the current sound graph with server-side Web Audio",
+                    "Rendering the current sound graph with the Rust audio engine",
                 );
-                let result = self.server_audio_renders.render(origin, request);
+                let result = render_audio_request(request);
                 self.edit_jobs.set_running(
                     job_id,
                     "planning",
-                    "Gemini is listening to the Web Audio render",
+                    "Gemini is listening to the backend audio render",
                 );
                 result
             },
@@ -1378,8 +1124,7 @@ impl Request {
                     | "/api/logs"
                     | "/api/undo"
                     | "/api/reset"
-            ) || self.path.starts_with("/api/edits/")
-                || self.path.starts_with("/api/server-audio-renders/"))
+            ) || self.path.starts_with("/api/edits/"))
     }
 
     fn public_host(&self) -> Option<&str> {
@@ -1456,7 +1201,7 @@ impl Response {
                 "Connection: close\r\nX-Content-Type-Options: nosniff\r\n",
                 "Content-Security-Policy: default-src 'self'; script-src 'self'; ",
                 "style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; ",
-                "object-src 'none'; frame-ancestors 'none'; base-uri 'none';\r\n",
+                "media-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none';\r\n",
                 "Referrer-Policy: no-referrer\r\n"
             ),
             self.status,
@@ -1604,14 +1349,12 @@ fn edit_job_id(path: &str) -> Option<u64> {
         .flatten()
 }
 
-fn server_audio_render_id(path: &str) -> Option<&str> {
-    let id = path.strip_prefix("/api/server-audio-renders/")?;
-    (!id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
-    .then_some(id)
+fn playback_audio_start(path: &str) -> Option<f32> {
+    if path == "/api/audio" {
+        return Some(0.0);
+    }
+    let milliseconds = path.strip_prefix("/api/audio/")?.parse::<u64>().ok()?;
+    Some(milliseconds as f32 / 1_000.0)
 }
 
 fn edit_operation_id(path: &str) -> Option<&str> {
@@ -1848,8 +1591,7 @@ mod tests {
                 store: Some(store),
                 planner: Planner::Demo,
                 edit_jobs: Arc::new(EditJobs::new()),
-                server_origin: None,
-                server_audio_renders: Arc::new(ServerAudioRenders::new()),
+                audio_cache: Arc::new(AudioCache::default()),
             },
             path,
         )
@@ -2231,8 +1973,7 @@ mod tests {
             store: None,
             planner: Planner::Demo,
             edit_jobs: Arc::new(EditJobs::new()),
-            server_origin: None,
-            server_audio_renders: Arc::new(ServerAudioRenders::new()),
+            audio_cache: Arc::new(AudioCache::default()),
         };
         let retried = restarted.handle(&request(
             "POST",
@@ -2365,7 +2106,7 @@ mod tests {
         let error = router.handle(&request(
             "POST",
             "/api/logs",
-            "level=error&context=starting+audio&message=AudioContext+failed",
+            "level=error&context=starting+audio&message=Media+playback+failed",
         ));
         assert_eq!(error.status, 200);
         assert_eq!(error.body, "{\"status\":\"logged\"}");
@@ -2644,117 +2385,30 @@ mod tests {
     }
 
     #[test]
-    fn accepts_validated_server_side_browser_audio() {
+    fn serves_audio_rendered_by_the_backend_engine() {
         let router = Router::demo();
-        let id = "render_test_1";
-        router.server_audio_renders.lock().insert(
-            id.to_owned(),
-            ServerAudioRenderSlot {
-                request: AudioRenderRequest {
-                    project: crate::model::Project::demo(),
-                    track_ids: vec![1, 2, 3],
-                    start: 0.0,
-                    end: 1.0,
-                    description: "test render".to_owned(),
-                },
-                result: None,
-            },
-        );
-
-        let render_request = router.handle(&request(
-            "GET",
-            "/api/server-audio-renders/render_test_1",
-            "",
-        ));
-        assert_eq!(render_request.status, 200);
-        let render_request: serde_json::Value =
-            serde_json::from_str(&render_request.body).expect("render request JSON");
-        assert_eq!(render_request["trackIds"], serde_json::json!([1, 2, 3]));
-        assert_eq!(
-            render_request["project"]["tracks"]
-                .as_array()
-                .unwrap()
-                .len(),
-            3
-        );
-
-        let mut wav = vec![0_u8; 44 + 48_000 * 4];
-        let riff_size = wav.len() as u32 - 8;
-        wav[0..4].copy_from_slice(b"RIFF");
-        wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
-        wav[8..12].copy_from_slice(b"WAVE");
-        wav[12..16].copy_from_slice(b"fmt ");
-        wav[16..20].copy_from_slice(&16_u32.to_le_bytes());
-        wav[20..22].copy_from_slice(&1_u16.to_le_bytes());
-        wav[22..24].copy_from_slice(&2_u16.to_le_bytes());
-        wav[24..28].copy_from_slice(&48_000_u32.to_le_bytes());
-        wav[28..32].copy_from_slice(&(48_000_u32 * 4).to_le_bytes());
-        wav[32..34].copy_from_slice(&4_u16.to_le_bytes());
-        wav[34..36].copy_from_slice(&16_u16.to_le_bytes());
-        wav[36..40].copy_from_slice(b"data");
-        wav[40..44].copy_from_slice(&(48_000_u32 * 4).to_le_bytes());
-        let body = serde_json::json!({"wav": crate::gemini_tools::base64_audio(&wav)}).to_string();
-        let response = router.handle(&request(
-            "POST",
-            "/api/server-audio-renders/render_test_1",
-            &body,
-        ));
+        let response = router.handle(&request("GET", "/api/audio", ""));
         assert_eq!(response.status, 200);
-        let mut renders = router.server_audio_renders.lock();
-        let stored = renders
-            .get_mut(id)
-            .and_then(|slot| slot.result.take())
-            .expect("submitted result")
-            .expect("valid WAV");
-        assert_eq!(stored, wav);
-    }
-
-    #[test]
-    #[ignore = "requires DAW_AI_CHROME_PATH and a runnable headless browser"]
-    fn server_side_browser_renders_without_a_client_session() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking listener");
-        let port = listener.local_addr().expect("listener address").port();
-        let router = Router::demo();
-        let renders = Arc::clone(&router.server_audio_renders);
-        let request = AudioRenderRequest {
-            project: crate::model::Project::demo(),
-            track_ids: vec![1, 2, 3],
-            start: 0.0,
-            end: 1.0,
-            description: "integration render".to_owned(),
-        };
-        let worker =
-            thread::spawn(move || renders.render(&format!("http://127.0.0.1:{port}"), request));
-        while !worker.is_finished() {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let router = router.clone();
-                    thread::spawn(move || {
-                        serve_connection(&mut stream, &router).expect("serve browser request");
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("browser listener failed: {error}"),
-            }
-        }
-        let rendered = worker
-            .join()
-            .expect("render worker")
-            .expect("Web Audio render");
-        validate_browser_wav(&rendered.wav, 1.0).expect("valid browser WAV");
-        assert!(
-            rendered.wav[44..]
-                .chunks_exact(2)
-                .any(|sample| sample != [0, 0]),
-            "browser render should contain music"
+        let audio: serde_json::Value =
+            serde_json::from_str(&response.body).expect("playback audio JSON");
+        assert_eq!(audio["projectVersion"], 1);
+        assert_eq!(audio["sampleRate"], audio_analysis::SAMPLE_RATE);
+        assert_eq!(audio["channels"], 1);
+        assert_eq!(audio["start"], 0.0);
+        assert_eq!(audio["end"], audio_analysis::MAX_REGION_SECONDS);
+        let wav = audio["wav"].as_str().expect("base64 WAV");
+        assert!(wav.starts_with("UklGR"));
+        assert!(wav.len() > 1_000);
+        assert_eq!(
+            router.handle(&request("POST", "/api/audio", "")).status,
+            405
         );
+        let later = router.handle(&request("GET", "/api/audio/16000", ""));
+        assert_eq!(later.status, 200);
+        let later: serde_json::Value =
+            serde_json::from_str(&later.body).expect("later playback audio JSON");
+        assert_eq!(later["start"], 16.0);
     }
-
     #[test]
     fn rejects_content_lengths_that_overflow_the_request_bound() {
         let raw = format!(
