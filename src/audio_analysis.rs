@@ -8,6 +8,7 @@ use crate::prompt::{Action, AutomationPoint};
 
 pub(crate) const SAMPLE_RATE: u32 = 16_000;
 pub(crate) const MAX_REGION_SECONDS: f32 = 16.0;
+const PLAYBACK_PREROLL_SECONDS: f32 = MAX_REGION_SECONDS;
 const FFT_SIZE: usize = 512;
 const FFT_HOP: usize = 256;
 const MEL_BANDS: usize = 64;
@@ -192,7 +193,11 @@ pub(crate) fn render_project_region(
         .iter()
         .map(|track| track.id)
         .collect::<Vec<_>>();
-    render_audio(project, &track_ids, start, end).map(|region| (region, end))
+    let preroll_start = (start - PLAYBACK_PREROLL_SECONDS).max(0.0);
+    let region = render_audio(project, &track_ids, preroll_start, end)?;
+    let sample_start = ((start - preroll_start) * SAMPLE_RATE as f32).round() as usize;
+    let sample_end = sample_start + ((end - start) * SAMPLE_RATE as f32).ceil() as usize;
+    Ok((region.slice(sample_start, sample_end, start, end), end))
 }
 
 fn render_audio(
@@ -399,9 +404,11 @@ fn render_event(
                     &mut phases,
                     current_frequency,
                     project_time,
-                ) + 0.78 * deterministic_noise(event_id, index)
+                ) + 0.78 * deterministic_noise(event_id, project_sample_index(region_start, index))
             }
-            "hat" | "cymbal" => deterministic_noise(event_id, index),
+            "hat" | "cymbal" => {
+                deterministic_noise(event_id, project_sample_index(region_start, index))
+            }
             "percussion" => {
                 0.45 * oscillator_sample(
                     project,
@@ -410,7 +417,7 @@ fn render_event(
                     &mut phases,
                     current_frequency,
                     project_time,
-                ) + 0.55 * deterministic_noise(event_id, index)
+                ) + 0.55 * deterministic_noise(event_id, project_sample_index(region_start, index))
             }
             _ => oscillator_sample(
                 project,
@@ -863,8 +870,12 @@ fn waveform(kind: &str, phase: f32) -> f32 {
     }
 }
 
-fn deterministic_noise(event_id: u64, sample: usize) -> f32 {
-    let mut value = event_id ^ (sample as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+fn project_sample_index(region_start: f32, index: usize) -> u64 {
+    (region_start * SAMPLE_RATE as f32).round() as u64 + index as u64
+}
+
+fn deterministic_noise(event_id: u64, sample: u64) -> f32 {
+    let mut value = event_id ^ sample.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     value ^= value >> 30;
     value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value ^= value >> 27;
@@ -1782,6 +1793,18 @@ mod tests {
         assert_eq!(
             region.samples.len(),
             (MAX_REGION_SECONDS * SAMPLE_RATE as f32) as usize
+        );
+    }
+
+    #[test]
+    fn overlapping_playback_regions_have_identical_pcm() {
+        let project = Project::demo();
+        let (earlier, _) = render_project_region(&project, 15.5).expect("earlier playback region");
+        let (later, _) = render_project_region(&project, 16.0).expect("later playback region");
+        let overlap_offset = (0.5 * SAMPLE_RATE as f32) as usize;
+        assert_eq!(
+            &earlier.samples[overlap_offset..],
+            &later.samples[..earlier.samples.len() - overlap_offset]
         );
     }
 

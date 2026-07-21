@@ -72,6 +72,9 @@
   const RECONCILED_REQUEST_TIMEOUT_MS = 2000;
   const EDIT_ACCEPTANCE_TIMEOUT_MS = 10_000;
   const PENDING_EDIT_STORAGE_KEY = "daw-ai.pending-edit.v1";
+  const AUDIO_CHUNK_SECONDS = 16;
+  const AUDIO_PREFETCH_LEAD_SECONDS = 12;
+  const AUDIO_PREFETCH_GUARD_SECONDS = 4;
 
   class AudioEngine {
     constructor() {
@@ -84,8 +87,10 @@
       this.audioVersion = null;
       this.audioStart = 0;
       this.audioEnd = 0;
-      this.playbackStartedAt = 0;
-      this.projectStartedAt = 0;
+      this.prefetch = null;
+      this.transitioning = false;
+      this.chunkCache = new Map();
+      this.chunkCacheVersion = null;
     }
 
     get project() {
@@ -116,70 +121,71 @@
       const generation = this.playbackGeneration;
       updateTransport();
 
+      let chunk = null;
       try {
-        const source = await this.backendAudioUrl();
-        if (generation !== this.playbackGeneration || this.playbackState !== "starting") return;
-        const media = new Audio();
-        media.preload = "auto";
-        media.src = source;
-        this.media = media;
-        const metadata = this.waitForMetadata(media);
-        media.addEventListener(
-          "ended",
-          () => {
-            if (this.media === media) this.advanceChunk();
-          },
-          { once: true },
-        );
-        this.projectStartedAt = this.playhead;
-        this.playbackStartedAt = performance.now();
+        chunk = await this.prepareChunk(this.playhead);
+        if (generation !== this.playbackGeneration || this.playbackState !== "starting") {
+          this.releaseMedia(chunk.media);
+          return;
+        }
+        const remaining = chunk.end - this.playhead;
+        const prefetch =
+          remaining <= AUDIO_PREFETCH_GUARD_SECONDS
+            ? this.beginPrefetch(chunk, generation)
+            : null;
+        if (prefetch) {
+          await prefetch.promise;
+        }
+        if (generation !== this.playbackGeneration || this.playbackState !== "starting") {
+          this.releaseMedia(chunk.media);
+          return;
+        }
+        chunk.media.currentTime = clamp(this.playhead - chunk.start, 0, chunk.media.duration);
+        await chunk.media.play();
+        if (generation !== this.playbackGeneration || this.playbackState !== "starting") {
+          this.releaseMedia(chunk.media);
+          return;
+        }
+        this.installChunk(chunk, generation);
         this.playbackState = "playing";
         this.timer = window.setInterval(() => this.tick(), 50);
         this.tick();
         updateTransport();
-        void metadata
-          .then(() => {
-            if (generation !== this.playbackGeneration || this.media !== media) return;
-            this.updatePosition();
-            media.currentTime = clamp(
-              this.playhead - this.audioStart,
-              0,
-              media.duration,
-            );
-            return media.play();
-          })
-          .catch((error) => {
-            if (generation !== this.playbackGeneration || this.media !== media) return;
-            this.stop(true);
-            showError(error, "starting backend audio", "Could not start audio: ");
-          });
       } catch (error) {
         if (generation !== this.playbackGeneration) return;
+        if (chunk?.media !== this.media) this.releaseMedia(chunk?.media);
         this.stop(true);
         showError(error, "starting backend audio", "Could not start audio: ");
       }
     }
 
-    async backendAudioUrl() {
+    async backendAudioChunk(position) {
       let projectVersion = this.project.version;
-      if (
-        this.audioUrl &&
-        this.audioVersion === projectVersion &&
-        this.playhead >= this.audioStart &&
-        this.playhead < this.audioEnd - 0.01
-      ) {
-        return this.audioUrl;
+      const chunkStart = Math.floor(position / AUDIO_CHUNK_SECONDS) * AUDIO_CHUNK_SECONDS;
+      if (this.chunkCacheVersion !== projectVersion) {
+        this.chunkCache.clear();
+        this.chunkCacheVersion = projectVersion;
       }
-      const startMilliseconds = Math.floor(this.playhead * 1_000);
-      const rendered = await api(`/api/audio/${startMilliseconds}`, {}, 60_000);
+      const cached = this.chunkCache.get(chunkStart);
+      if (cached) return cached;
+      const startMilliseconds = Math.round(chunkStart * 1_000);
+      const rendered = await api(
+        `/api/audio/${startMilliseconds}`,
+        { headers: { "X-DAW-AI-Audio": "1" } },
+        60_000,
+      );
       if (rendered?.projectVersion !== projectVersion) {
-        const currentProject = await api("/api/project");
-        if (currentProject.version !== rendered?.projectVersion) {
-          throw new Error("The project changed while backend audio was rendering.");
+        if (state.promptPending) {
+          projectVersion = rendered.projectVersion;
+        } else {
+          const currentProject = await api("/api/project");
+          if (currentProject.version !== rendered?.projectVersion) {
+            throw new Error("The project changed while backend audio was rendering.");
+          }
+          state.project = currentProject;
+          projectVersion = currentProject.version;
+          renderProject();
         }
-        state.project = currentProject;
-        projectVersion = currentProject.version;
-        renderProject();
       }
       if (
         rendered?.channels !== 1 ||
@@ -187,8 +193,8 @@
         rendered.sampleRate <= 0 ||
         !Number.isFinite(rendered?.start) ||
         !Number.isFinite(rendered?.end) ||
-        rendered.start > this.playhead + 0.001 ||
-        rendered.end <= this.playhead ||
+        rendered.start > position + 0.001 ||
+        rendered.end <= position ||
         typeof rendered?.wav !== "string" ||
         rendered.wav.length === 0
       ) {
@@ -202,11 +208,80 @@
       ) {
         throw new Error("The backend returned an invalid WAV file.");
       }
-      this.audioUrl = `data:audio/wav;base64,${rendered.wav}`;
-      this.audioVersion = projectVersion;
-      this.audioStart = rendered.start;
-      this.audioEnd = rendered.end;
-      return this.audioUrl;
+      if (this.chunkCacheVersion !== projectVersion) {
+        this.chunkCache.clear();
+        this.chunkCacheVersion = projectVersion;
+      }
+      const chunk = {
+        source: `data:audio/wav;base64,${rendered.wav}`,
+        version: projectVersion,
+        start: rendered.start,
+        end: rendered.end,
+      };
+      this.chunkCache.set(chunk.start, chunk);
+      while (this.chunkCache.size > 3) this.chunkCache.delete(this.chunkCache.keys().next().value);
+      return chunk;
+    }
+
+    async prepareChunk(position) {
+      const chunk = await this.backendAudioChunk(position);
+      const media = new Audio();
+      media.preload = "auto";
+      media.src = chunk.source;
+      try {
+        await this.waitForMetadata(media);
+        return { ...chunk, media };
+      } catch (error) {
+        this.releaseMedia(media);
+        throw error;
+      }
+    }
+
+    beginPrefetch(chunk, generation) {
+      if (chunk.end >= this.project.duration - 0.01) return null;
+      if (
+        this.prefetch &&
+        this.prefetch.generation === generation &&
+        Math.abs(this.prefetch.start - chunk.end) < 0.001
+      ) {
+        return this.prefetch;
+      }
+      const entry = {
+        generation,
+        start: chunk.end,
+        promise: this.prepareChunk(chunk.end),
+      };
+      entry.promise
+        .then((prepared) => {
+          if (generation !== this.playbackGeneration && prepared.media !== this.media) {
+            this.releaseMedia(prepared.media);
+          }
+        })
+        .catch(() => {});
+      this.prefetch = entry;
+      return entry;
+    }
+
+    installChunk(chunk, generation) {
+      this.media = chunk.media;
+      this.audioUrl = chunk.source;
+      this.audioVersion = chunk.version;
+      this.audioStart = chunk.start;
+      this.audioEnd = chunk.end;
+      chunk.media.addEventListener(
+        "ended",
+        () => {
+          if (this.media === chunk.media) void this.advanceChunk(chunk.media, generation);
+        },
+        { once: true },
+      );
+    }
+
+    releaseMedia(media) {
+      if (!media) return;
+      media.pause();
+      media.removeAttribute("src");
+      media.load();
     }
 
     waitForMetadata(media) {
@@ -231,16 +306,24 @@
     }
 
     stop(preservePosition) {
-      if (this.isPlaying && preservePosition) this.updatePosition();
+      if (preservePosition) this.updatePosition();
       this.playbackGeneration += 1;
       this.playbackState = "idle";
+      this.transitioning = false;
       window.clearInterval(this.timer);
       this.timer = null;
       if (this.media) {
-        this.media.pause();
-        this.media.removeAttribute("src");
-        this.media.load();
+        this.releaseMedia(this.media);
         this.media = null;
+      }
+      const prefetch = this.prefetch;
+      this.prefetch = null;
+      if (prefetch) {
+        void prefetch.promise
+          .then((chunk) => {
+            if (chunk.media !== this.media) this.releaseMedia(chunk.media);
+          })
+          .catch(() => {});
       }
       if (!preservePosition) this.playhead = 0;
       updateTransport();
@@ -257,20 +340,46 @@
     }
 
     updatePosition() {
-      if (!this.isPlaying || !this.media) return;
-      const elapsed = (performance.now() - this.playbackStartedAt) / 1000;
-      this.playhead = Math.min(this.project.duration, this.projectStartedAt + elapsed);
+      if (!this.media || !Number.isFinite(this.media.currentTime)) return;
+      this.playhead = Math.min(this.project.duration, this.audioStart + this.media.currentTime);
     }
 
-    advanceChunk() {
-      if (!this.isPlaying) return;
+    async advanceChunk(media, generation) {
+      if (!this.isPlaying || this.transitioning || this.media !== media) return;
+      this.transitioning = true;
       this.updatePosition();
-      const next = Math.max(this.playhead, this.audioEnd);
-      this.stop(true);
-      this.playhead = Math.min(next, this.project.duration);
-      renderPlayhead();
-      updateTransport();
-      if (this.playhead < this.project.duration - 0.01) void this.start();
+      if (this.audioEnd >= this.project.duration - 0.01) {
+        this.stop(false);
+        return;
+      }
+      const prefetch = this.prefetch;
+      this.prefetch = null;
+      try {
+        const chunk =
+          prefetch && Math.abs(prefetch.start - this.audioEnd) < 0.001
+            ? await prefetch.promise
+            : await this.prepareChunk(this.audioEnd);
+        if (generation !== this.playbackGeneration || !this.isPlaying || this.media !== media) {
+          this.releaseMedia(chunk.media);
+          return;
+        }
+        chunk.media.currentTime = 0;
+        await chunk.media.play();
+        if (generation !== this.playbackGeneration || !this.isPlaying || this.media !== media) {
+          this.releaseMedia(chunk.media);
+          return;
+        }
+        this.installChunk(chunk, generation);
+        this.releaseMedia(media);
+        this.transitioning = false;
+        this.updatePosition();
+        updateTransport();
+        renderPlayhead();
+      } catch (error) {
+        if (generation !== this.playbackGeneration) return;
+        this.stop(true);
+        showError(error, "continuing backend audio", "Could not continue audio: ");
+      }
     }
 
     tick() {
@@ -280,9 +389,17 @@
         this.stop(false);
         return;
       }
-      if (this.playhead >= this.audioEnd) {
-        this.advanceChunk();
-        return;
+      if (
+        !this.prefetch &&
+        !this.transitioning &&
+        this.audioEnd - this.playhead <= AUDIO_PREFETCH_LEAD_SECONDS
+      ) {
+        this.beginPrefetch(
+          {
+            end: this.audioEnd,
+          },
+          this.playbackGeneration,
+        );
       }
       updateTransport();
       renderPlayhead();

@@ -3,7 +3,6 @@ use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-#[cfg(test)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,6 +19,7 @@ use crate::storage::ProjectStore;
 const MAX_REQUEST_BYTES: usize = 6 * 1024 * 1024;
 const MAX_ACTIVE_EDIT_JOBS: usize = 4;
 const MAX_RETAINED_EDIT_JOBS: usize = 64;
+const AUDIO_REQUEST_HEADER: &str = "x-daw-ai-audio";
 const GEMINI_POLL_INTERVAL_MS: u64 = 1_000;
 const DEMO_POLL_INTERVAL_MS: u64 = 25;
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -196,40 +196,97 @@ struct EditFailure {
 }
 
 #[derive(Default)]
+struct AudioCacheState {
+    entries: Vec<(String, String)>,
+    rendering: Option<String>,
+}
+
+#[derive(Default)]
 struct AudioCache {
-    entry: Mutex<Option<(String, String)>>,
+    state: Mutex<AudioCacheState>,
+    completed: Condvar,
+}
+
+#[derive(Debug)]
+enum AudioCacheError {
+    Render(String),
 }
 
 impl AudioCache {
-    fn playback_json(&self, project: &crate::model::Project, start: f32) -> Result<String, String> {
+    fn playback_json(
+        &self,
+        project: &crate::model::Project,
+        start: f32,
+    ) -> Result<String, AudioCacheError> {
+        self.playback_json_with(project, start, audio_analysis::render_project_region)
+    }
+
+    fn playback_json_with(
+        &self,
+        project: &crate::model::Project,
+        start: f32,
+        render: impl FnOnce(
+            &crate::model::Project,
+            f32,
+        ) -> Result<(audio_analysis::AudioRegion, f32), String>,
+    ) -> Result<String, AudioCacheError> {
         let graph = project.to_json();
         let cache_key = format!("{start:.3}\n{graph}");
-        if let Some((_, response)) = self
-            .entry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .filter(|(cached_key, _)| cached_key == &cache_key)
-        {
-            return Ok(response.clone());
+        loop {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((_, response)) = state
+                .entries
+                .iter()
+                .find(|(cached_key, _)| cached_key == &cache_key)
+            {
+                return Ok(response.clone());
+            }
+            match state.rendering.as_ref() {
+                Some(_) => {
+                    drop(
+                        self.completed
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    );
+                }
+                None => {
+                    state.rendering = Some(cache_key.clone());
+                    break;
+                }
+            }
         }
-        let (region, end) = audio_analysis::render_project_region(project, start)?;
-        let wav = audio_analysis::wav_bytes(&region.samples);
-        let response = serde_json::json!({
-            "projectVersion": project.version,
-            "sampleRate": audio_analysis::SAMPLE_RATE,
-            "channels": 1,
-            "start": start,
-            "end": end,
-            "wav": base64_audio(&wav),
-        })
-        .to_string();
-        *self
-            .entry
+
+        let rendered = render(project, start).map(|(region, end)| {
+            let wav = audio_analysis::wav_bytes(&region.samples);
+            serde_json::json!({
+                "projectVersion": project.version,
+                "sampleRate": audio_analysis::SAMPLE_RATE,
+                "channels": 1,
+                "start": start,
+                "end": end,
+                "wav": base64_audio(&wav),
+            })
+            .to_string()
+        });
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some((cache_key, response.clone()));
-        Ok(response)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.rendering = None;
+        if let Ok(response) = &rendered {
+            state
+                .entries
+                .retain(|(cached_key, _)| cached_key != &cache_key);
+            state.entries.push((cache_key, response.clone()));
+            if state.entries.len() > 4 {
+                state.entries.remove(0);
+            }
+        }
+        self.completed.notify_all();
+        rendered.map_err(AudioCacheError::Render)
     }
 }
 
@@ -422,12 +479,15 @@ impl Router {
         if request.is_mutation() && !request.is_trusted_mutation(public_host) {
             return Response::json(403, error_json("cross-origin request rejected"));
         }
-        if let Some(start) = playback_audio_start(&request.path) {
-            return if request.method == "GET" {
-                self.playback_audio(start)
-            } else {
-                Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
-            };
+        if let Some(start_milliseconds) = playback_audio_start(&request.path) {
+            if request.method != "GET" {
+                return Response::json(405, error_json("method not allowed"))
+                    .with_header("Allow", "GET");
+            }
+            if !request.is_trusted_audio(public_host) {
+                return Response::json(403, error_json("cross-origin audio request rejected"));
+            }
+            return self.playback_audio(start_milliseconds);
         }
         if request.path.starts_with("/api/audio") {
             return Response::json(404, error_json("audio region not found"));
@@ -560,14 +620,22 @@ impl Router {
         )
     }
 
-    fn playback_audio(&self, start: f32) -> Response {
+    fn playback_audio(&self, start_milliseconds: u64) -> Response {
         let project = self.lock_studio().project().clone();
+        let chunk_milliseconds = (audio_analysis::MAX_REGION_SECONDS * 1_000.0) as u64;
+        if start_milliseconds % chunk_milliseconds != 0 {
+            return Response::json(
+                422,
+                error_json("playback start must align to an audio chunk boundary"),
+            );
+        }
+        let start = start_milliseconds as f32 / 1_000.0;
         if !start.is_finite() || start < 0.0 || start >= project.duration {
             return Response::json(422, error_json("playback start is outside the project"));
         }
         match self.audio_cache.playback_json(&project, start) {
             Ok(body) => Response::json(200, body),
-            Err(error) => {
+            Err(AudioCacheError::Render(error)) => {
                 eprintln!("error: could not render playback audio: {error}");
                 Response::json(500, error_json("could not render playback audio"))
             }
@@ -1138,6 +1206,17 @@ impl Request {
     }
 
     fn is_trusted_mutation(&self, host: &str) -> bool {
+        self.is_trusted_request(host)
+    }
+
+    fn is_trusted_audio(&self, host: &str) -> bool {
+        self.headers
+            .get(AUDIO_REQUEST_HEADER)
+            .is_some_and(|value| value == "1")
+            && self.is_trusted_request(host)
+    }
+
+    fn is_trusted_request(&self, host: &str) -> bool {
         if self
             .headers
             .get("sec-fetch-site")
@@ -1349,12 +1428,11 @@ fn edit_job_id(path: &str) -> Option<u64> {
         .flatten()
 }
 
-fn playback_audio_start(path: &str) -> Option<f32> {
+fn playback_audio_start(path: &str) -> Option<u64> {
     if path == "/api/audio" {
-        return Some(0.0);
+        return Some(0);
     }
-    let milliseconds = path.strip_prefix("/api/audio/")?.parse::<u64>().ok()?;
-    Some(milliseconds as f32 / 1_000.0)
+    path.strip_prefix("/api/audio/")?.parse::<u64>().ok()
 }
 
 fn edit_operation_id(path: &str) -> Option<&str> {
@@ -1537,6 +1615,7 @@ const fn studio_error_message(error: StudioError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Project;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_FILE_ID: AtomicU64 = AtomicU64::new(1);
@@ -1548,6 +1627,14 @@ mod tests {
             headers: HashMap::from([("host".to_owned(), "127.0.0.1:8888".to_owned())]),
             body: body.to_owned(),
         }
+    }
+
+    fn audio_request(path: &str) -> Request {
+        let mut request = request("GET", path, "");
+        request
+            .headers
+            .insert(AUDIO_REQUEST_HEADER.to_owned(), "1".to_owned());
+        request
     }
 
     fn wait_for_edit(router: &Router, accepted: &Response) -> serde_json::Value {
@@ -2387,7 +2474,7 @@ mod tests {
     #[test]
     fn serves_audio_rendered_by_the_backend_engine() {
         let router = Router::demo();
-        let response = router.handle(&request("GET", "/api/audio", ""));
+        let response = router.handle(&audio_request("/api/audio"));
         assert_eq!(response.status, 200);
         let audio: serde_json::Value =
             serde_json::from_str(&response.body).expect("playback audio JSON");
@@ -2403,11 +2490,111 @@ mod tests {
             router.handle(&request("POST", "/api/audio", "")).status,
             405
         );
-        let later = router.handle(&request("GET", "/api/audio/16000", ""));
+        let later = router.handle(&audio_request("/api/audio/16000"));
         assert_eq!(later.status, 200);
         let later: serde_json::Value =
             serde_json::from_str(&later.body).expect("later playback audio JSON");
         assert_eq!(later["start"], 16.0);
+        assert_eq!(
+            router.handle(&audio_request("/api/audio/15500")).status,
+            422
+        );
+    }
+
+    #[test]
+    fn rejects_untrusted_audio_requests() {
+        let router = Router::demo();
+        assert_eq!(router.handle(&request("GET", "/api/audio", "")).status, 403);
+
+        let mut hostile = audio_request("/api/audio");
+        hostile
+            .headers
+            .insert("origin".to_owned(), "http://127.0.0.1:18867".to_owned());
+        hostile
+            .headers
+            .insert("sec-fetch-site".to_owned(), "cross-site".to_owned());
+        assert_eq!(router.handle(&hostile).status, 403);
+    }
+
+    #[test]
+    fn coalesces_matching_audio_renders_and_serializes_competing_work() {
+        let cache = Arc::new(AudioCache::default());
+        let project = Project::demo();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let started = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let first_cache = Arc::clone(&cache);
+        let first_project = project.clone();
+        let first_gate = Arc::clone(&gate);
+        let first_started = Arc::clone(&started);
+        let first = thread::spawn(move || {
+            first_cache.playback_json_with(&first_project, 0.0, |project, _| {
+                let (lock, ready) = &*first_started;
+                *lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                ready.notify_all();
+
+                let (lock, released) = &*first_gate;
+                drop(
+                    released
+                        .wait_while(
+                            lock.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            |released| !*released,
+                        )
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                audio_analysis::render_region(project, &[1], 0.0, 0.01).map(|region| (region, 0.01))
+            })
+        });
+
+        let (lock, ready) = &*started;
+        drop(
+            ready
+                .wait_while(
+                    lock.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    |started| !*started,
+                )
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+
+        let second_cache = Arc::clone(&cache);
+        let second_project = project.clone();
+        let second = thread::spawn(move || {
+            second_cache.playback_json_with(&second_project, 0.0, |_, _| {
+                panic!("coalesced render ran twice")
+            })
+        });
+        let competing_cache = Arc::clone(&cache);
+        let competing_project = project.clone();
+        let competing = thread::spawn(move || {
+            competing_cache.playback_json_with(&competing_project, 16.0, |project, _| {
+                audio_analysis::render_region(project, &[1], 0.0, 0.01)
+                    .map(|region| (region, 16.01))
+            })
+        });
+
+        let (lock, released) = &*gate;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        released.notify_all();
+        let first = first
+            .join()
+            .expect("first render thread")
+            .expect("first render");
+        let second = second
+            .join()
+            .expect("coalesced render thread")
+            .expect("coalesced render");
+        let competing = competing
+            .join()
+            .expect("competing render thread")
+            .expect("competing render");
+        assert_eq!(first, second);
+        assert_ne!(first, competing);
     }
     #[test]
     fn rejects_content_lengths_that_overflow_the_request_bound() {
