@@ -8,7 +8,8 @@ use crate::prompt::{Action, AutomationPoint};
 
 pub(crate) const SAMPLE_RATE: u32 = 16_000;
 pub(crate) const MAX_REGION_SECONDS: f32 = 16.0;
-const PLAYBACK_PREROLL_SECONDS: f32 = MAX_REGION_SECONDS;
+pub(crate) const PLAYBACK_REGION_STRIDE_SECONDS: f32 = MAX_REGION_SECONDS / 2.0;
+const DSP_SETTLING_SECONDS: f32 = MAX_REGION_SECONDS;
 const FFT_SIZE: usize = 512;
 const FFT_HOP: usize = 256;
 const MEL_BANDS: usize = 64;
@@ -193,7 +194,7 @@ pub(crate) fn render_project_region(
         .iter()
         .map(|track| track.id)
         .collect::<Vec<_>>();
-    let preroll_start = (start - PLAYBACK_PREROLL_SECONDS).max(0.0);
+    let preroll_start = (start - playback_preroll_seconds(project)).max(0.0);
     let region = render_audio(project, &track_ids, preroll_start, end)?;
     let sample_start = ((start - preroll_start) * SAMPLE_RATE as f32).round() as usize;
     let sample_end = sample_start + ((end - start) * SAMPLE_RATE as f32).ceil() as usize;
@@ -586,12 +587,7 @@ impl<'a> TrackRenderState<'a> {
     fn new(project: &'a Project, track: &'a Track, start: f32, end: f32) -> Self {
         let automation = AutomationIndex::new(project, track);
         let beat_duration = 60.0 / project.bpm as f32;
-        let maximum_voice = track
-            .clips
-            .iter()
-            .flat_map(|clip| &clip.events)
-            .map(|event| event.duration * beat_duration + maximum_release(track, &automation))
-            .fold(0.0_f32, f32::max);
+        let maximum_voice = maximum_voice_lifetime(project, track, &automation);
         let render_lookback = (start - maximum_voice).max(0.0);
         let mut occurrences = Vec::new();
         for clip in &track.clips {
@@ -848,14 +844,40 @@ fn maximum_release(track: &Track, automation: &AutomationIndex<'_>) -> f32 {
     }
 }
 
+fn maximum_voice_lifetime(
+    project: &Project,
+    track: &Track,
+    automation: &AutomationIndex<'_>,
+) -> f32 {
+    let beat_duration = 60.0 / project.bpm as f32;
+    let release = maximum_release(track, automation);
+    track
+        .clips
+        .iter()
+        .flat_map(|clip| &clip.events)
+        .map(|event| event.duration * beat_duration + release)
+        .fold(0.0_f32, f32::max)
+}
+
+fn playback_preroll_seconds(project: &Project) -> f32 {
+    let maximum_voice = project
+        .tracks
+        .iter()
+        .map(|track| {
+            let automation = AutomationIndex::new(project, track);
+            maximum_voice_lifetime(project, track, &automation)
+        })
+        .fold(0.0_f32, f32::max);
+    maximum_voice + DSP_SETTLING_SECONDS
+}
+
 fn voice_envelope(elapsed: f32, attack: f32, body: f32, release: f32) -> f32 {
-    if elapsed < attack.max(0.001) {
-        (elapsed / attack.max(0.001)).clamp(0.0, 1.0)
-    } else if elapsed < body {
-        1.0
-    } else {
-        (1.0 - (elapsed - body) / release.max(0.001)).clamp(0.0, 1.0)
+    let attack = attack.max(0.001);
+    if elapsed < body {
+        return (elapsed / attack).clamp(0.0, 1.0);
     }
+    let note_off_level = (body / attack).clamp(0.0, 1.0);
+    note_off_level * (1.0 - (elapsed - body) / release.max(0.001)).clamp(0.0, 1.0)
 }
 
 fn waveform(kind: &str, phase: f32) -> f32 {
@@ -1797,6 +1819,21 @@ mod tests {
     }
 
     #[test]
+    fn short_notes_release_from_the_partial_attack_level() {
+        let body = 0.0625 * 60.0 / 112.0;
+        let attack = 2.0;
+        let release = 0.2;
+        let note_off = voice_envelope(body, attack, body, release);
+        let first_release_sample =
+            voice_envelope(body + 1.0 / SAMPLE_RATE as f32, attack, body, release);
+        let half_release = voice_envelope(body + release / 2.0, attack, body, release);
+
+        assert!((note_off - body / attack).abs() < 0.000_001);
+        assert!(first_release_sample < note_off);
+        assert!((half_release - note_off / 2.0).abs() < 0.000_001);
+    }
+
+    #[test]
     fn overlapping_playback_regions_have_identical_pcm() {
         let project = Project::demo();
         let (earlier, _) = render_project_region(&project, 15.5).expect("earlier playback region");
@@ -1806,6 +1843,51 @@ mod tests {
             &earlier.samples[overlap_offset..],
             &later.samples[..earlier.samples.len() - overlap_offset]
         );
+    }
+
+    #[test]
+    fn late_playback_chunk_reconstructs_long_modulated_voices() {
+        let mut project = Project::demo();
+        project.bpm = 60;
+        project.duration = 48.0;
+        let project_duration = project.duration;
+        project.edits.clear();
+        project.tracks.retain(|track| track.role == TrackRole::Bass);
+        let track = &mut project.tracks[0];
+        let track_id = track.id;
+        track.effects.clear();
+        track.routing.effect_order.clear();
+        track.instrument.attack = 0.01;
+        track.instrument.release = 5.0;
+        track.modulators[0].target = "instrument.pitch".to_owned();
+        track.modulators[0].rate = 0.37;
+        track.modulators[0].depth = 1.0;
+        track.modulators[0].trigger = "free".to_owned();
+        track.clips = vec![Clip {
+            id: 9_100,
+            label: "Long modulated note".to_owned(),
+            start: 0.0,
+            end: project_duration,
+            source_start: 0.0,
+            style: "test".to_owned(),
+            loop_beats: 16.0,
+            events: vec![ClipEvent {
+                id: 9_101,
+                kind: "note".to_owned(),
+                time: 12.0,
+                duration: 16.0,
+                pitch: 36,
+                velocity: 1.0,
+            }],
+        }];
+
+        let continuous = render_audio(&project, &[track_id], 0.0, project.duration)
+            .expect("continuous playback render");
+        let (late, end) = render_project_region(&project, 32.0).expect("late playback chunk");
+        let offset = 32 * SAMPLE_RATE as usize;
+
+        assert_eq!(end, project.duration);
+        assert_eq!(&continuous.samples[offset..], late.samples);
     }
 
     #[test]
