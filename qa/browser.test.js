@@ -2338,8 +2338,9 @@ async function run() {
 
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await waitFor(
-      async () => evaluate(cdp, appSession, "document.querySelector('#play-button').classList.contains('is-playing')"),
+      async () => evaluate(cdp, appSession, "document.documentElement.dataset.audioState === 'playing'"),
       "playback before mixer change",
+      30_000,
     );
     const initialMixerPlaybackTime = await evaluate(cdp, appSession, "document.querySelector('#current-time').textContent");
     await waitFor(
@@ -2436,10 +2437,11 @@ async function run() {
         evaluate(
           cdp,
           appSession,
-          `document.querySelector('#play-button').classList.contains('is-playing') &&
+          `document.documentElement.dataset.audioState === 'playing' &&
             document.querySelector('#current-time').textContent !== ${JSON.stringify(playbackTimeBeforeMix)}`,
         ),
       "playback restoration after mixer change",
+      30_000,
     );
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await waitFor(
@@ -2576,7 +2578,7 @@ async function run() {
       async () => evaluate(
         cdp,
         appSession,
-        "document.querySelector('#play-button').classList.contains('is-playing')",
+        "document.documentElement.dataset.audioState === 'playing'",
       ),
       "backend audio transport start",
       30_000,

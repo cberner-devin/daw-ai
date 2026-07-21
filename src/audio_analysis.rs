@@ -197,8 +197,17 @@ pub(crate) fn render_project_region(
     let preroll_start = (start - playback_preroll_seconds(project)).max(0.0);
     let region = render_audio(project, &track_ids, preroll_start, end)?;
     let sample_start = ((start - preroll_start) * SAMPLE_RATE as f32).round() as usize;
-    let sample_end = sample_start + ((end - start) * SAMPLE_RATE as f32).ceil() as usize;
-    Ok((region.slice(sample_start, sample_end, start, end), end))
+    let sample_count = playback_sample_count(start, end);
+    let mut region = region.slice(sample_start, sample_start + sample_count, start, end);
+    region.samples.resize(sample_count, 0.0);
+    Ok((region, end))
+}
+
+pub(crate) fn playback_sample_count(start: f32, end: f32) -> usize {
+    let sample_rate = f64::from(SAMPLE_RATE);
+    let start_sample = (f64::from(start) * sample_rate).round() as usize;
+    let end_sample = (f64::from(end) * sample_rate).ceil() as usize;
+    end_sample.saturating_sub(start_sample)
 }
 
 fn render_audio(
