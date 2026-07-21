@@ -81,7 +81,10 @@ fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
     let response = match Request::read(stream) {
         Ok(request) => {
             if request.path.starts_with("/api/audio-stream/") {
-                return router.write_playback_stream(&request, stream);
+                let cancellation_stream = stream.try_clone()?;
+                return router.write_playback_stream_with_cancel(&request, stream, || {
+                    stream_disconnected(&cancellation_stream)
+                });
             }
             let response = router.handle(&request);
             log_http_response(&request, &response);
@@ -93,6 +96,30 @@ fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
         }
     };
     response.write(stream)
+}
+
+fn stream_disconnected(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut byte = [0_u8; 1];
+    let result = stream.peek(&mut byte);
+    if stream.set_nonblocking(false).is_err() {
+        return true;
+    }
+    match result {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) =>
+        {
+            false
+        }
+        Err(_) => true,
+    }
 }
 
 #[derive(Clone)]
@@ -215,6 +242,7 @@ struct AudioCache {
 #[derive(Debug)]
 enum AudioCacheError {
     Render(String),
+    Cancelled,
 }
 
 impl AudioCache {
@@ -297,10 +325,32 @@ impl AudioCache {
     fn stream_region(
         &self,
         project: &crate::model::Project,
-        start: f32,
-    ) -> Result<(audio_analysis::AudioRegion, f32), AudioCacheError> {
-        let render_key = format!("stream:{start:.3}\n{}", project.to_json());
+        start_sample: usize,
+        is_cancelled: &impl Fn() -> bool,
+    ) -> Result<(audio_analysis::AudioRegion, usize), AudioCacheError> {
+        self.stream_region_with(
+            project,
+            start_sample,
+            is_cancelled,
+            audio_analysis::render_project_samples,
+        )
+    }
+
+    fn stream_region_with(
+        &self,
+        project: &crate::model::Project,
+        start_sample: usize,
+        is_cancelled: &impl Fn() -> bool,
+        render: impl FnOnce(
+            &crate::model::Project,
+            usize,
+        ) -> Result<(audio_analysis::AudioRegion, usize), String>,
+    ) -> Result<(audio_analysis::AudioRegion, usize), AudioCacheError> {
+        let render_key = format!("stream:{start_sample}\n{}", project.to_json());
         loop {
+            if is_cancelled() {
+                return Err(AudioCacheError::Cancelled);
+            }
             let mut state = self
                 .state
                 .lock()
@@ -317,7 +367,16 @@ impl AudioCache {
             }
         }
 
-        let rendered = audio_analysis::render_project_region(project, start);
+        if is_cancelled() {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.rendering = None;
+            self.completed.notify_all();
+            return Err(AudioCacheError::Cancelled);
+        }
+        let rendered = render(project, start_sample);
         let mut state = self
             .state
             .lock()
@@ -692,10 +751,21 @@ impl Router {
                 eprintln!("error: could not render playback audio: {error}");
                 Response::json(500, error_json("could not render playback audio"))
             }
+            Err(AudioCacheError::Cancelled) => unreachable!("cached renders cannot be cancelled"),
         }
     }
 
+    #[cfg(test)]
     fn write_playback_stream(&self, request: &Request, output: &mut impl Write) -> io::Result<()> {
+        self.write_playback_stream_with_cancel(request, output, || false)
+    }
+
+    fn write_playback_stream_with_cancel(
+        &self,
+        request: &Request,
+        output: &mut impl Write,
+        is_cancelled: impl Fn() -> bool,
+    ) -> io::Result<()> {
         let Some(public_host) = request.public_host() else {
             return Response::json(400, error_json("invalid host")).write(output);
         };
@@ -723,6 +793,9 @@ impl Router {
             return Response::json(422, error_json("playback start is outside the project"))
                 .write(output);
         }
+        if is_cancelled() {
+            return Ok(());
+        }
 
         let sample_count = audio_analysis::playback_sample_count(start, project.duration);
         write_response_head(
@@ -735,16 +808,24 @@ impl Router {
         output.write_all(&audio_analysis::wav_header(sample_count))?;
 
         let mut remaining = sample_count;
-        let mut cursor = start;
+        let mut cursor = audio_analysis::playback_start_sample(start);
         while remaining > 0 {
-            let (region, end) = match self.audio_cache.stream_region(&project, cursor) {
-                Ok(rendered) => rendered,
-                Err(AudioCacheError::Render(error)) => {
-                    eprintln!("error: could not render playback stream: {error}");
-                    return Err(io::Error::other("could not render playback stream"));
-                }
-            };
+            let (region, end) =
+                match self
+                    .audio_cache
+                    .stream_region(&project, cursor, &is_cancelled)
+                {
+                    Ok(rendered) => rendered,
+                    Err(AudioCacheError::Render(error)) => {
+                        eprintln!("error: could not render playback stream: {error}");
+                        return Err(io::Error::other("could not render playback stream"));
+                    }
+                    Err(AudioCacheError::Cancelled) => return Ok(()),
+                };
             let count = region.samples.len().min(remaining);
+            if is_cancelled() {
+                return Ok(());
+            }
             output.write_all(&audio_analysis::pcm_bytes(&region.samples[..count]))?;
             remaining -= count;
             cursor = end;
@@ -2798,6 +2879,48 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(first, competing);
     }
+
+    #[test]
+    fn cancelled_stream_leaves_the_render_queue_without_rendering() {
+        let cache = Arc::new(AudioCache::default());
+        let project = Project::demo();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let checked = Arc::new(std::sync::Barrier::new(2));
+        let mut state = cache
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.rendering = Some("active render".to_owned());
+
+        let second_cache = Arc::clone(&cache);
+        let second_cancelled = Arc::clone(&cancelled);
+        let second_checked = Arc::clone(&checked);
+        let second = thread::spawn(move || {
+            let first_check = AtomicBool::new(true);
+            second_cache.stream_region_with(
+                &project,
+                1,
+                &|| {
+                    if first_check.swap(false, Ordering::SeqCst) {
+                        second_checked.wait();
+                    }
+                    second_cancelled.load(Ordering::SeqCst)
+                },
+                |_, _| panic!("a cancelled queued stream must not render"),
+            )
+        });
+
+        checked.wait();
+        cancelled.store(true, Ordering::SeqCst);
+        state.rendering = None;
+        drop(state);
+        cache.completed.notify_all();
+        assert!(matches!(
+            second.join().expect("cancelled stream thread"),
+            Err(AudioCacheError::Cancelled)
+        ));
+    }
+
     #[test]
     fn rejects_content_lengths_that_overflow_the_request_bound() {
         let raw = format!(

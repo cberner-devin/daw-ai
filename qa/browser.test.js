@@ -338,6 +338,40 @@ async function run() {
     });
     cdp = await CdpClient.connect(browserWebSocket);
     const appUrl = `http://127.0.0.1:${appPort}`;
+    const startupPage = await openPageWithScript(cdp, appUrl, `(() => {
+      const originalFetch = window.fetch;
+      window.__initialProjectPending = false;
+      window.fetch = function fetch(resource, options) {
+        if (resource !== '/api/project') return originalFetch(resource, options);
+        window.__initialProjectPending = true;
+        return new Promise((resolve, reject) => {
+          window.__releaseInitialProject = () => originalFetch(resource, options).then(resolve, reject);
+        });
+      };
+    })()`);
+    await waitFor(
+      async () => evaluate(cdp, startupPage.sessionId, "window.__initialProjectPending"),
+      "delayed initial project request",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, startupPage.sessionId, `(() => {
+        const play = document.querySelector('#play-button');
+        play.click();
+        return { disabled: play.disabled, playing: play.classList.contains('is-playing') };
+      })()`),
+      { disabled: true, playing: false },
+      "Play must remain disabled until audio access and the project are both ready",
+    );
+    await evaluate(cdp, startupPage.sessionId, "window.__releaseInitialProject() ");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        startupPage.sessionId,
+        "!document.querySelector('#play-button').disabled && document.querySelectorAll('.track-row').length === 3",
+      ),
+      "playback readiness after initial project load",
+    );
+    await cdp.send("Target.closeTarget", { targetId: startupPage.targetId });
     const appSession = await openPage(cdp, appUrl);
     const consoleErrors = [];
     cdp.on("Runtime.consoleAPICalled", (message) => {
@@ -2639,6 +2673,35 @@ async function run() {
         `document.querySelector('#current-time').textContent !== ${JSON.stringify(backendPlaybackTime)}`,
       ),
       "backend audio transport movement",
+    );
+    await evaluate(cdp, appSession, `(async () => {
+      const lane = document.querySelector('.track-lane');
+      window.__rapidSeekPlayBaseline = window.__transportPlayCalls.length;
+      for (let index = 0; index < 12; index += 1) {
+        lane.dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'ArrowRight', bubbles: true, cancelable: true,
+        }));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.documentElement.dataset.audioState === 'playing' &&
+          window.__transportPlayCalls.length === window.__rapidSeekPlayBaseline + 1`,
+      ),
+      "coalesced active keyboard seeks",
+      30_000,
+    );
+    assert.equal(
+      await evaluate(
+        cdp,
+        appSession,
+        "window.__transportPlayCalls.length - window.__rapidSeekPlayBaseline",
+      ),
+      1,
+      "rapid active seeks must start only the final requested stream",
     );
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await waitFor(
