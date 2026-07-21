@@ -31,17 +31,22 @@ the user and coding assistant have access to the machine DAW AI is deployed on, 
 
 The following sound tools should be implemented and available in the advanced view of the UI and also to the AI model.
 
+These are all implemented in the DAW AI backend. The client-side JS contains a basic editor to modify the sound graph and view it,
+but all execution of it is in the backend server process.
+
 #### MIDI Clip
 Contains notes, including their timing, duration, pitch, and velocity.
 
 #### Instrument:
-Produces sound from musical events. Instruments may be synthesizers or sample-based instruments and expose configurable parameters.
+Produces sound from MIDI events. Instruments may be synthesizers or sample-based instruments and expose configurable parameters.
 At a minimum, this should include at least two oscillators, independently configurable waveform, tuning, and level all with configurable parameters.
+
+For the current MVP, this should be a basic implementation, but in the future plugin support for VST plugins like Vital or Serum will be added.
 
 #### Effect
 Processes sound produced by an instrument, such as a filter, distortion, compressor, delay, or reverb, and exposes configurable parameters. May be chained with previous Effect.
 
-#### Modulator
+#### Modulator / Automation
 Generates time-varying control values—such as envelopes, LFOs, or arbitrary curves—which can control any Instrument or Effect parameter.
 My also be tempo sync'ed, or configured to trigger off a MIDI note event
 
@@ -77,7 +82,9 @@ it to the backend server to be included in the logs.
 ### Vetoed Implementations
 
 The implementation MUST NOT hardcode niche sound tools such as a dubstep "drop" tool. All the tools should
-be simple primitives that the AI (or user) uses to build the sound
+be simple primitives that the AI (or user) uses to build the sound.
+
+The implementation MUST NOT use Web Audio. It must be a custom backend that runs in the server process.
 
 ### Implementation
 
