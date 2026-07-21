@@ -194,7 +194,7 @@ pub(crate) fn render_project_region(
         .iter()
         .map(|track| track.id)
         .collect::<Vec<_>>();
-    let preroll_start = (start - playback_preroll_seconds(project)).max(0.0);
+    let preroll_start = playback_preroll_start(project, start);
     let region = render_audio(project, &track_ids, preroll_start, end)?;
     let sample_start = ((start - preroll_start) * SAMPLE_RATE as f32).round() as usize;
     let sample_count = playback_sample_count(start, end);
@@ -377,7 +377,7 @@ fn render_event(
         TrackRole::Texture => 0.07,
     };
     let level = velocity.clamp(0.01, 1.0) * role_level;
-    let first_project_time = region_start + first as f32 / SAMPLE_RATE as f32;
+    let first_project_time = project_sample_time(region_start, first);
     let elapsed_at_start = (first_project_time - onset).max(0.0);
     let mut phases = track
         .instrument
@@ -388,7 +388,7 @@ fn render_event(
         })
         .collect::<Vec<_>>();
     for (index, sample) in output.iter_mut().enumerate().take(last).skip(first) {
-        let project_time = region_start + index as f32 / SAMPLE_RATE as f32;
+        let project_time = project_sample_time(region_start, index);
         let elapsed = project_time - onset;
         if elapsed < 0.0 {
             continue;
@@ -891,6 +891,12 @@ fn playback_preroll_seconds(project: &Project) -> f32 {
     maximum_voice + DSP_SETTLING_SECONDS
 }
 
+fn playback_preroll_start(project: &Project, start: f32) -> f32 {
+    let unaligned = (start - playback_preroll_seconds(project)).max(0.0);
+    // Whole seconds keep the audio and control-rate grids absolute even at the 24-hour limit.
+    unaligned.floor()
+}
+
 fn voice_envelope(elapsed: f32, attack: f32, body: f32, release: f32) -> f32 {
     let attack = attack.max(0.001);
     if elapsed < body {
@@ -913,7 +919,11 @@ fn waveform(kind: &str, phase: f32) -> f32 {
 }
 
 fn project_sample_index(region_start: f32, index: usize) -> u64 {
-    (region_start * SAMPLE_RATE as f32).round() as u64 + index as u64
+    (f64::from(region_start) * f64::from(SAMPLE_RATE)).round() as u64 + index as u64
+}
+
+fn project_sample_time(region_start: f32, index: usize) -> f32 {
+    project_sample_index(region_start, index) as f32 / SAMPLE_RATE as f32
 }
 
 fn deterministic_noise(event_id: u64, sample: u64) -> f32 {
@@ -1090,7 +1100,7 @@ fn process_track_audio(
     let frame_count = samples.len().div_ceil(AUTOMATION_SAMPLES);
     let frames = (0..frame_count)
         .map(|index| {
-            let time = start + (index * AUTOMATION_SAMPLES) as f32 / SAMPLE_RATE as f32;
+            let time = project_sample_time(start, index * AUTOMATION_SAMPLES);
             automation_at(project, track, render_state, time)
         })
         .collect::<Vec<_>>();
@@ -1862,6 +1872,31 @@ mod tests {
         assert_eq!(
             &earlier.samples[overlap_offset..],
             &later.samples[..earlier.samples.len() - overlap_offset]
+        );
+    }
+
+    #[test]
+    fn playback_overlaps_remain_stable_when_preroll_moves() {
+        let project = Project::demo();
+        assert_ne!(
+            playback_preroll_start(&project, 16.0),
+            playback_preroll_start(&project, 24.0)
+        );
+        let (earlier, _) = render_project_region(&project, 16.0).expect("earlier playback region");
+        let (later, _) = render_project_region(&project, 24.0).expect("later playback region");
+        let overlap_offset = 8 * SAMPLE_RATE as usize;
+        let earlier = pcm_bytes(&earlier.samples[overlap_offset..]);
+        let later = pcm_bytes(&later.samples);
+        let differing = earlier
+            .chunks_exact(2)
+            .zip(later.chunks_exact(2))
+            .filter(|(left, right)| left != right)
+            .count();
+
+        assert_eq!(earlier.len(), later.len());
+        assert_eq!(
+            differing, 0,
+            "overlap contained {differing} differing samples"
         );
     }
 

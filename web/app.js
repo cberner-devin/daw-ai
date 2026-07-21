@@ -185,7 +185,7 @@
     }
 
     stop(preservePosition) {
-      if (preservePosition) this.updatePosition();
+      if (preservePosition && this.isActive) this.updatePosition();
       this.playbackGeneration += 1;
       this.playbackState = "idle";
       window.clearInterval(this.timer);

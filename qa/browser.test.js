@@ -2448,6 +2448,50 @@ async function run() {
       async () => evaluate(cdp, appSession, "!document.querySelector('#play-button').classList.contains('is-playing')"),
       "playback pause after mixer regression",
     );
+    const pausedMutation = await evaluate(cdp, appSession, `(async () => {
+      const lane = document.querySelector('.track-lane');
+      lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true, cancelable: true }));
+      for (let index = 0; index < 40; index += 1) {
+        lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
+      }
+      const project = await fetch('/api/project').then((response) => response.json());
+      const bass = project.tracks.find((track) => track.role === 'bass');
+      const input = document.querySelector('[data-volume-track="' + bass.id + '"]');
+      const originalVolume = input.value;
+      input.value = String(Math.max(0, Number(input.value) - 0.01));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return { version: project.version, bassId: bass.id, originalVolume };
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `fetch('/api/project').then((project) => project.json()).then((project) => project.version > ${pausedMutation.version})`,
+      ),
+      "paused mixer mutation",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `({
+        state: document.documentElement.dataset.audioState,
+        time: document.querySelector('#current-time').textContent,
+      })`),
+      { state: "idle", time: "0:10.0" },
+      "a paused mixer mutation must preserve the saved playhead",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.querySelector('[data-volume-track="${pausedMutation.bassId}"]').value === ${JSON.stringify(pausedMutation.originalVolume)}`,
+      ),
+      "undo paused mixer mutation",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('#current-time').textContent"),
+      "0:10.0",
+      "undo while paused must preserve the saved playhead",
+    );
     await evaluate(cdp, appSession, `(() => {
       const lane = document.querySelector('.track-lane');
       lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true, cancelable: true }));
