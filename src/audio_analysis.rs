@@ -8,7 +8,6 @@ use crate::prompt::{Action, AutomationPoint};
 
 pub(crate) const SAMPLE_RATE: u32 = 16_000;
 pub(crate) const MAX_REGION_SECONDS: f32 = 16.0;
-pub(crate) const PLAYBACK_REGION_STRIDE_SECONDS: f32 = MAX_REGION_SECONDS / 2.0;
 const DSP_SETTLING_SECONDS: f32 = MAX_REGION_SECONDS;
 const FFT_SIZE: usize = 512;
 const FFT_HOP: usize = 256;

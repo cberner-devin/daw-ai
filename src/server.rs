@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::audio_analysis;
 use crate::gemini::{EDIT_TIMEOUT_SECONDS, GeminiEdit, GeminiPlanner, PlannerError};
-use crate::gemini_tools::{base64_audio, render_audio_request};
+use crate::gemini_tools::render_audio_request;
 use crate::model::{ChannelOperationAction, Studio, StudioError, json_string};
 use crate::prompt::{EditPlan, PromptEngine};
 use crate::storage::ProjectStore;
@@ -207,7 +207,7 @@ struct Router {
     store: Option<ProjectStore>,
     planner: Planner,
     edit_jobs: Arc<EditJobs>,
-    audio_cache: Arc<AudioCache>,
+    audio_renderer: Arc<AudioRenderer>,
     audio_token: Arc<String>,
 }
 
@@ -307,106 +307,29 @@ struct EditFailure {
 }
 
 #[derive(Default)]
-struct AudioCacheState {
-    entries: Vec<(String, String)>,
-    rendering: Option<String>,
+struct AudioRenderState {
+    rendering: bool,
 }
 
 #[derive(Default)]
-struct AudioCache {
-    state: Mutex<AudioCacheState>,
+struct AudioRenderer {
+    state: Mutex<AudioRenderState>,
     completed: Condvar,
 }
 
 #[derive(Debug)]
-enum AudioCacheError {
+enum AudioRenderError {
     Render(String),
     Cancelled,
 }
 
-impl AudioCache {
-    fn playback_json(
-        &self,
-        project: &crate::model::Project,
-        start: f32,
-    ) -> Result<String, AudioCacheError> {
-        self.playback_json_with(project, start, audio_analysis::render_project_region)
-    }
-
-    fn playback_json_with(
-        &self,
-        project: &crate::model::Project,
-        start: f32,
-        render: impl FnOnce(
-            &crate::model::Project,
-            f32,
-        ) -> Result<(audio_analysis::AudioRegion, f32), String>,
-    ) -> Result<String, AudioCacheError> {
-        let graph = project.to_json();
-        let cache_key = format!("{start:.3}\n{graph}");
-        loop {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((_, response)) = state
-                .entries
-                .iter()
-                .find(|(cached_key, _)| cached_key == &cache_key)
-            {
-                return Ok(response.clone());
-            }
-            match state.rendering.as_ref() {
-                Some(_) => {
-                    drop(
-                        self.completed
-                            .wait(state)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    );
-                }
-                None => {
-                    state.rendering = Some(cache_key.clone());
-                    break;
-                }
-            }
-        }
-
-        let rendered = render(project, start).map(|(region, end)| {
-            let wav = audio_analysis::wav_bytes(&region.samples);
-            serde_json::json!({
-                "projectVersion": project.version,
-                "sampleRate": audio_analysis::SAMPLE_RATE,
-                "channels": 1,
-                "start": start,
-                "end": end,
-                "wav": base64_audio(&wav),
-            })
-            .to_string()
-        });
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.rendering = None;
-        if let Ok(response) = &rendered {
-            state
-                .entries
-                .retain(|(cached_key, _)| cached_key != &cache_key);
-            state.entries.push((cache_key, response.clone()));
-            if state.entries.len() > 4 {
-                state.entries.remove(0);
-            }
-        }
-        self.completed.notify_all();
-        rendered.map_err(AudioCacheError::Render)
-    }
-
+impl AudioRenderer {
     fn stream_region(
         &self,
         project: &crate::model::Project,
         start_sample: usize,
         is_cancelled: &impl Fn() -> bool,
-    ) -> Result<(audio_analysis::AudioRegion, usize), AudioCacheError> {
+    ) -> Result<(audio_analysis::AudioRegion, usize), AudioRenderError> {
         let project_end_sample = audio_analysis::playback_sample_count(0.0, project.duration);
         let end_sample = start_sample
             .saturating_add(AUDIO_RANGE_SAMPLES)
@@ -427,7 +350,7 @@ impl AudioCache {
         start_sample: usize,
         end_sample: usize,
         is_cancelled: &impl Fn() -> bool,
-    ) -> Result<audio_analysis::AudioRegion, AudioCacheError> {
+    ) -> Result<audio_analysis::AudioRegion, AudioRenderError> {
         self.stream_region_with(
             project,
             start_sample,
@@ -448,24 +371,23 @@ impl AudioCache {
             usize,
             usize,
         ) -> Result<audio_analysis::AudioRegion, String>,
-    ) -> Result<audio_analysis::AudioRegion, AudioCacheError> {
-        let render_key = format!("stream:{start_sample}:{end_sample}\n{}", project.to_json());
+    ) -> Result<audio_analysis::AudioRegion, AudioRenderError> {
         loop {
             if is_cancelled() {
-                return Err(AudioCacheError::Cancelled);
+                return Err(AudioRenderError::Cancelled);
             }
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.rendering.is_some() {
+            if state.rendering {
                 drop(
                     self.completed
                         .wait(state)
                         .unwrap_or_else(std::sync::PoisonError::into_inner),
                 );
             } else {
-                state.rendering = Some(render_key.clone());
+                state.rendering = true;
                 break;
             }
         }
@@ -475,18 +397,18 @@ impl AudioCache {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.rendering = None;
+            state.rendering = false;
             self.completed.notify_all();
-            return Err(AudioCacheError::Cancelled);
+            return Err(AudioRenderError::Cancelled);
         }
         let rendered = render(project, start_sample, end_sample);
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.rendering = None;
+        state.rendering = false;
         self.completed.notify_all();
-        rendered.map_err(AudioCacheError::Render)
+        rendered.map_err(AudioRenderError::Render)
     }
 }
 
@@ -657,7 +579,7 @@ impl Router {
             store: Some(store),
             planner,
             edit_jobs: Arc::new(EditJobs::new()),
-            audio_cache: Arc::new(AudioCache::default()),
+            audio_renderer: Arc::new(AudioRenderer::default()),
             audio_token: Arc::new(new_operation_id(0)),
         })
     }
@@ -669,7 +591,7 @@ impl Router {
             store: None,
             planner: Planner::Demo,
             edit_jobs: Arc::new(EditJobs::new()),
-            audio_cache: Arc::new(AudioCache::default()),
+            audio_renderer: Arc::new(AudioRenderer::default()),
             audio_token: Arc::new("test-audio-token".to_owned()),
         }
     }
@@ -694,18 +616,8 @@ impl Router {
                 format!("{{\"streamToken\":{}}}", json_string(&self.audio_token)),
             );
         }
-        if let Some(start_milliseconds) = playback_audio_start(&request.path) {
-            if request.method != "GET" {
-                return Response::json(405, error_json("method not allowed"))
-                    .with_header("Allow", "GET");
-            }
-            if !request.is_trusted_audio(public_host) {
-                return Response::json(403, error_json("cross-origin audio request rejected"));
-            }
-            return self.playback_audio(start_milliseconds);
-        }
         if request.path.starts_with("/api/audio") {
-            return Response::json(404, error_json("audio region not found"));
+            return Response::json(404, error_json("audio endpoint not found"));
         }
         if let Some(operation_id) = edit_operation_id(&request.path) {
             return if request.method == "GET" {
@@ -835,29 +747,6 @@ impl Router {
         )
     }
 
-    fn playback_audio(&self, start_milliseconds: u64) -> Response {
-        let project = self.lock_studio().project().clone();
-        let stride_milliseconds = (audio_analysis::PLAYBACK_REGION_STRIDE_SECONDS * 1_000.0) as u64;
-        if start_milliseconds % stride_milliseconds != 0 {
-            return Response::json(
-                422,
-                error_json("playback start must align to an audio chunk boundary"),
-            );
-        }
-        let start = start_milliseconds as f32 / 1_000.0;
-        if !start.is_finite() || start < 0.0 || start >= project.duration {
-            return Response::json(422, error_json("playback start is outside the project"));
-        }
-        match self.audio_cache.playback_json(&project, start) {
-            Ok(body) => Response::json(200, body),
-            Err(AudioCacheError::Render(error)) => {
-                eprintln!("error: could not render playback audio: {error}");
-                Response::json(500, error_json("could not render playback audio"))
-            }
-            Err(AudioCacheError::Cancelled) => unreachable!("cached renders cannot be cancelled"),
-        }
-    }
-
     #[cfg(test)]
     fn write_playback_stream(&self, request: &Request, output: &mut impl Write) -> io::Result<()> {
         self.write_playback_stream_with_cancel(request, output, || false)
@@ -964,15 +853,15 @@ impl Router {
             }
             let (region, end) =
                 match self
-                    .audio_cache
+                    .audio_renderer
                     .stream_region(&project, cursor, &is_cancelled)
                 {
                     Ok(rendered) => rendered,
-                    Err(AudioCacheError::Render(error)) => {
+                    Err(AudioRenderError::Render(error)) => {
                         eprintln!("error: could not render playback stream: {error}");
                         return Err(io::Error::other("could not render playback stream"));
                     }
-                    Err(AudioCacheError::Cancelled) => return Ok(()),
+                    Err(AudioRenderError::Cancelled) => return Ok(()),
                 };
             let count = region.samples.len().min(remaining);
             if is_cancelled() {
@@ -1009,18 +898,18 @@ impl Router {
         let pcm_end = range.end + 1 - WAV_HEADER_BYTES;
         let first_sample = pcm_start / 2;
         let end_sample = pcm_end.div_ceil(2);
-        let region = match self.audio_cache.stream_sample_range(
+        let region = match self.audio_renderer.stream_sample_range(
             project,
             stream_start_sample + first_sample,
             stream_start_sample + end_sample,
             is_cancelled,
         ) {
             Ok(region) => region,
-            Err(AudioCacheError::Render(error)) => {
+            Err(AudioRenderError::Render(error)) => {
                 eprintln!("error: could not render playback range: {error}");
                 return Err(io::Error::other("could not render playback range"));
             }
-            Err(AudioCacheError::Cancelled) => return Ok(()),
+            Err(AudioRenderError::Cancelled) => return Ok(()),
         };
         if is_cancelled() {
             return Ok(());
@@ -1831,13 +1720,6 @@ fn edit_job_id(path: &str) -> Option<u64> {
         .flatten()
 }
 
-fn playback_audio_start(path: &str) -> Option<u64> {
-    if path == "/api/audio" {
-        return Some(0);
-    }
-    path.strip_prefix("/api/audio/")?.parse::<u64>().ok()
-}
-
 fn playback_audio_stream(path: &str) -> Option<(&str, u64, u64)> {
     let mut parts = path.strip_prefix("/api/audio-stream/")?.split('/');
     let token = parts.next()?;
@@ -2092,7 +1974,7 @@ mod tests {
                 store: Some(store),
                 planner: Planner::Demo,
                 edit_jobs: Arc::new(EditJobs::new()),
-                audio_cache: Arc::new(AudioCache::default()),
+                audio_renderer: Arc::new(AudioRenderer::default()),
                 audio_token: Arc::new("test-audio-token".to_owned()),
             },
             path,
@@ -2475,7 +2357,7 @@ mod tests {
             store: None,
             planner: Planner::Demo,
             edit_jobs: Arc::new(EditJobs::new()),
-            audio_cache: Arc::new(AudioCache::default()),
+            audio_renderer: Arc::new(AudioRenderer::default()),
             audio_token: Arc::new("test-audio-token".to_owned()),
         };
         let retried = restarted.handle(&request(
@@ -2888,39 +2770,8 @@ mod tests {
     }
 
     #[test]
-    fn serves_audio_rendered_by_the_backend_engine() {
-        let router = Router::demo();
-        let response = router.handle(&audio_request("/api/audio"));
-        assert_eq!(response.status, 200);
-        let audio: serde_json::Value =
-            serde_json::from_str(&response.body).expect("playback audio JSON");
-        assert_eq!(audio["projectVersion"], 1);
-        assert_eq!(audio["sampleRate"], audio_analysis::SAMPLE_RATE);
-        assert_eq!(audio["channels"], 1);
-        assert_eq!(audio["start"], 0.0);
-        assert_eq!(audio["end"], audio_analysis::MAX_REGION_SECONDS);
-        let wav = audio["wav"].as_str().expect("base64 WAV");
-        assert!(wav.starts_with("UklGR"));
-        assert!(wav.len() > 1_000);
-        assert_eq!(
-            router.handle(&request("POST", "/api/audio", "")).status,
-            405
-        );
-        let later = router.handle(&audio_request("/api/audio/16000"));
-        assert_eq!(later.status, 200);
-        let later: serde_json::Value =
-            serde_json::from_str(&later.body).expect("later playback audio JSON");
-        assert_eq!(later["start"], 16.0);
-        assert_eq!(
-            router.handle(&audio_request("/api/audio/15500")).status,
-            422
-        );
-    }
-
-    #[test]
     fn rejects_untrusted_audio_requests() {
         let router = Router::demo();
-        assert_eq!(router.handle(&request("GET", "/api/audio", "")).status, 403);
         assert_eq!(
             router
                 .handle(&request("GET", "/api/audio-access", ""))
@@ -2928,7 +2779,7 @@ mod tests {
             403
         );
 
-        let mut hostile = audio_request("/api/audio");
+        let mut hostile = audio_request("/api/audio-access");
         hostile
             .headers
             .insert("origin".to_owned(), "http://127.0.0.1:18867".to_owned());
@@ -3036,104 +2887,23 @@ mod tests {
     }
 
     #[test]
-    fn coalesces_matching_audio_renders_and_serializes_competing_work() {
-        let cache = Arc::new(AudioCache::default());
-        let project = Project::demo();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let started = Arc::new((Mutex::new(false), Condvar::new()));
-
-        let first_cache = Arc::clone(&cache);
-        let first_project = project.clone();
-        let first_gate = Arc::clone(&gate);
-        let first_started = Arc::clone(&started);
-        let first = thread::spawn(move || {
-            first_cache.playback_json_with(&first_project, 0.0, |project, _| {
-                let (lock, ready) = &*first_started;
-                *lock
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-                ready.notify_all();
-
-                let (lock, released) = &*first_gate;
-                drop(
-                    released
-                        .wait_while(
-                            lock.lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner),
-                            |released| !*released,
-                        )
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                );
-                audio_analysis::render_region(project, &[1], 0.0, 0.01).map(|region| (region, 0.01))
-            })
-        });
-
-        let (lock, ready) = &*started;
-        drop(
-            ready
-                .wait_while(
-                    lock.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    |started| !*started,
-                )
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-
-        let second_cache = Arc::clone(&cache);
-        let second_project = project.clone();
-        let second = thread::spawn(move || {
-            second_cache.playback_json_with(&second_project, 0.0, |_, _| {
-                panic!("coalesced render ran twice")
-            })
-        });
-        let competing_cache = Arc::clone(&cache);
-        let competing_project = project.clone();
-        let competing = thread::spawn(move || {
-            competing_cache.playback_json_with(&competing_project, 16.0, |project, _| {
-                audio_analysis::render_region(project, &[1], 0.0, 0.01)
-                    .map(|region| (region, 16.01))
-            })
-        });
-
-        let (lock, released) = &*gate;
-        *lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        released.notify_all();
-        let first = first
-            .join()
-            .expect("first render thread")
-            .expect("first render");
-        let second = second
-            .join()
-            .expect("coalesced render thread")
-            .expect("coalesced render");
-        let competing = competing
-            .join()
-            .expect("competing render thread")
-            .expect("competing render");
-        assert_eq!(first, second);
-        assert_ne!(first, competing);
-    }
-
-    #[test]
     fn cancelled_stream_leaves_the_render_queue_without_rendering() {
-        let cache = Arc::new(AudioCache::default());
+        let renderer = Arc::new(AudioRenderer::default());
         let project = Project::demo();
         let cancelled = Arc::new(AtomicBool::new(false));
         let checked = Arc::new(std::sync::Barrier::new(2));
-        let mut state = cache
+        let mut state = renderer
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.rendering = Some("active render".to_owned());
+        state.rendering = true;
 
-        let second_cache = Arc::clone(&cache);
+        let second_renderer = Arc::clone(&renderer);
         let second_cancelled = Arc::clone(&cancelled);
         let second_checked = Arc::clone(&checked);
         let second = thread::spawn(move || {
             let first_check = AtomicBool::new(true);
-            second_cache.stream_region_with(
+            second_renderer.stream_region_with(
                 &project,
                 1,
                 2,
@@ -3149,12 +2919,12 @@ mod tests {
 
         checked.wait();
         cancelled.store(true, Ordering::SeqCst);
-        state.rendering = None;
+        state.rendering = false;
         drop(state);
-        cache.completed.notify_all();
+        renderer.completed.notify_all();
         assert!(matches!(
             second.join().expect("cancelled stream thread"),
-            Err(AudioCacheError::Cancelled)
+            Err(AudioRenderError::Cancelled)
         ));
     }
 
