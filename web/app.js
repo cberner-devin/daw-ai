@@ -3094,7 +3094,7 @@
       .map(
         (session) => `<article class="gemini-session-item">
           <div><strong>${escapeHtml(new Date(Number(session.createdAt) || 0).toLocaleString())}</strong>
-          <span>${escapeHtml(session.status || "unknown")} · ${Number(session.appliedSteps) || 0} actions · ${Number(session.audioListens) || 0} listens</span></div>
+          <span>${escapeHtml(session.status || "unknown")} &middot; ${Number(session.appliedSteps) || 0} actions &middot; ${Number(session.audioListens) || 0} listens</span></div>
           <p>${escapeHtml(session.prompt || "Untitled edit")}</p>
         </article>`,
       )
