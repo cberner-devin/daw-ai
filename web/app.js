@@ -61,6 +61,7 @@
     dragPointer: null,
     dragAnchor: 0,
     touchSelectionMode: false,
+    longPress: null,
     promptPending: false,
     activeEditJobId: null,
     interruptPending: false,
@@ -84,6 +85,8 @@
   const AUDIO_SEEK_DEBOUNCE_MS = 200;
   const TOAST_DISMISS_MS = 4200;
   const ERROR_TOAST_DISMISS_MS = 60_000;
+  const LONG_PRESS_MS = 500;
+  const LONG_PRESS_MOVE_TOLERANCE_PX = 10;
   const SURGE_PRESETS = ["Init", "Surge Percussion", "Surge Bass", "Surge Pad", "Surge Lead", "Surge Atmosphere"];
 
   class AudioEngine {
@@ -1197,7 +1200,19 @@
 
   function beginSelection(event) {
     if (!event.target.closest(".track-lane") || !state.project) return;
-    if (event.pointerType === "touch" && !state.touchSelectionMode) return;
+    if (event.pointerType === "touch" && !state.touchSelectionMode) {
+      cancelLongPress();
+      const pointerId = event.pointerId;
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const timer = window.setTimeout(() => {
+        if (state.longPress?.pointerId !== pointerId) return;
+        state.longPress = null;
+        selectWholeTrack();
+      }, LONG_PRESS_MS);
+      state.longPress = { pointerId, startX, startY, timer };
+      return;
+    }
     state.dragPointer = event.pointerId;
     state.dragAnchor = timelineTimeFromPointer(event);
     state.selectionStart = Math.min(state.dragAnchor, state.project.duration - 0.25);
@@ -1207,6 +1222,13 @@
   }
 
   function moveSelection(event) {
+    if (state.longPress?.pointerId === event.pointerId) {
+      const movement = Math.hypot(
+        event.clientX - state.longPress.startX,
+        event.clientY - state.longPress.startY,
+      );
+      if (movement > LONG_PRESS_MOVE_TOLERANCE_PX) cancelLongPress();
+    }
     if (event.pointerId !== state.dragPointer) return;
     const current = timelineTimeFromPointer(event);
     if (current === state.dragAnchor) {
@@ -1221,6 +1243,7 @@
   }
 
   function endSelection(event) {
+    if (state.longPress?.pointerId === event.pointerId) cancelLongPress();
     if (event.pointerId !== state.dragPointer) return;
     state.dragPointer = null;
     if (elements.trackRows.hasPointerCapture(event.pointerId)) {
@@ -1229,6 +1252,31 @@
     audio.seek(state.selectionStart);
     renderSelection();
     if (event.pointerType === "touch") setTouchSelectionMode(false);
+  }
+
+  function cancelLongPress() {
+    if (!state.longPress) return;
+    window.clearTimeout(state.longPress.timer);
+    state.longPress = null;
+  }
+
+  function selectWholeTrack() {
+    if (!state.project) return;
+    state.selectionStart = 0;
+    state.selectionEnd = state.project.duration;
+    audio.seek(0);
+    renderSelection();
+    setTouchSelectionMode(false);
+  }
+
+  function selectWholeTrackFromDoubleClick(event) {
+    const hit = document.elementFromPoint(event.clientX, event.clientY);
+    if (!hit?.closest(".track-lane")) return;
+    selectWholeTrack();
+  }
+
+  function keepLongPressForTimeline(event) {
+    if (event.target.closest(".track-lane")) event.preventDefault();
   }
 
   function setTouchSelectionMode(enabled) {
@@ -2028,6 +2076,8 @@
   elements.trackRows.addEventListener("pointermove", moveSelection);
   elements.trackRows.addEventListener("pointerup", endSelection);
   elements.trackRows.addEventListener("pointercancel", endSelection);
+  elements.trackRows.addEventListener("dblclick", selectWholeTrackFromDoubleClick);
+  elements.trackRows.addEventListener("contextmenu", keepLongPressForTimeline);
   elements.trackRows.addEventListener("keydown", handleTimelineKey);
   elements.promptForm.addEventListener("submit", submitPrompt);
   elements.playButton.addEventListener("click", () => void audio.toggle());
