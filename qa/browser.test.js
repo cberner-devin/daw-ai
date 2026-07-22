@@ -1768,7 +1768,7 @@ async function run() {
       })()`),
       "unrelated concurrent channel must not confirm a lost add",
     );
-    assert.notEqual(unrelatedChannel.toast, "Channel added");
+    assert.notEqual(unrelatedChannel.toast, "Track added");
     await evaluate(cdp, appSession, `(() => {
       window.__restoreFetchAfterUnrelatedChannel();
       window.confirm = () => true;
@@ -1910,6 +1910,56 @@ async function run() {
       })`),
       { instruments: 3, effects: 3, modulators: 3, routes: 3, events: 22 },
       "Advanced must expose every sound tool and the demo clip events",
+    );
+    const advancedGraphSummary = await evaluate(cdp, appSession, `(() => ({
+        graphs: document.querySelectorAll('.sound-graph').length,
+        selectableNodes: document.querySelectorAll('[data-graph-node]').length,
+        selectedNodes: document.querySelectorAll('[data-graph-node][aria-pressed="true"]').length,
+        visibleInspectors: [...document.querySelectorAll('.node-inspector')].filter((pane) => !pane.hidden).length,
+        pianoRolls: document.querySelectorAll('.piano-roll').length,
+        visualNotes: document.querySelectorAll('.midi-note').length,
+      }))()`);
+    assert.deepEqual(
+      advancedGraphSummary,
+      {
+        graphs: 3,
+        selectableNodes: 10,
+        selectedNodes: 3,
+        visibleInspectors: 3,
+        pianoRolls: 3,
+        visualNotes: 22,
+      },
+      `Advanced must render selectable sound graphs and standard MIDI piano rolls (${JSON.stringify(advancedGraphSummary)})`,
+    );
+    await evaluate(cdp, appSession, `document.querySelector(
+      '[data-graph-node="effect:210"][data-track-id="2"]',
+    ).click()`);
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(() => {
+        const card = document.querySelector('[data-channel-track="2"]');
+        return {
+          selected: card.querySelector('[data-graph-node="effect:210"]').getAttribute('aria-pressed'),
+          effectPaneVisible: !card.querySelector('.effects-tool').hidden,
+          instrumentPaneHidden: card.querySelector('.instrument-tool').hidden,
+          focusedNode: document.activeElement.dataset.graphNode,
+        };
+      })()`),
+      {
+        selected: "true",
+        effectPaneVisible: true,
+        instrumentPaneHidden: true,
+        focusedNode: "effect:210",
+      },
+      "clicking a graph node must reveal and focus its parameter side pane",
+    );
+    await evaluate(cdp, appSession, `document.querySelector(
+      '[data-graph-node="instrument:201"][data-track-id="2"]',
+    ).click()`);
+    await evaluate(cdp, appSession, "document.querySelector('.midi-note[data-midi-event=\"1101\"]').click()");
+    assert.equal(
+      await evaluate(cdp, appSession, "document.activeElement.dataset.controlKey"),
+      "1-clip-11-event-1101-pitch",
+      "clicking a piano-roll note must reveal its editable MIDI event",
     );
     assert.deepEqual(
       await evaluate(cdp, appSession, `({

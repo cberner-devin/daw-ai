@@ -19,7 +19,7 @@ use crate::prompt::{Action, AutomationPoint, EditPlan, MAX_COMPOUND_ACTIONS, Mid
 
 pub(crate) const EDIT_SCHEMA: &str = include_str!("../gemini/edit-plan.schema.json");
 const STUDIO_CONTRACT: &str = include_str!("../gemini/STUDIO.md");
-const GEMINI_MODEL: &str = "gemini-3.5-flash";
+pub(crate) const GEMINI_MODEL: &str = "gemini-3.6-flash";
 const DEFAULT_INTERACTIONS_ENDPOINT: &str =
     "https://generativelanguage.googleapis.com/v1/interactions";
 const SYSTEMD_CREDENTIAL_NAME: &str = "gemini-api-key";
@@ -246,7 +246,7 @@ fn run_session_with_transport(
             }
             if !state.listened_since_edit {
                 input = JsonValue::String(format!(
-                    "The last edit has not been heard. Call {AUDIO_TOOL_NAME} with the channels and absolute project range that best reveal the result, evaluate the audio against the request, and continue editing if it is weak."
+                    "The last edit has not been heard. Call {AUDIO_TOOL_NAME} with the tracks and absolute project range that best reveal the result, evaluate the audio against the request, and continue editing if it is weak."
                 ));
                 continue;
             }
@@ -307,7 +307,7 @@ fn run_session_with_transport(
                     )
                     .map_err(PlannerError::Io)?;
                 input = JsonValue::String(format!(
-                    "The independent audio judge rejected your completion claim. This verdict came from a fresh interaction that heard the latest WAV without your transcript.\n\n{feedback}\n\nUse this as required revision guidance. Apply a concrete graph edit, render the most informative channels and absolute project range, listen, and only then claim completion again."
+                    "The independent audio judge rejected your completion claim. This verdict came from a fresh interaction that heard the latest WAV without your transcript.\n\n{feedback}\n\nUse this as required revision guidance. Apply a concrete graph edit, render the most informative tracks and absolute project range, listen, and only then claim completion again."
                 ));
                 continue;
             }
@@ -524,7 +524,7 @@ fn judge_system_instruction() -> &'static str {
         "or transformation is plainly audible, not merely technically plausible. Evaluate arrangement ",
         "and transition, pulse and subdivision, groove, dynamics and contrast, timbre, channel balance, ",
         "and stereo presentation where each is relevant. If the evidence render is too narrow or omits ",
-        "necessary channels or before/after context, reject it. On rejection, identify concrete audible ",
+        "necessary tracks or before/after context, reject it. On rejection, identify concrete audible ",
         "shortcomings and give detailed, prioritized musical corrections. Always call the verdict tool."
     )
 }
@@ -837,7 +837,7 @@ fn missing_credentials(path: Option<&Path>) -> PlannerError {
 
 fn planner_task(prompt: &str, start: f32, end: f32) -> String {
     format!(
-        "Selected edit region: {start:.3} to {end:.3} seconds. This bounds graph edits, not listening.\nUser request: {prompt}\n\nBegin by reading the current sound graph and rendering the channels and absolute project start/end times that best reveal the original music. Include context outside the selected edit region when transition or contrast matters. Then edit, listen to the new audio, critically compare it with the request, and iterate until the musical result is convincing. An independent audio judge will review the exact latest render when you claim completion."
+        "Selected edit region: {start:.3} to {end:.3} seconds. This bounds graph edits, not listening.\nUser request: {prompt}\n\nBegin by reading the current sound graph and rendering the tracks and absolute project start/end times that best reveal the original music. Include context outside the selected edit region when transition or contrast matters. Then edit, listen to the new audio, critically compare it with the request, and iterate until the musical result is convincing. An independent audio judge will review the exact latest render when you claim completion."
     )
 }
 

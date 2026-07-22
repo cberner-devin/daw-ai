@@ -1372,7 +1372,7 @@ impl Studio {
             return Err(StudioError::InvalidChannel);
         }
         self.remember();
-        let track_id = self.add_track(role, 0.0, self.project.duration, "New channel");
+        let track_id = self.add_track(role, 0.0, self.project.duration, "New track");
         self.project.version += 1;
         Ok(track_id)
     }
