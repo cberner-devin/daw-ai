@@ -1877,7 +1877,7 @@ async function run() {
     );
     assert.deepEqual(
       await evaluate(cdp, appSession, `(() => {
-        const select = document.querySelector('[data-sound-tool="instrument"][data-parameter="waveform"]');
+        const select = document.querySelector('[data-sound-tool="instrument"][data-parameter="preset"]');
         select.focus();
         const allowed = select.dispatchEvent(
           new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true, cancelable: true }),
@@ -1903,18 +1903,21 @@ async function run() {
     assert.deepEqual(
       await evaluate(cdp, appSession, `({
         instruments: document.querySelectorAll('.instrument-tool').length,
-        oscillators: document.querySelectorAll('.oscillator-card').length,
         effects: document.querySelectorAll('.effects-tool').length,
         modulators: document.querySelectorAll('.modulator-card').length,
         routes: document.querySelectorAll('.routing-chain').length,
         events: document.querySelectorAll('.clip-event').length,
       })`),
-      { instruments: 3, oscillators: 6, effects: 3, modulators: 3, routes: 3, events: 22 },
+      { instruments: 3, effects: 3, modulators: 3, routes: 3, events: 22 },
       "Advanced must expose every sound tool and the demo clip events",
     );
     assert.deepEqual(
       await evaluate(cdp, appSession, `({
-        oscillatorParameters: [...document.querySelectorAll(
+        engines: [...document.querySelectorAll('.instrument-tool .tool-heading strong')]
+          .map((heading) => heading.textContent),
+        presets: [...document.querySelectorAll('[data-sound-tool="instrument"][data-parameter="preset"]')]
+          .map((control) => control.value),
+        nativeParameters: [...document.querySelectorAll(
           '[data-sound-tool="instrument"][data-track-id="2"]',
         )].map((control) => control.dataset.parameter),
         filterParameters: [...document.querySelectorAll(
@@ -1927,18 +1930,36 @@ async function run() {
           .map((control) => control.value),
       })`),
       {
-        oscillatorParameters: [
-          "waveform", "oscillator1.tuning", "oscillator1.level",
-          "oscillator2.waveform", "oscillator2.tuning", "oscillator2.level",
-          "attack", "release", "tone",
-        ],
+        engines: ["Surge XT", "Surge XT", "Surge XT"],
+        presets: ["Surge Percussion", "Surge Bass", "Surge Pad"],
+        nativeParameters: ["preset", "attack", "release", "cutoff", "resonance", "pitch"],
         filterParameters: ["mix", "cutoff", "resonance"],
         midiRoutes: 1,
         rateModes: ["hz", "hz", "hz"],
         triggers: ["midi", "free", "free"],
       },
-      "Advanced must expose layered oscillators and modulator sync/trigger controls",
+      "Advanced must expose Surge presets, native parameters, and modulator sync/trigger controls",
     );
+    await evaluate(cdp, appSession, `(() => {
+      const preset = document.querySelector(
+        '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="preset"]',
+      );
+      preset.value = 'Surge Pad';
+      preset.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => evaluate(cdp, appSession, `(async () => {
+      const project = await fetch('/api/project').then((response) => response.json());
+      const instrument = project.tracks[1].instrument;
+      return instrument.engine === 'Surge XT' && instrument.preset === 'Surge Pad' &&
+        document.querySelector(
+          '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="preset"]',
+        ).value === 'Surge Pad';
+    })()`), "Surge XT preset update");
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => evaluate(cdp, appSession, `(async () => {
+      const project = await fetch('/api/project').then((response) => response.json());
+      return project.tracks[1].instrument.preset === 'Surge Bass';
+    })()`), "Surge XT preset undo");
     await evaluate(cdp, appSession, `document.querySelector(
       '[data-sound-tool="modulator"][data-track-id="1"][data-parameter="enabled"]',
     ).click()`);
@@ -2092,7 +2113,7 @@ async function run() {
         };
       })()`),
       {
-        release: { value: "0.025", step: "any", output: "0.025 s" },
+        release: { value: "0.025", step: "any", output: "2.5%" },
         mix: { value: "0.005", step: "any", output: "0.5%", heading: "0.5%" },
       },
       "authoritative floats must render without range sanitization or display rounding",
@@ -2105,7 +2126,7 @@ async function run() {
     await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
     await waitFor(async () => {
       const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-      return project.tracks[1].instrument.parameters.release === 0.18;
+      return project.tracks[1].instrument.parameters.release === 0.3;
     }, "precise release undo");
     await evaluate(
       cdp,
@@ -2131,7 +2152,7 @@ async function run() {
       const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
       return project.tracks[2].routing.audio[2] === "effect:310";
     }, "advanced effect reorder undo");
-    const layeredInstrumentBefore = await evaluate(
+    const nativeInstrumentBefore = await evaluate(
       cdp,
       appSession,
       "fetch('/api/project').then((response) => response.json())",
@@ -2144,22 +2165,21 @@ async function run() {
         control.value = value;
         control.dispatchEvent(new Event('change', { bubbles: true }));
       };
-      update('oscillator2.waveform', 'triangle');
-      update('oscillator2.tuning', '-7');
-      update('oscillator2.level', '0.41');
+      update('cutoff', '0.41');
+      update('resonance', '0.27');
+      update('pitch', '0.55');
     })()`);
     await waitFor(async () => {
       const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
       const instrument = project.tracks[1].instrument;
-      return project.version === layeredInstrumentBefore.version + 3 &&
-        instrument.oscillators[0].waveform === "square" &&
-        instrument.oscillators[1].waveform === "triangle" &&
-        instrument.oscillators[1].tuning === -7 && instrument.oscillators[1].level === 0.41;
-    }, "independent secondary oscillator updates");
+      return project.version === nativeInstrumentBefore.version + 3 &&
+        instrument.parameters.cutoff === 0.41 &&
+        instrument.parameters.resonance === 0.27 && instrument.parameters.pitch === 0.55;
+    }, "native Surge XT parameter updates");
     for (const [condition, label] of [
-      ["instrument.oscillators[1].level === 0.28", "secondary oscillator level undo"],
-      ["instrument.oscillators[1].tuning === -12", "secondary oscillator tuning undo"],
-      ["instrument.oscillators[1].waveform === 'sawtooth'", "secondary oscillator waveform undo"],
+      ["instrument.parameters.pitch === 0.5", "native pitch undo"],
+      ["instrument.parameters.resonance === 0.18", "native resonance undo"],
+      ["instrument.parameters.cutoff === 0.45", "native cutoff undo"],
     ]) {
       await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
       await waitFor(async () =>
@@ -2173,23 +2193,23 @@ async function run() {
       "fetch('/api/project').then((response) => response.json())",
     );
     await evaluate(cdp, appSession, `(() => {
-      const select = document.querySelector('[data-sound-tool="instrument"][data-track-id="2"][data-parameter="waveform"]');
-      select.value = 'sawtooth';
-      select.dispatchEvent(new Event('change', { bubbles: true }));
+      const control = document.querySelector('[data-sound-tool="instrument"][data-track-id="2"][data-parameter="cutoff"]');
+      control.value = '0.44';
+      control.dispatchEvent(new Event('change', { bubbles: true }));
     })()`);
     await waitFor(async () => {
       const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-      return project.version === soundProjectBefore.version + 1 && project.tracks[1].instrument.waveform === "sawtooth";
+      return project.version === soundProjectBefore.version + 1 && project.tracks[1].instrument.parameters.cutoff === 0.44;
     }, "advanced instrument update");
     assert.equal(
       await evaluate(cdp, appSession, "document.activeElement.dataset.controlKey"),
-      "2-instrument-201-waveform",
+      "2-instrument-201-cutoff",
       "sound-tool updates must restore focus to their control",
     );
     await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
     await waitFor(async () => {
       const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-      return project.tracks[1].instrument.waveform === "square";
+      return project.tracks[1].instrument.parameters.cutoff === 0.45;
     }, "advanced instrument undo");
     const projectBeforeClipUiMutation = await evaluate(
       cdp,
@@ -2448,13 +2468,13 @@ async function run() {
         cdp,
         appSession,
         `document.activeElement.dataset.volumeTrack === '2' &&
-          document.querySelector('[data-volume-track="1"]').value === '0.83' &&
-          document.querySelector('[data-volume-track="2"]').value === '0.75'`,
+          document.querySelector('[data-volume-track="1"]').value === '0.79' &&
+          document.querySelector('[data-volume-track="2"]').value === '0.96'`,
       );
       return (
         project.version >= projectBeforeMix.version + 2 &&
-        Math.abs(project.tracks[0].volume - 0.83) < 0.001 &&
-        Math.abs(project.tracks[1].volume - 0.75) < 0.001 &&
+        Math.abs(project.tracks[0].volume - 0.79) < 0.001 &&
+        Math.abs(project.tracks[1].volume - 0.96) < 0.001 &&
         clientReady
       );
     }, "serialized mixer changes");
@@ -2468,7 +2488,7 @@ async function run() {
         first: document.querySelector('[data-volume-track="1"]').value,
         second: document.querySelector('[data-volume-track="2"]').value,
       })`),
-      { first: "0.83", second: "0.75" },
+      { first: "0.79", second: "0.96" },
       "the final mixer render must include every queued update",
     );
     await waitFor(
@@ -2851,7 +2871,7 @@ async function run() {
     const beforeAttackWaveform = await evaluate(
       cdp,
       appSession,
-      "fetch('/api/project').then((response) => response.json()).then((project) => project.tracks.find((track) => track.id === 2).instrument.waveform)",
+      "fetch('/api/project').then((response) => response.json()).then((project) => project.tracks.find((track) => track.id === 2).instrument.parameters.cutoff)",
     );
     attacker = await startAttackerServer(attackerPort);
     const attackerSession = await openPage(cdp, `http://127.0.0.1:${attackerPort}`);
@@ -2865,12 +2885,12 @@ async function run() {
       method: 'POST',
       mode: 'no-cors',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth'
+      body: 'track_id=2&tool=instrument&tool_id=201&parameter=cutoff&value=0.9'
     }).then(() => true).catch(() => false)`);
     const afterAttack = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
     assert.equal(afterAttack.edits.some((edit) => edit.prompt === "hostile edit"), false);
     assert.equal(
-      afterAttack.tracks.find((track) => track.id === 2).instrument.waveform,
+      afterAttack.tracks.find((track) => track.id === 2).instrument.parameters.cutoff,
       beforeAttackWaveform,
       "cross-origin sound-tool mutations must be rejected",
     );

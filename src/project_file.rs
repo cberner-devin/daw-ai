@@ -5,8 +5,9 @@ use serde_json::{Map, Value as JsonValue};
 use crate::model::{
     ChannelOperation, ChannelOperationAction, Clip, ClipEvent, Edit, EditOperation, Effect,
     FILTER_CUTOFF_MAX_HZ, FILTER_CUTOFF_MIN_HZ, FILTER_RESONANCE_DEFAULT, FILTER_RESONANCE_MAX,
-    FILTER_RESONANCE_MIN, Instrument, MAX_PROMPT_CHARACTERS, Modulator, Oscillator, Project,
-    ProjectFileError, Routing, Track, TrackRole, automation_target_range, legacy_filter_cutoff_hz,
+    FILTER_RESONANCE_MIN, Instrument, MAX_PROMPT_CHARACTERS, Modulator, Project, ProjectFileError,
+    Routing, SURGE_ENGINE, Track, TrackRole, automation_target_range, legacy_filter_cutoff_hz,
+    valid_surge_preset,
 };
 use crate::prompt::{Action, AutomationPoint, MAX_COMPOUND_ACTIONS, MidiNote};
 
@@ -210,49 +211,43 @@ fn parse_track(
     let instrument_object = object(instrument_value, "instrument")?;
     let instrument_id = unique_id(instrument_object, "id", ids, "instrument")?;
     expect_type(instrument_object, "instrument")?;
-    let engine = limited_string(instrument_object, "engine", 1, 64)?;
-    let legacy_waveform = limited_string(instrument_object, "waveform", 1, 32)?;
-    validate_waveform(&legacy_waveform)?;
-    let oscillators = match instrument_object.get("oscillators") {
-        Some(value) => {
-            let values = value
-                .as_array()
-                .ok_or_else(|| invalid("instrument oscillators must be an array"))?;
-            if values.len() != 2 {
-                return Err(invalid("instrument must contain exactly 2 oscillators"));
-            }
-            values
-                .iter()
-                .enumerate()
-                .map(|(index, value)| parse_oscillator(value, index))
-                .collect::<Result<Vec<_>, _>>()?
-        }
-        None => vec![
-            Oscillator {
-                waveform: legacy_waveform.clone(),
-                tuning: 0.0,
-                level: 0.72,
-            },
-            Oscillator {
-                waveform: legacy_waveform.clone(),
-                tuning: 0.0,
-                level: 0.28,
-            },
-        ],
-    };
-    let waveform = oscillators[0].waveform.clone();
+    let _legacy_engine = limited_string(instrument_object, "engine", 1, 64)?;
+    let legacy_preset = instrument_object
+        .get("preset")
+        .map_or(Ok("Custom"), |value| {
+            value
+                .as_str()
+                .ok_or_else(|| invalid("preset must be a string"))
+        })?;
+    let preset = migrate_surge_preset(legacy_preset, role);
+    if !valid_surge_preset(preset) {
+        return Err(invalid("instrument preset is unsupported"));
+    }
     let instrument_parameters = object(
         field(instrument_object, "parameters")?,
         "instrument parameters",
     )?;
+    let attack = optional_range(instrument_parameters, "attack", 0.05, 0.0, 2.0)?;
+    let release = optional_range(instrument_parameters, "release", 0.3, 0.0, 5.0)?;
     let instrument = Instrument {
         id: instrument_id,
-        engine,
-        waveform,
-        oscillators,
-        attack: range(instrument_parameters, "attack", 0.001, 2.0)?,
-        release: range(instrument_parameters, "release", 0.02, 5.0)?,
-        tone: range(instrument_parameters, "tone", 0.0, 1.0)?,
+        engine: SURGE_ENGINE.to_owned(),
+        preset: preset.to_owned(),
+        attack: if attack > 1.0 { attack / 2.0 } else { attack },
+        release: if release > 1.0 {
+            release / 5.0
+        } else {
+            release
+        },
+        cutoff: optional_range(
+            instrument_parameters,
+            "cutoff",
+            optional_range(instrument_parameters, "tone", 0.6, 0.0, 1.0)?,
+            0.0,
+            1.0,
+        )?,
+        resonance: optional_range(instrument_parameters, "resonance", 0.18, 0.0, 1.0)?,
+        pitch: optional_range(instrument_parameters, "pitch", 0.5, 0.0, 1.0)?,
     };
 
     let effect_values = array(track, "effects")?;
@@ -323,22 +318,57 @@ fn parse_track(
     Ok(parsed)
 }
 
-fn parse_oscillator(value: &JsonValue, index: usize) -> Result<Oscillator, ProjectFileError> {
-    let oscillator = object(value, &format!("oscillator {}", index + 1))?;
-    let waveform = limited_string(oscillator, "waveform", 1, 32)?;
-    validate_waveform(&waveform)?;
-    Ok(Oscillator {
-        waveform,
-        tuning: range(oscillator, "tuning", -24.0, 24.0)?,
-        level: range(oscillator, "level", 0.0, 1.0)?,
-    })
+fn migrate_surge_preset(preset: &str, role: TrackRole) -> &str {
+    match preset {
+        "Punch Kit" => "Surge Percussion",
+        "Deep Bass" => "Surge Bass",
+        "Warm Pad" => "Surge Pad",
+        "Bright Lead" => "Surge Lead",
+        "Air Texture" => "Surge Atmosphere",
+        "Custom" => match role {
+            TrackRole::Drums => "Surge Percussion",
+            TrackRole::Bass => "Surge Bass",
+            TrackRole::Chords => "Surge Pad",
+            TrackRole::Lead => "Surge Lead",
+            TrackRole::Texture => "Surge Atmosphere",
+        },
+        _ => preset,
+    }
 }
 
-fn validate_waveform(value: &str) -> Result<(), ProjectFileError> {
-    if matches!(value, "sine" | "triangle" | "sawtooth" | "square") {
-        Ok(())
-    } else {
-        Err(invalid("instrument waveform is unsupported"))
+fn migrate_surge_parameter(parameter: &str) -> &str {
+    match parameter {
+        "instrument.tone" => "instrument.cutoff",
+        "instrument.oscillator1.tuning" | "instrument.oscillator2.tuning" => "instrument.pitch",
+        "instrument.oscillator1.level" | "instrument.oscillator2.level" => "track.volume",
+        _ => parameter,
+    }
+}
+
+fn migrate_surge_automation_points(parameter: &str, points: &mut [AutomationPoint]) {
+    let transform: Option<fn(f32) -> f32> = match parameter {
+        "instrument.oscillator1.tuning" | "instrument.oscillator2.tuning" => {
+            Some(|value: f32| (value + 24.0) / 48.0)
+        }
+        "instrument.attack" if points.iter().any(|point| point.value > 1.0) => {
+            Some(|value: f32| value / 2.0)
+        }
+        "instrument.release" if points.iter().any(|point| point.value > 1.0) => {
+            Some(|value: f32| value / 5.0)
+        }
+        "instrument.pitch"
+            if points
+                .iter()
+                .any(|point| !(0.0..=1.0).contains(&point.value)) =>
+        {
+            Some(|value: f32| (value + 2.0) / 4.0)
+        }
+        _ => None,
+    };
+    if let Some(transform) = transform {
+        for point in points {
+            point.value = transform(point.value).clamp(0.0, 1.0);
+        }
     }
 }
 
@@ -401,6 +431,7 @@ fn parse_modulator(
         return Err(invalid("modulator shape is unsupported"));
     }
     let parameters = object(field(modulator, "parameters")?, "modulator parameters")?;
+    let target = limited_string(modulator, "target", 1, 64)?;
     Ok(Modulator {
         id,
         name: limited_string(modulator, "name", 1, 64)?,
@@ -409,7 +440,7 @@ fn parse_modulator(
         rate_mode: optional_enum(modulator, "rateMode", "hz", &["hz", "tempo"])?,
         trigger: optional_enum(modulator, "trigger", "free", &["free", "midi"])?,
         depth: range(parameters, "depth", 0.0, 1.0)?,
-        target: limited_string(modulator, "target", 1, 64)?,
+        target: migrate_surge_parameter(&target).to_owned(),
         enabled: boolean(modulator, "enabled")?,
     })
 }
@@ -478,7 +509,7 @@ fn validate_control_routing(
         let route = object(route, &format!("routing control entry {}", index + 1))?;
         let connection = (
             string(route, "source")?.to_owned(),
-            string(route, "target")?.to_owned(),
+            migrate_surge_parameter(string(route, "target")?).to_owned(),
         );
         if !expected.contains(&connection) || !seen.insert(connection) {
             return Err(invalid(
@@ -541,7 +572,7 @@ fn validate_routing_edges(
         let edge = object(edge, &format!("routing edge {}", index + 1))?;
         let connection = (
             string(edge, "source")?.to_owned(),
-            string(edge, "target")?.to_owned(),
+            migrate_surge_parameter(string(edge, "target")?).to_owned(),
             string(edge, "type")?.to_owned(),
         );
         if !expected.contains(&connection) || !seen.insert(connection) {
@@ -843,7 +874,7 @@ fn parse_action(value: &JsonValue, depth: usize) -> Result<Action, ProjectFileEr
             role: required_target(target, "add-track")?,
         }),
         "instrument" => Ok(Action::Instrument {
-            waveform: waveform(string(action, "name")?)?,
+            preset: surge_preset(string(action, "name")?)?,
             target: required_target(target, "instrument")?,
         }),
         "modulator" => Ok(Action::Modulator {
@@ -870,7 +901,7 @@ fn parse_action(value: &JsonValue, depth: usize) -> Result<Action, ProjectFileEr
             if !(2..=16).contains(&points.len()) {
                 return Err(invalid("automation requires between 2 and 16 points"));
             }
-            let points = points
+            let mut points = points
                 .iter()
                 .map(|point| {
                     let point = object(point, "automation point")?;
@@ -881,13 +912,15 @@ fn parse_action(value: &JsonValue, depth: usize) -> Result<Action, ProjectFileEr
                 })
                 .collect::<Result<Vec<_>, ProjectFileError>>()?;
             validate_automation_points(&points)?;
+            let parameter = limited_string(action, "name", 1, 64)?;
+            migrate_surge_automation_points(&parameter, &mut points);
             Ok(Action::Automation {
                 track_id: action
                     .get("trackId")
                     .map(|_| integer(action, "trackId"))
                     .transpose()?
                     .unwrap_or(0),
-                parameter: limited_string(action, "name", 1, 64)?,
+                parameter: migrate_surge_parameter(&parameter).to_owned(),
                 curve: automation_curve(string(action, "curve")?)?,
                 points,
                 target: required_target(target, "automation")?,
@@ -1038,13 +1071,15 @@ fn parse_role(value: &str) -> Result<TrackRole, ProjectFileError> {
     }
 }
 
-fn waveform(value: &str) -> Result<&'static str, ProjectFileError> {
+fn surge_preset(value: &str) -> Result<&'static str, ProjectFileError> {
     match value {
-        "sine" => Ok("sine"),
-        "triangle" => Ok("triangle"),
-        "sawtooth" => Ok("sawtooth"),
-        "square" => Ok("square"),
-        _ => Err(invalid("unsupported instrument waveform")),
+        "Init" | "sine" => Ok("Init"),
+        "Surge Percussion" => Ok("Surge Percussion"),
+        "Surge Bass" | "square" => Ok("Surge Bass"),
+        "Surge Pad" | "triangle" => Ok("Surge Pad"),
+        "Surge Lead" | "sawtooth" => Ok("Surge Lead"),
+        "Surge Atmosphere" => Ok("Surge Atmosphere"),
+        _ => Err(invalid("unsupported Surge XT starter patch")),
     }
 }
 
@@ -1072,6 +1107,7 @@ fn sound_tool(value: &str) -> Result<&'static str, ProjectFileError> {
 
 fn sound_parameter(value: &str) -> Result<&'static str, ProjectFileError> {
     match value {
+        // Retained edit history is descriptive and may predate Surge XT.
         "waveform" => Ok("waveform"),
         "oscillator1.waveform" => Ok("oscillator1.waveform"),
         "oscillator1.tuning" => Ok("oscillator1.tuning"),
@@ -1079,12 +1115,14 @@ fn sound_parameter(value: &str) -> Result<&'static str, ProjectFileError> {
         "oscillator2.waveform" => Ok("oscillator2.waveform"),
         "oscillator2.tuning" => Ok("oscillator2.tuning"),
         "oscillator2.level" => Ok("oscillator2.level"),
+        "tone" => Ok("tone"),
+        "preset" => Ok("preset"),
         "attack" => Ok("attack"),
         "release" => Ok("release"),
-        "tone" => Ok("tone"),
-        "mix" => Ok("mix"),
         "cutoff" => Ok("cutoff"),
         "resonance" => Ok("resonance"),
+        "pitch" => Ok("pitch"),
+        "mix" => Ok("mix"),
         "enabled" => Ok("enabled"),
         "shape" => Ok("shape"),
         "rate" => Ok("rate"),
@@ -1094,7 +1132,6 @@ fn sound_parameter(value: &str) -> Result<&'static str, ProjectFileError> {
         "target" => Ok("target"),
         "time" => Ok("time"),
         "duration" => Ok("duration"),
-        "pitch" => Ok("pitch"),
         "velocity" => Ok("velocity"),
         "position" => Ok("position"),
         _ => Err(invalid("unsupported sound-tool parameter")),
@@ -1356,6 +1393,38 @@ mod tests {
                 .to_json()
                 .contains(&format!("\"trackId\":{bass_id}"))
         );
+
+        let mut legacy_tuning: JsonValue = serde_json::from_str(&source).unwrap();
+        legacy_tuning["edits"][0]["action"]["name"] =
+            JsonValue::String("instrument.oscillator1.tuning".to_owned());
+        legacy_tuning["edits"][0]["action"]["points"][0]["value"] = JsonValue::from(-12.0);
+        legacy_tuning["edits"][0]["action"]["points"][1]["value"] = JsonValue::from(12.0);
+        let migrated = parse_project(&legacy_tuning.to_string()).expect("legacy tuning lane");
+        let Action::Automation {
+            parameter, points, ..
+        } = &migrated.edits[0].action
+        else {
+            panic!("expected automation action");
+        };
+        assert_eq!(parameter, "instrument.pitch");
+        assert_eq!(points[0].value, 0.25);
+        assert_eq!(points[1].value, 0.75);
+    }
+
+    #[test]
+    fn accepts_legacy_configure_parameters_in_retained_history() {
+        for parameter in [
+            "waveform",
+            "oscillator1.waveform",
+            "oscillator1.tuning",
+            "oscillator1.level",
+            "oscillator2.waveform",
+            "oscillator2.tuning",
+            "oscillator2.level",
+            "tone",
+        ] {
+            assert_eq!(sound_parameter(parameter).unwrap(), parameter);
+        }
     }
 
     #[test]
@@ -1381,17 +1450,29 @@ mod tests {
     }
 
     #[test]
-    fn legacy_single_oscillator_and_free_running_modulators_are_migrated() {
+    fn legacy_custom_instruments_and_routes_are_migrated() {
         let mut legacy: JsonValue = serde_json::from_str(&Project::demo().to_json()).unwrap();
         for track in legacy["tracks"].as_array_mut().expect("tracks") {
-            track["instrument"]
+            let instrument = track["instrument"].as_object_mut().expect("instrument");
+            instrument.remove("preset");
+            instrument.remove("oscillators");
+            let parameters = instrument["parameters"]
                 .as_object_mut()
-                .expect("instrument")
-                .remove("oscillators");
+                .expect("instrument parameters");
+            let cutoff = parameters.remove("cutoff").expect("native cutoff");
+            parameters.insert("tone".to_owned(), cutoff);
+            instrument.insert(
+                "engine".to_owned(),
+                JsonValue::String("Legacy built-in synth".to_owned()),
+            );
             for modulator in track["modulators"].as_array_mut().expect("modulators") {
                 let modulator = modulator.as_object_mut().expect("modulator");
                 modulator.remove("rateMode");
                 modulator.remove("trigger");
+                modulator.insert(
+                    "target".to_owned(),
+                    JsonValue::String("instrument.tone".to_owned()),
+                );
             }
             for effect in track["effects"].as_array_mut().expect("effects") {
                 let parameters = effect["parameters"]
@@ -1400,15 +1481,26 @@ mod tests {
                 parameters.remove("cutoff");
                 parameters.remove("resonance");
             }
-            track["routing"]["edges"]
+            let edges = track["routing"]["edges"]
                 .as_array_mut()
-                .expect("routing edges")
-                .retain(|edge| {
-                    edge["type"] != "midi"
-                        || !edge["target"]
-                            .as_str()
-                            .is_some_and(|target| target.starts_with("modulator:"))
-                });
+                .expect("routing edges");
+            edges.retain(|edge| {
+                edge["type"] != "midi"
+                    || !edge["target"]
+                        .as_str()
+                        .is_some_and(|target| target.starts_with("modulator:"))
+            });
+            for edge in edges {
+                if edge["type"] == "control" {
+                    edge["target"] = JsonValue::String("instrument.tone".to_owned());
+                }
+            }
+            for route in track["routing"]["control"]
+                .as_array_mut()
+                .expect("control routes")
+            {
+                route["target"] = JsonValue::String("instrument.tone".to_owned());
+            }
         }
 
         let parsed = parse_project(&legacy.to_string()).expect("legacy sound graph");
@@ -1416,13 +1508,17 @@ mod tests {
             parsed
                 .tracks
                 .iter()
-                .all(|track| track.instrument.oscillators.len() == 2)
+                .all(|track| track.instrument.engine == SURGE_ENGINE)
         );
+        assert_eq!(parsed.tracks[0].instrument.preset, "Surge Percussion");
+        assert_eq!(parsed.tracks[1].instrument.preset, "Surge Bass");
+        assert_eq!(parsed.tracks[2].instrument.preset, "Surge Pad");
         assert!(parsed.tracks.iter().all(|track| {
-            track
-                .modulators
-                .iter()
-                .all(|modulator| modulator.rate_mode == "hz" && modulator.trigger == "free")
+            track.modulators.iter().all(|modulator| {
+                modulator.rate_mode == "hz"
+                    && modulator.trigger == "free"
+                    && modulator.target == "instrument.cutoff"
+            })
         }));
         let bass_filter = &parsed.tracks[1].effects[0];
         assert_eq!(
@@ -1461,8 +1557,8 @@ mod tests {
         assert!(parse_project(&routing).is_err());
 
         let control = Project::demo().to_json().replacen(
-            "{\"source\":\"modulator:150\",\"target\":\"instrument.tone\"}",
-            "{\"source\":\"modulator:999\",\"target\":\"instrument.tone\"}",
+            "{\"source\":\"modulator:150\",\"target\":\"instrument.cutoff\"}",
+            "{\"source\":\"modulator:999\",\"target\":\"instrument.cutoff\"}",
             1,
         );
         assert!(parse_project(&control).is_err());

@@ -2092,10 +2092,10 @@ mod tests {
         let response = router.handle(&request(
             "POST",
             "/api/sound-tools",
-            "track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth",
+            "track_id=2&tool=instrument&tool_id=201&parameter=preset&value=Surge+Lead",
         ));
         assert_eq!(response.status, 200);
-        assert!(response.body.contains("\"waveform\":\"sawtooth\""));
+        assert!(response.body.contains("\"preset\":\"Surge Lead\""));
 
         let invalid = router.handle(&request(
             "POST",
@@ -2104,7 +2104,7 @@ mod tests {
         ));
         assert_eq!(invalid.status, 422);
         let project = router.handle(&request("GET", "/api/project", ""));
-        assert!(project.body.contains("\"waveform\":\"sawtooth\""));
+        assert!(project.body.contains("\"preset\":\"Surge Lead\""));
     }
 
     #[test]
@@ -2185,20 +2185,20 @@ mod tests {
             end: 8.0,
             project: project.clone(),
         };
-        let plan = |waveform: &str, summary: &str| EditPlan {
+        let plan = |preset: &str, summary: &str| EditPlan {
             action: crate::prompt::Action::Configure {
                 track_id: 2,
                 target: crate::model::TrackRole::Bass,
                 tool: "instrument",
                 tool_id: 201,
                 clip_id: None,
-                parameter: "waveform",
-                value: waveform.to_owned(),
+                parameter: "preset",
+                value: preset.to_owned(),
             },
             summary: summary.to_owned(),
         };
         let mut session = Studio::from_project(project);
-        let first_plan = plan("sawtooth", "Brightened the bass");
+        let first_plan = plan("Surge Lead", "Brightened the bass");
         session
             .apply_plan(4.0, 8.0, &edit.prompt, first_plan.clone())
             .expect("first session step");
@@ -2225,7 +2225,7 @@ mod tests {
                 .all(|edit| edit.operation_id.is_none())
         );
 
-        let second_plan = plan("triangle", "Softened the bass");
+        let second_plan = plan("Surge Pad", "Softened the bass");
         session
             .apply_plan(4.0, 8.0, &edit.prompt, second_plan.clone())
             .expect("second session step");
@@ -2252,7 +2252,7 @@ mod tests {
 
         let studio = router.lock_studio();
         assert_eq!(studio.project().version, 4);
-        assert_eq!(studio.project().tracks[1].instrument.waveform, "triangle");
+        assert_eq!(studio.project().tracks[1].instrument.preset, "Surge Pad");
         assert_eq!(studio.project().edits.len(), 2);
         assert!(
             studio
@@ -2317,8 +2317,8 @@ mod tests {
                 tool: "instrument",
                 tool_id: 201,
                 clip_id: None,
-                parameter: "waveform",
-                value: "sawtooth".to_owned(),
+                parameter: "preset",
+                value: "Surge Lead".to_owned(),
             },
             summary: "Brightened the bass".to_owned(),
         };
@@ -2418,7 +2418,7 @@ mod tests {
         let (job_id, operation_id, _) = router.edit_jobs.create(750, None).expect("edit job");
         let edit = EditRequest {
             operation_id: operation_id.clone(),
-            prompt: "change the bass waveform".to_owned(),
+            prompt: "change the bass patch".to_owned(),
             start: 4.0,
             end: 8.0,
             project: project.clone(),
@@ -2430,10 +2430,10 @@ mod tests {
                 tool: "instrument",
                 tool_id: 201,
                 clip_id: None,
-                parameter: "waveform",
-                value: "sawtooth".to_owned(),
+                parameter: "preset",
+                value: "Surge Lead".to_owned(),
             },
-            summary: "Changed the bass waveform".to_owned(),
+            summary: "Changed the bass patch".to_owned(),
         };
         let mut session = Studio::from_project(project);
         session
@@ -2458,7 +2458,7 @@ mod tests {
                 job_id,
                 &edit,
                 &mut expected_version,
-                "Changed the bass waveform",
+                "Changed the bass patch",
             )
             .expect("independent completion record");
 
@@ -2479,7 +2479,7 @@ mod tests {
             .find(|operation| operation.operation_id == operation_id)
             .expect("Gemini operation record");
         assert!(completed.completed);
-        assert_eq!(completed.message, "Changed the bass waveform");
+        assert_eq!(completed.message, "Changed the bass patch");
         assert!(studio.project().edit_operations.iter().any(|operation| {
             operation.operation_id == "previous-operation" && operation.completed
         }));
@@ -2517,20 +2517,20 @@ mod tests {
         let response = router.handle(&request(
             "POST",
             "/api/sound-tools",
-            "track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth",
+            "track_id=2&tool=instrument&tool_id=201&parameter=preset&value=Surge+Lead",
         ));
         assert_eq!(response.status, 200);
         let response = router.handle(&request(
             "POST",
             "/api/sound-tools",
-            "track_id=2&tool=modulator&tool_id=250&parameter=target&value=instrument.oscillator2.level",
+            "track_id=2&tool=modulator&tool_id=250&parameter=target&value=instrument.resonance",
         ));
         assert_eq!(response.status, 200);
         let saved = ProjectStore::open(path.clone()).expect("saved project").1;
-        assert_eq!(saved.project().tracks[1].instrument.waveform, "sawtooth");
+        assert_eq!(saved.project().tracks[1].instrument.preset, "Surge Lead");
         assert_eq!(
             saved.project().tracks[1].modulators[0].target,
-            "instrument.oscillator2.level"
+            "instrument.resonance"
         );
         std::fs::remove_file(path).expect("remove test graph");
     }
@@ -2957,11 +2957,11 @@ mod tests {
 
         hostile.path = "/api/sound-tools".to_owned();
         hostile.body =
-            "track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth".to_owned();
+            "track_id=2&tool=instrument&tool_id=201&parameter=preset&value=Surge+Lead".to_owned();
         assert_eq!(router.handle(&hostile).status, 403);
         let project = router.handle(&request("GET", "/api/project", ""));
         let project: serde_json::Value = serde_json::from_str(&project.body).expect("project JSON");
-        assert_eq!(project["tracks"][1]["instrument"]["waveform"], "square");
+        assert_eq!(project["tracks"][1]["instrument"]["preset"], "Surge Bass");
 
         hostile
             .headers
@@ -2979,7 +2979,7 @@ mod tests {
             .insert("origin".to_owned(), "https://studio.example".to_owned());
         assert_eq!(router.handle(&hostile).status, 200);
         let project = router.handle(&request("GET", "/api/project", ""));
-        assert!(project.body.contains("\"waveform\":\"sawtooth\""));
+        assert!(project.body.contains("\"preset\":\"Surge Lead\""));
     }
 
     #[test]
@@ -2988,7 +2988,7 @@ mod tests {
         let mut forwarded = request(
             "POST",
             "/api/sound-tools",
-            "track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth",
+            "track_id=2&tool=instrument&tool_id=201&parameter=preset&value=Surge+Lead",
         );
         forwarded.headers.insert(
             "x-forwarded-host".to_owned(),
@@ -3009,7 +3009,7 @@ mod tests {
         let mut public = request(
             "POST",
             "/api/sound-tools",
-            "track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth",
+            "track_id=2&tool=instrument&tool_id=201&parameter=preset&value=Surge+Lead",
         );
         public
             .headers
@@ -3043,7 +3043,7 @@ mod tests {
         public.method = "POST".to_owned();
         public.path = "/api/sound-tools".to_owned();
         public.body =
-            "track_id=2&tool=instrument&tool_id=201&parameter=waveform&value=sawtooth".to_owned();
+            "track_id=2&tool=instrument&tool_id=201&parameter=preset&value=Surge+Lead".to_owned();
         public.headers.insert(
             "origin".to_owned(),
             "http://music.private.example:8443".to_owned(),
@@ -3054,7 +3054,7 @@ mod tests {
         assert_eq!(router.handle(&public).status, 200);
 
         let project = router.handle(&request("GET", "/api/project", ""));
-        assert!(project.body.contains("\"waveform\":\"sawtooth\""));
+        assert!(project.body.contains("\"preset\":\"Surge Lead\""));
     }
 
     #[test]

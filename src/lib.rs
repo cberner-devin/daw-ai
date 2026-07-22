@@ -7,6 +7,7 @@ mod project_file;
 pub mod prompt;
 pub mod server;
 mod storage;
+mod surge;
 
 pub const DEFAULT_PORT: u16 = 8888;
 

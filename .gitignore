@@ -11,3 +11,6 @@ target/
 # Local DAW-AI project state
 /sound-graph.json
 /.sound-graph.json.*.tmp
+
+# Surge XT's native source checkout, populated by the vendored binding build.
+/vendor/surge-sys/sbmod/

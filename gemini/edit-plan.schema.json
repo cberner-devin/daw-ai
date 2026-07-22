@@ -30,7 +30,7 @@
             "type": "string",
             "anyOf": [
               {
-                "enum": ["None", "MIDI Clip", "sine", "triangle", "sawtooth", "square", "instrument.attack", "instrument.release", "instrument.tone", "instrument.pitch", "instrument.oscillator1.tuning", "instrument.oscillator1.level", "instrument.oscillator2.tuning", "instrument.oscillator2.level", "track.volume", "Reverb", "Room", "Echo", "Chorus", "Low-pass filter", "Punch compressor", "Drive", "Shimmer", "Effects"]
+                "enum": ["None", "MIDI Clip", "Init", "Surge Percussion", "Surge Bass", "Surge Pad", "Surge Lead", "Surge Atmosphere", "instrument.attack", "instrument.release", "instrument.cutoff", "instrument.resonance", "instrument.pitch", "track.volume", "Reverb", "Room", "Echo", "Chorus", "Low-pass filter", "Punch compressor", "Drive", "Shimmer", "Effects"]
               },
               {
                 "pattern": "^effect:[1-9][0-9]*\\.(mix|cutoff|resonance)$"
@@ -63,12 +63,12 @@
           },
           "parameter": {
             "type": "string",
-            "enum": ["None", "waveform", "oscillator1.waveform", "oscillator1.tuning", "oscillator1.level", "oscillator2.waveform", "oscillator2.tuning", "oscillator2.level", "attack", "release", "tone", "mix", "cutoff", "resonance", "enabled", "shape", "rate", "rateMode", "trigger", "depth", "target", "time", "duration", "pitch", "velocity", "position"]
+            "enum": ["None", "preset", "attack", "release", "cutoff", "resonance", "pitch", "mix", "enabled", "shape", "rate", "rateMode", "trigger", "depth", "target", "time", "duration", "velocity", "position"]
           },
           "setting": {
             "type": "string",
             "maxLength": 64,
-            "description": "Text value for configure parameters such as waveform, enabled, shape, rateMode, trigger, or target. Numeric configure parameters may use this string for compatibility but should normally use value."
+            "description": "Text value for configure parameters such as preset, enabled, shape, rateMode, trigger, or target. Numeric configure parameters may use this string for compatibility but should normally use value."
           },
           "start": {
             "type": "number",

@@ -12,6 +12,15 @@ pub(crate) const FILTER_CUTOFF_DEFAULT_HZ: f32 = 1_200.0;
 pub(crate) const FILTER_RESONANCE_MIN: f32 = 0.1;
 pub(crate) const FILTER_RESONANCE_MAX: f32 = 20.0;
 pub(crate) const FILTER_RESONANCE_DEFAULT: f32 = 0.7;
+pub(crate) const SURGE_ENGINE: &str = "Surge XT";
+pub(crate) const SURGE_PRESETS: &[&str] = &[
+    "Init",
+    "Surge Percussion",
+    "Surge Bass",
+    "Surge Pad",
+    "Surge Lead",
+    "Surge Atmosphere",
+];
 
 struct ModulationTarget {
     id: String,
@@ -88,21 +97,15 @@ pub struct Effect {
 }
 
 #[derive(Clone, Debug)]
-pub struct Oscillator {
-    pub waveform: String,
-    pub tuning: f32,
-    pub level: f32,
-}
-
-#[derive(Clone, Debug)]
 pub struct Instrument {
     pub id: u64,
     pub engine: String,
-    pub waveform: String,
-    pub oscillators: Vec<Oscillator>,
+    pub preset: String,
     pub attack: f32,
     pub release: f32,
-    pub tone: f32,
+    pub cutoff: f32,
+    pub resonance: f32,
+    pub pitch: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -382,8 +385,9 @@ impl Track {
             concat!(
                 "{{\"id\":{},\"name\":{},\"role\":{},\"color\":{},",
                 "\"volume\":{},\"muted\":{},\"instrument\":{{",
-                "\"id\":{},\"type\":\"instrument\",\"engine\":{},\"waveform\":{},",
-                "\"oscillators\":["
+                "\"id\":{},\"type\":\"instrument\",\"engine\":{},\"preset\":{},",
+                "\"parameters\":{{\"attack\":{},\"release\":{},",
+                "\"cutoff\":{},\"resonance\":{},\"pitch\":{}}}}},\"effects\":["
             ),
             self.id,
             json_string(&self.name),
@@ -393,32 +397,12 @@ impl Track {
             self.muted,
             self.instrument.id,
             json_string(&self.instrument.engine),
-            json_string(&self.instrument.waveform)
-        )
-        .expect("writing to a string cannot fail");
-
-        for (index, oscillator) in self.instrument.oscillators.iter().enumerate() {
-            if index > 0 {
-                output.push(',');
-            }
-            write!(
-                output,
-                "{{\"waveform\":{},\"tuning\":{},\"level\":{}}}",
-                json_string(&oscillator.waveform),
-                decimal(oscillator.tuning),
-                decimal(oscillator.level)
-            )
-            .expect("writing to a string cannot fail");
-        }
-        write!(
-            output,
-            concat!(
-                "],\"parameters\":{{\"attack\":{},\"release\":{},",
-                "\"tone\":{}}}}},\"effects\":["
-            ),
+            json_string(&self.instrument.preset),
             decimal(self.instrument.attack),
             decimal(self.instrument.release),
-            decimal(self.instrument.tone)
+            decimal(self.instrument.cutoff),
+            decimal(self.instrument.resonance),
+            decimal(self.instrument.pitch)
         )
         .expect("writing to a string cannot fail");
 
@@ -851,13 +835,13 @@ impl Action {
                 "{{\"type\":\"add-track\",\"target\":{}}}",
                 json_string(role.as_str())
             ),
-            Self::Instrument { waveform, target } => write!(
+            Self::Instrument { preset, target } => write!(
                 output,
                 concat!(
                     "{{\"type\":\"instrument\",\"name\":{},",
                     "\"value\":0.0,\"target\":{}}}"
                 ),
-                json_string(waveform),
+                json_string(preset),
                 json_string(target.as_str())
             ),
             Self::Modulator {
@@ -1269,12 +1253,14 @@ impl Studio {
                 self.project.bpm = *bpm;
                 Ok(())
             }
-            Action::Instrument { waveform, target } => {
+            Action::Instrument { preset, target } => {
                 let track_index = role_action_track_index(&self.project, *target, None)
                     .ok_or(StudioError::UnknownTrack)?;
                 let instrument = &mut self.project.tracks[track_index].instrument;
-                instrument.waveform = (*waveform).to_owned();
-                instrument.oscillators[0].waveform = (*waveform).to_owned();
+                if !valid_surge_preset(preset) {
+                    return Err(StudioError::InvalidSoundTool);
+                }
+                instrument.preset = (*preset).to_owned();
                 Ok(())
             }
             Action::Modulator {
@@ -1794,44 +1780,27 @@ fn configure_instrument(
     if instrument.id != tool_id {
         return Err(StudioError::UnknownSoundTool);
     }
-    if let Some((index, oscillator_parameter)) = oscillator_parameter(parameter) {
-        let oscillator = instrument
-            .oscillators
-            .get_mut(index)
-            .ok_or(StudioError::UnknownSoundTool)?;
-        match oscillator_parameter {
-            "waveform" if valid_waveform(value) => oscillator.waveform = value.to_owned(),
-            "tuning" => oscillator.tuning = parse_range(value, -24.0, 24.0)?,
-            "level" => oscillator.level = parse_range(value, 0.0, 1.0)?,
-            _ => return Err(StudioError::InvalidSoundTool),
-        }
-        if index == 0 {
-            instrument.waveform.clone_from(&oscillator.waveform);
-        }
-        return Ok(());
+    if parameter == "preset" {
+        return if valid_surge_preset(value) {
+            instrument.preset = value.to_owned();
+            Ok(())
+        } else {
+            Err(StudioError::InvalidSoundTool)
+        };
     }
     match parameter {
-        "waveform" if valid_waveform(value) => {
-            instrument.waveform = value.to_owned();
-            instrument.oscillators[0].waveform = value.to_owned();
-        }
-        "attack" => instrument.attack = parse_range(value, 0.001, 2.0)?,
-        "release" => instrument.release = parse_range(value, 0.02, 5.0)?,
-        "tone" => instrument.tone = parse_range(value, 0.0, 1.0)?,
+        "attack" => instrument.attack = parse_range(value, 0.0, 1.0)?,
+        "release" => instrument.release = parse_range(value, 0.0, 1.0)?,
+        "cutoff" => instrument.cutoff = parse_range(value, 0.0, 1.0)?,
+        "resonance" => instrument.resonance = parse_range(value, 0.0, 1.0)?,
+        "pitch" => instrument.pitch = parse_range(value, 0.0, 1.0)?,
         _ => return Err(StudioError::InvalidSoundTool),
     }
     Ok(())
 }
 
-fn oscillator_parameter(parameter: &str) -> Option<(usize, &str)> {
-    let parameter = parameter.strip_prefix("oscillator")?;
-    let (number, parameter) = parameter.split_once('.')?;
-    let index = number.parse::<usize>().ok()?.checked_sub(1)?;
-    Some((index, parameter))
-}
-
-fn valid_waveform(value: &str) -> bool {
-    matches!(value, "sine" | "triangle" | "sawtooth" | "square")
+pub(crate) fn valid_surge_preset(value: &str) -> bool {
+    SURGE_PRESETS.contains(&value)
 }
 
 fn parse_range(value: &str, minimum: f32, maximum: f32) -> Result<f32, StudioError> {
@@ -1870,23 +1839,31 @@ fn modulation_targets(track: &Track) -> Vec<ModulationTarget> {
     let mut targets = vec![
         ModulationTarget {
             id: "instrument.attack".to_owned(),
-            label: "Instrument attack".to_owned(),
-            minimum: 0.001,
-            maximum: 2.0,
-            scale: 0.5,
+            label: "Surge amp envelope attack".to_owned(),
+            minimum: 0.0,
+            maximum: 1.0,
+            scale: 1.0,
             mode: "add",
         },
         ModulationTarget {
             id: "instrument.release".to_owned(),
-            label: "Instrument release".to_owned(),
-            minimum: 0.02,
-            maximum: 5.0,
-            scale: 2.0,
+            label: "Surge amp envelope release".to_owned(),
+            minimum: 0.0,
+            maximum: 1.0,
+            scale: 1.0,
             mode: "add",
         },
         ModulationTarget {
-            id: "instrument.tone".to_owned(),
-            label: "Instrument tone".to_owned(),
+            id: "instrument.cutoff".to_owned(),
+            label: "Surge filter 1 cutoff".to_owned(),
+            minimum: 0.0,
+            maximum: 1.0,
+            scale: 1.0,
+            mode: "add",
+        },
+        ModulationTarget {
+            id: "instrument.resonance".to_owned(),
+            label: "Surge filter 1 resonance".to_owned(),
             minimum: 0.0,
             maximum: 1.0,
             scale: 1.0,
@@ -1894,10 +1871,10 @@ fn modulation_targets(track: &Track) -> Vec<ModulationTarget> {
         },
         ModulationTarget {
             id: "instrument.pitch".to_owned(),
-            label: "Instrument pitch".to_owned(),
-            minimum: -2.0,
-            maximum: 2.0,
-            scale: 2.0,
+            label: "Surge scene pitch".to_owned(),
+            minimum: 0.0,
+            maximum: 1.0,
+            scale: 0.1,
             mode: "add",
         },
         ModulationTarget {
@@ -1909,25 +1886,6 @@ fn modulation_targets(track: &Track) -> Vec<ModulationTarget> {
             mode: "multiply",
         },
     ];
-    for (index, _) in track.instrument.oscillators.iter().enumerate() {
-        let number = index + 1;
-        targets.push(ModulationTarget {
-            id: format!("instrument.oscillator{number}.tuning"),
-            label: format!("Oscillator {number} tuning"),
-            minimum: -24.0,
-            maximum: 24.0,
-            scale: 12.0,
-            mode: "add",
-        });
-        targets.push(ModulationTarget {
-            id: format!("instrument.oscillator{number}.level"),
-            label: format!("Oscillator {number} level"),
-            minimum: 0.0,
-            maximum: 1.0,
-            scale: 1.0,
-            mode: "add",
-        });
-    }
     for effect in &track.effects {
         targets.push(ModulationTarget {
             id: format!("effect:{}.mix", effect.id),
@@ -2034,48 +1992,43 @@ fn demo_track(id: u64, role: TrackRole, name: &str, color: &str) -> Track {
 }
 
 fn generated_track(id: u64, role: TrackRole) -> Track {
-    let (name, color, engine, waveform, attack, release, tone, effect_specs, modulator) = match role
-    {
+    let (name, color, preset, attack, release, cutoff, effect_specs, modulator) = match role {
         TrackRole::Drums => (
             "AI Drum Rack",
             "#ffb86b",
-            "Synthesized drum rack",
-            "sine",
-            0.002,
-            0.18,
+            "Surge Percussion",
+            0.0,
+            0.25,
             0.82,
             vec![("Punch compressor", 0.34)],
-            ("Pulse envelope", "envelope", 2.0, 0.12, "instrument.tone"),
+            ("Pulse envelope", "envelope", 2.0, 0.12, "instrument.cutoff"),
         ),
         TrackRole::Bass => (
             "AI Bass",
             "#74e0bc",
-            "Monophonic subtractive synth",
-            "square",
-            0.008,
-            0.18,
-            0.32,
+            "Surge Bass",
+            0.02,
+            0.3,
+            0.45,
             vec![("Low-pass filter", 0.46)],
-            ("Bass movement", "sine", 0.25, 0.18, "instrument.tone"),
+            ("Bass movement", "sine", 0.25, 0.18, "instrument.cutoff"),
         ),
         TrackRole::Chords => (
             "AI Chords",
             "#8ca9ff",
-            "Polyphonic pad",
-            "triangle",
-            0.09,
-            1.2,
-            0.48,
+            "Surge Pad",
+            0.36,
+            0.62,
+            0.58,
             vec![("Chorus", 0.28), ("Room", 0.2)],
-            ("Slow bloom", "triangle", 0.125, 0.16, "instrument.tone"),
+            ("Slow bloom", "triangle", 0.125, 0.16, "instrument.cutoff"),
         ),
         TrackRole::Lead => (
             "AI Lead",
             "#d99cff",
-            "Monophonic lead synth",
-            "sawtooth",
-            0.012,
-            0.32,
+            "Surge Lead",
+            0.02,
+            0.38,
             0.64,
             vec![("Echo", 0.24)],
             ("Lead vibrato", "sine", 5.0, 0.08, "instrument.pitch"),
@@ -2083,13 +2036,18 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
         TrackRole::Texture => (
             "AI Texture",
             "#ff91ad",
-            "Granular atmosphere",
-            "sine",
-            0.6,
-            2.4,
+            "Surge Atmosphere",
+            0.58,
+            0.74,
             0.7,
             vec![("Shimmer", 0.38)],
-            ("Atmosphere drift", "random", 0.18, 0.22, "instrument.tone"),
+            (
+                "Atmosphere drift",
+                "random",
+                0.18,
+                0.22,
+                "instrument.cutoff",
+            ),
         ),
     };
 
@@ -2107,36 +2065,22 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
         role,
         color: color.to_owned(),
         volume: match role {
-            TrackRole::Drums => 0.82,
-            TrackRole::Bass => 0.74,
-            TrackRole::Chords => 0.58,
+            TrackRole::Drums => 0.78,
+            TrackRole::Bass => 0.95,
+            TrackRole::Chords => 0.85,
             TrackRole::Lead => 0.56,
             TrackRole::Texture => 0.44,
         },
         muted: false,
         instrument: Instrument {
             id: instrument_id,
-            engine: engine.to_owned(),
-            waveform: waveform.to_owned(),
-            oscillators: vec![
-                Oscillator {
-                    waveform: waveform.to_owned(),
-                    tuning: 0.0,
-                    level: 0.72,
-                },
-                Oscillator {
-                    waveform: secondary_waveform(waveform).to_owned(),
-                    tuning: match role {
-                        TrackRole::Bass => -12.0,
-                        TrackRole::Chords | TrackRole::Texture => 12.0,
-                        _ => 0.0,
-                    },
-                    level: 0.28,
-                },
-            ],
+            engine: SURGE_ENGINE.to_owned(),
+            preset: preset.to_owned(),
             attack,
             release,
-            tone,
+            cutoff,
+            resonance: 0.18,
+            pitch: 0.5,
         },
         effects,
         modulators: vec![Modulator {
@@ -2159,15 +2103,6 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
             output: "master".to_owned(),
         },
         clips: Vec::new(),
-    }
-}
-
-fn secondary_waveform(primary: &str) -> &'static str {
-    match primary {
-        "sine" => "triangle",
-        "triangle" => "sine",
-        "sawtooth" => "square",
-        _ => "sawtooth",
     }
 }
 
@@ -2302,11 +2237,19 @@ mod tests {
         let project = Project::demo();
         assert_eq!(project.bpm, 112);
         assert_eq!(project.tracks.len(), 3);
+        assert!(
+            project
+                .tracks
+                .iter()
+                .all(|track| track.instrument.engine == SURGE_ENGINE)
+        );
+        assert_eq!(project.tracks[0].instrument.preset, "Surge Percussion");
+        assert_eq!(project.tracks[1].instrument.preset, "Surge Bass");
+        assert_eq!(project.tracks[2].instrument.preset, "Surge Pad");
         assert!(project.tracks.iter().all(|track| !track.clips.is_empty()));
         assert!(project.tracks.iter().all(|track| {
             !track.clips[0].events.is_empty()
                 && !track.modulators.is_empty()
-                && track.instrument.oscillators.len() >= 2
                 && track.routing.effect_order.len() == track.effects.len()
         }));
         let json = project.to_json();
@@ -2320,10 +2263,48 @@ mod tests {
             "\"source\":\"instrument:101\",\"target\":\"effect:110\",\"type\":\"audio\""
         ));
         assert!(json.contains(
-            "\"source\":\"modulator:150\",\"target\":\"instrument.tone\",\"type\":\"control\""
+            "\"source\":\"modulator:150\",\"target\":\"instrument.cutoff\",\"type\":\"control\""
         ));
         assert!(
             json.contains("\"source\":\"clips\",\"target\":\"modulator:150\",\"type\":\"midi\"")
+        );
+    }
+
+    #[test]
+    fn surge_presets_and_native_parameters_are_configurable() {
+        let mut studio = Studio::new();
+        let bass_id = studio.project().tracks[1].id;
+        let instrument_id = studio.project().tracks[1].instrument.id;
+
+        studio
+            .configure_sound_tool(
+                bass_id,
+                "instrument",
+                instrument_id,
+                None,
+                "preset",
+                "Surge Pad",
+            )
+            .expect("published Surge preset");
+        let instrument = &studio.project().tracks[1].instrument;
+        assert_eq!(instrument.engine, SURGE_ENGINE);
+        assert_eq!(instrument.preset, "Surge Pad");
+
+        studio
+            .configure_sound_tool(bass_id, "instrument", instrument_id, None, "cutoff", "0.4")
+            .expect("manual Surge parameter");
+        assert_eq!(studio.project().tracks[1].instrument.cutoff, 0.4);
+        assert_eq!(studio.project().tracks[1].instrument.preset, "Surge Pad");
+        assert_eq!(
+            studio.configure_sound_tool(
+                bass_id,
+                "instrument",
+                instrument_id,
+                None,
+                "preset",
+                "Unknown",
+            ),
+            Err(StudioError::InvalidSoundTool)
         );
     }
 
@@ -2373,45 +2354,24 @@ mod tests {
         let later_effect_id = studio.project().tracks[2].routing.effect_order[1];
 
         studio
-            .configure_sound_tool(
-                bass_id,
-                "instrument",
-                instrument_id,
-                None,
-                "waveform",
-                "sawtooth",
-            )
+            .configure_sound_tool(bass_id, "instrument", instrument_id, None, "attack", "0.12")
             .expect("configurable instrument");
         studio
-            .configure_sound_tool(
-                bass_id,
-                "instrument",
-                instrument_id,
-                None,
-                "oscillator1.tuning",
-                "7",
-            )
-            .expect("configurable primary oscillator tuning");
+            .configure_sound_tool(bass_id, "instrument", instrument_id, None, "cutoff", "0.41")
+            .expect("configurable Surge cutoff");
         studio
             .configure_sound_tool(
                 bass_id,
                 "instrument",
                 instrument_id,
                 None,
-                "oscillator2.waveform",
-                "triangle",
+                "resonance",
+                "0.27",
             )
-            .expect("configurable secondary oscillator waveform");
+            .expect("configurable Surge resonance");
         studio
-            .configure_sound_tool(
-                bass_id,
-                "instrument",
-                instrument_id,
-                None,
-                "oscillator2.level",
-                "0.41",
-            )
-            .expect("configurable secondary oscillator level");
+            .configure_sound_tool(bass_id, "instrument", instrument_id, None, "pitch", "0.55")
+            .expect("configurable Surge pitch");
         studio
             .configure_sound_tool(bass_id, "effect", effect_id, None, "mix", "0.72")
             .expect("configurable effect");
@@ -2462,11 +2422,10 @@ mod tests {
             .expect("configurable effect routing");
 
         let bass = &studio.project().tracks[1];
-        assert_eq!(bass.instrument.waveform, "sawtooth");
-        assert_eq!(bass.instrument.oscillators[0].waveform, "sawtooth");
-        assert_eq!(bass.instrument.oscillators[0].tuning, 7.0);
-        assert_eq!(bass.instrument.oscillators[1].waveform, "triangle");
-        assert_eq!(bass.instrument.oscillators[1].level, 0.41);
+        assert_eq!(bass.instrument.attack, 0.12);
+        assert_eq!(bass.instrument.cutoff, 0.41);
+        assert_eq!(bass.instrument.resonance, 0.27);
+        assert_eq!(bass.instrument.pitch, 0.55);
         assert_eq!(bass.effects[0].mix, 0.72);
         assert_eq!(bass.effects[0].cutoff_hz, Some(640.0));
         assert_eq!(bass.effects[0].resonance, Some(8.5));
@@ -2503,10 +2462,9 @@ mod tests {
 
         assert!(targets.contains(&"instrument.attack".to_owned()));
         assert!(targets.contains(&"instrument.release".to_owned()));
-        assert!(targets.contains(&"instrument.tone".to_owned()));
+        assert!(targets.contains(&"instrument.cutoff".to_owned()));
         assert!(targets.contains(&"instrument.pitch".to_owned()));
-        assert!(targets.contains(&"instrument.oscillator1.tuning".to_owned()));
-        assert!(targets.contains(&"instrument.oscillator2.level".to_owned()));
+        assert!(targets.contains(&"instrument.resonance".to_owned()));
         assert!(targets.contains(&"track.volume".to_owned()));
         assert!(targets.contains(&"effect:210.mix".to_owned()));
         assert!(targets.contains(&"effect:210.cutoff".to_owned()));
@@ -2676,7 +2634,7 @@ mod tests {
         for index in 0..30 {
             let plan = crate::prompt::EditPlan {
                 action: Action::Modulator {
-                    parameter: "instrument.tone".to_owned(),
+                    parameter: "instrument.cutoff".to_owned(),
                     shape: "sine",
                     rate: 0.5,
                     depth: 0.2,
@@ -2748,7 +2706,7 @@ mod tests {
                         role: TrackRole::Bass,
                     },
                     Action::Instrument {
-                        waveform: "sawtooth",
+                        preset: "Surge Lead",
                         target: TrackRole::Bass,
                     },
                     Action::Modulator {
@@ -2774,9 +2732,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(basses.len(), 2);
         assert_eq!(basses[0].id, original_bass_id);
-        assert_eq!(basses[0].instrument.waveform, "square");
+        assert_eq!(basses[0].instrument.preset, "Surge Bass");
         assert_eq!(basses[0].modulators.len(), 1);
-        assert_eq!(basses[1].instrument.waveform, "sawtooth");
+        assert_eq!(basses[1].instrument.preset, "Surge Lead");
         assert_eq!(basses[1].modulators.len(), 2);
         assert_eq!(basses[1].modulators[1].target, "instrument.attack");
 
@@ -2892,7 +2850,7 @@ mod tests {
             .iter()
             .find(|track| track.id == original_bass_id)
             .expect("original bass");
-        assert_eq!(original_bass.instrument.waveform, "square");
+        assert_eq!(original_bass.instrument.preset, "Surge Bass");
         assert_eq!(original_bass.modulators[0].id, original_bass_modulator.id);
         assert_eq!(
             original_bass.modulators[0].shape,
@@ -2925,14 +2883,14 @@ mod tests {
             })
             .expect("bass track");
         let drop_bass_id = bass.id;
-        assert_eq!(bass.instrument.waveform, "sawtooth");
+        assert_eq!(bass.instrument.preset, "Surge Bass");
         assert!(
             bass.clips
                 .iter()
                 .any(|clip| clip.label == "Syncopated bass")
         );
         let wobble = bass.modulators.last().expect("authored bass modulation");
-        assert_eq!(wobble.target, "instrument.tone");
+        assert_eq!(wobble.target, "instrument.cutoff");
         assert_eq!(wobble.shape, "square");
         assert_eq!(wobble.rate, 2.0);
         assert_eq!(wobble.depth, 0.72);
@@ -3350,7 +3308,7 @@ mod tests {
 
         for dependent in [
             Action::Instrument {
-                waveform: "sawtooth",
+                preset: "Surge Lead",
                 target: TrackRole::Lead,
             },
             Action::Modulator {
@@ -3451,8 +3409,8 @@ mod tests {
                 tool: "instrument",
                 tool_id: 201,
                 clip_id: None,
-                parameter: "waveform",
-                value: "sawtooth".to_owned(),
+                parameter: "preset",
+                value: "Surge Lead".to_owned(),
             },
             summary: "Brightened the bass".to_owned(),
         };
@@ -3472,7 +3430,7 @@ mod tests {
             .expect("valid graph replacement");
         assert_eq!(studio.project().edits.len(), 1);
         assert_eq!(studio.project().version, 2);
-        assert_eq!(studio.project().tracks[1].instrument.waveform, "sawtooth");
+        assert_eq!(studio.project().tracks[1].instrument.preset, "Surge Lead");
         assert!(studio.undo());
         let mut restored = studio.project().clone();
         restored.version = 1;
