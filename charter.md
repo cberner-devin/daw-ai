@@ -38,12 +38,17 @@ Instruments, modulators, and effects are shown in an associated sound graph. Cli
 a side pane that displays the relevant parameters and settings.
 
 These two views are separate tabs, each filling most of the screen, and there is a prominent tab near the top to
-switch between AI Mode and Advanced.
+switch between AI Mode, Advanced, and Debug.
+
+#### Debug
 
 There is also a third tab "Debug" which is a debugging pane showing error information, and other information
 that is useful to a coding assistant. The information is easy for the user to copy and paste into an
 external coding assistant, if they need help debugging issues in DAW AI itself. It can be assumed that
 the user and coding assistant have access to the machine DAW AI is deployed on, to read additional logs...etc.
+
+This tab also has a dropdown selector to change the Instrument between "Surge XT" and "built-in". The
+latter uses a built-in custom audio engine. Surge XT is the default.
 
 ### Sound tools
 
@@ -58,9 +63,12 @@ Contains notes, including their timing, duration, pitch, and velocity.
 #### Instrument:
 Produces sound from MIDI events.
 
-For the current MVP, this should be a basic implementation, which relying on [Surge XT](https://surge-synthesizer.github.io/) as the only synthesizer
+For the current MVP, this should be a basic implementation, which relying on [Surge XT](https://surge-synthesizer.github.io/) as the synthesizer
 and exposes basic presets and parameters. Use the official [surge-rs](https://github.com/surge-synthesizer/surge-rs) Rust bindings.
 They are alpha quality, so if there are critical bugs, it is ok to vendor it and patch the bugs.
+
+There is also a separate "built-in" backend that is entirely custom. This does not need to be production quality, and is mainly for debugging.
+Apply reasonable effort here to make it sound good and support the same range of things as we use from Surge for the Surge synthesizer.
 
 #### Effect
 Processes sound produced by an instrument, such as a filter, distortion, compressor, delay, or reverb, and exposes configurable parameters. May be chained with previous Effect.
