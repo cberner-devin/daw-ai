@@ -147,12 +147,12 @@ mod tests {
         let path = temporary_project_path("store");
         let (store, mut studio) = ProjectStore::open(path.clone()).expect("new store");
         studio
-            .configure_sound_tool(2, "instrument", 201, None, "waveform", "sawtooth")
+            .configure_sound_tool(2, "instrument", 201, None, "preset", "Surge Lead")
             .expect("valid graph edit");
         store.save(studio.project()).expect("saved graph");
 
         let (_, reloaded) = ProjectStore::open(path.clone()).expect("reloaded store");
-        assert!(reloaded.to_json().contains("\"waveform\":\"sawtooth\""));
+        assert!(reloaded.to_json().contains("\"preset\":\"Surge Lead\""));
         fs::remove_file(path).expect("remove test graph");
     }
 

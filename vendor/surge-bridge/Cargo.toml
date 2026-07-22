@@ -1,0 +1,15 @@
+[package]
+name = "surge-bridge"
+version = "0.1.0"
+authors = ["NV4 <cattobyte@kyararanbii.xyz>"]
+edition = "2024"
+description = "(Official) Opinionated FFI extensions for the Surge XT synthesizer."
+license = "GPL-3.0-or-later"
+keywords = ["audio", "synthesis", "ffi"]
+categories = ["multimedia::audio", "external-ffi-bindings"]
+
+[dependencies]
+surge-sys = { path = "../surge-sys" }
+
+[build-dependencies]
+cc = "1.2.57"

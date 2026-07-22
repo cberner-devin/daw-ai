@@ -970,7 +970,7 @@ fn action_from_json(value: &JsonValue) -> Result<Action, PlannerError> {
             .map(|role| Action::AddTrack { role })
             .ok_or_else(|| invalid("add-track requires a role target")),
         "instrument" if value == 0.0 => Ok(Action::Instrument {
-            waveform: waveform_name(name)?,
+            preset: surge_preset_name(name)?,
             target: target.ok_or_else(|| invalid("instrument requires a role target"))?,
         }),
         "modulator" if (0.0..=1.0).contains(&value) => Ok(Action::Modulator {
@@ -1162,13 +1162,15 @@ fn effect_name(name: &str, allow_all: bool) -> Result<&'static str, PlannerError
     }
 }
 
-fn waveform_name(name: &str) -> Result<&'static str, PlannerError> {
+fn surge_preset_name(name: &str) -> Result<&'static str, PlannerError> {
     match name {
-        "sine" => Ok("sine"),
-        "triangle" => Ok("triangle"),
-        "sawtooth" => Ok("sawtooth"),
-        "square" => Ok("square"),
-        _ => Err(invalid("unknown instrument waveform")),
+        "Init" => Ok("Init"),
+        "Surge Percussion" => Ok("Surge Percussion"),
+        "Surge Bass" => Ok("Surge Bass"),
+        "Surge Pad" => Ok("Surge Pad"),
+        "Surge Lead" => Ok("Surge Lead"),
+        "Surge Atmosphere" => Ok("Surge Atmosphere"),
+        _ => Err(invalid("unknown Surge XT starter patch")),
     }
 }
 
@@ -1176,12 +1178,9 @@ fn modulator_parameter(name: &str) -> Result<String, PlannerError> {
     match name {
         "instrument.attack"
         | "instrument.release"
-        | "instrument.tone"
+        | "instrument.cutoff"
+        | "instrument.resonance"
         | "instrument.pitch"
-        | "instrument.oscillator1.tuning"
-        | "instrument.oscillator1.level"
-        | "instrument.oscillator2.tuning"
-        | "instrument.oscillator2.level"
         | "track.volume" => Ok(name.to_owned()),
         _ if effect_modulation_target(name).is_some() => Ok(name.to_owned()),
         _ => Err(invalid("unknown modulation target")),
@@ -1256,19 +1255,13 @@ fn sound_tool_name(name: &str) -> Result<&'static str, PlannerError> {
 
 fn sound_parameter_name(name: &str) -> Result<&'static str, PlannerError> {
     match name {
-        "waveform" => Ok("waveform"),
-        "oscillator1.waveform" => Ok("oscillator1.waveform"),
-        "oscillator1.tuning" => Ok("oscillator1.tuning"),
-        "oscillator1.level" => Ok("oscillator1.level"),
-        "oscillator2.waveform" => Ok("oscillator2.waveform"),
-        "oscillator2.tuning" => Ok("oscillator2.tuning"),
-        "oscillator2.level" => Ok("oscillator2.level"),
+        "preset" => Ok("preset"),
         "attack" => Ok("attack"),
         "release" => Ok("release"),
-        "tone" => Ok("tone"),
         "mix" => Ok("mix"),
         "cutoff" => Ok("cutoff"),
         "resonance" => Ok("resonance"),
+        "pitch" => Ok("pitch"),
         "enabled" => Ok("enabled"),
         "shape" => Ok("shape"),
         "rate" => Ok("rate"),
@@ -1278,7 +1271,6 @@ fn sound_parameter_name(name: &str) -> Result<&'static str, PlannerError> {
         "target" => Ok("target"),
         "time" => Ok("time"),
         "duration" => Ok("duration"),
-        "pitch" => Ok("pitch"),
         "velocity" => Ok("velocity"),
         "position" => Ok("position"),
         _ => Err(invalid("unknown sound-tool parameter")),
@@ -1299,13 +1291,8 @@ fn configuration_value(
     }
     if matches!(
         parameter,
-        "oscillator1.tuning"
-            | "oscillator1.level"
-            | "oscillator2.tuning"
-            | "oscillator2.level"
-            | "attack"
+        "attack"
             | "release"
-            | "tone"
             | "mix"
             | "cutoff"
             | "resonance"
@@ -1413,14 +1400,14 @@ mod tests {
         );
     }
 
-    fn waveform_edit(waveform: &str) -> JsonValue {
+    fn preset_edit(preset: &str) -> JsonValue {
         serde_json::json!({
-            "summary": "Changed the bass waveform",
+            "summary": "Changed the bass patch",
             "musicalPlan": "Give the bass a brighter harmonic profile.",
             "actions": [{
                 "kind": "configure", "target": "bass", "name": "None", "value": 0,
                 "trackId": 2, "tool": "instrument", "toolId": 201, "clipId": 0,
-                "parameter": "waveform", "setting": waveform, "start": 0, "end": 1,
+                "parameter": "preset", "setting": preset, "start": 0, "end": 1,
                 "rate": 0, "events": []
             }]
         })
@@ -1436,7 +1423,7 @@ mod tests {
         let blocked = execute_tool(
             &session,
             1,
-            &call(APPLY_TOOL_NAME, waveform_edit("sawtooth")),
+            &call(APPLY_TOOL_NAME, preset_edit("Surge Lead")),
             &mut state,
             &mut render_audio,
             &mut |_| {
@@ -1476,7 +1463,7 @@ mod tests {
         execute_tool(
             &session,
             3,
-            &call(APPLY_TOOL_NAME, waveform_edit("sawtooth")),
+            &call(APPLY_TOOL_NAME, preset_edit("Surge Lead")),
             &mut state,
             &mut render_audio,
             &mut |_| {
@@ -1491,7 +1478,7 @@ mod tests {
         let blocked = execute_tool(
             &session,
             4,
-            &call(APPLY_TOOL_NAME, waveform_edit("triangle")),
+            &call(APPLY_TOOL_NAME, preset_edit("Surge Pad")),
             &mut state,
             &mut render_audio,
             &mut |_| Ok(()),
@@ -1601,11 +1588,11 @@ mod tests {
                 {
                     "kind": "configure", "target": "bass", "name": "None", "value": 0,
                     "trackId": 2, "tool": "instrument", "toolId": 201, "clipId": 0,
-                    "parameter": "waveform", "setting": "sawtooth", "start": 0, "end": 1,
+                    "parameter": "preset", "setting": "Surge Bass", "start": 0, "end": 1,
                     "rate": 0, "events": []
                 },
                 {
-                    "kind": "modulator", "target": "bass", "name": "instrument.tone", "value": 0.72,
+                    "kind": "modulator", "target": "bass", "name": "instrument.cutoff", "value": 0.72,
                     "trackId": 0, "tool": "None", "toolId": 0, "clipId": 0,
                     "parameter": "None", "setting": "square", "start": 0, "end": 1,
                     "rate": 4, "events": []
@@ -1624,7 +1611,7 @@ mod tests {
                 }
             ]
         });
-        let revision = waveform_edit("square");
+        let revision = preset_edit("Surge Bass");
         let responses = [
             serde_json::json!({
                 "id": "i1", "status": "requires_action", "steps": [
@@ -2015,8 +2002,8 @@ mod tests {
                 "summary":"Changed the bass source and added movement",
                 "musicalPlan":"Use a bright bass oscillator and square-wave tone modulation.",
                 "actions":[
-                    {"kind":"instrument","target":"bass","name":"sawtooth","value":0},
-                    {"kind":"modulator","target":"bass","name":"instrument.tone","value":0.25,"setting":"square","rate":2}
+                    {"kind":"instrument","target":"bass","name":"Surge Lead","value":0},
+                    {"kind":"modulator","target":"bass","name":"instrument.cutoff","value":0.25,"setting":"square","rate":2}
                 ]
             }"#,
         )
@@ -2026,11 +2013,11 @@ mod tests {
             Action::Compound {
                 actions: vec![
                     Action::Instrument {
-                        waveform: "sawtooth",
+                        preset: "Surge Lead",
                         target: TrackRole::Bass,
                     },
                     Action::Modulator {
-                        parameter: "instrument.tone".to_owned(),
+                        parameter: "instrument.cutoff".to_owned(),
                         shape: "square",
                         rate: 2.0,
                         depth: 0.25,

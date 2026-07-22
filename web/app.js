@@ -74,6 +74,7 @@
   const PENDING_EDIT_STORAGE_KEY = "daw-ai.pending-edit.v1";
   const AUDIO_RETRY_DELAYS_MS = [250, 500, 1000];
   const AUDIO_SEEK_DEBOUNCE_MS = 200;
+  const SURGE_PRESETS = ["Init", "Surge Percussion", "Surge Bass", "Surge Pad", "Surge Lead", "Surge Atmosphere"];
 
   class AudioEngine {
     constructor() {
@@ -533,13 +534,19 @@
           </label>
           <div class="sound-tool instrument-tool">
             <div class="tool-heading"><div><span>Instrument</span><strong>${escapeHtml(track.instrument.engine)}</strong></div><code>#${track.instrument.id}</code></div>
-            <div class="oscillator-stack">
-              ${track.instrument.oscillators.map((oscillator, index) => renderOscillator(track, oscillator, index)).join("")}
+            <div class="tool-controls instrument-preset-controls">
+              <label class="tool-control">Preset
+                <select data-sound-tool="instrument" data-track-id="${track.id}" data-tool-id="${track.instrument.id}" data-parameter="preset" data-control-key="${track.id}-instrument-${track.instrument.id}-preset" aria-label="${escapeHtml(`${track.name} instrument #${track.instrument.id} Surge XT preset`)}">
+                  ${selectOptions(SURGE_PRESETS, track.instrument.preset)}
+                </select>
+              </label>
             </div>
             <div class="tool-controls instrument-envelope-controls">
-              ${soundRange(track, "instrument", track.instrument.id, "instrument", "attack", track.instrument.parameters.attack, 0.001, 2, "s")}
-              ${soundRange(track, "instrument", track.instrument.id, "instrument", "release", track.instrument.parameters.release, 0.02, 5, "s")}
-              ${soundRange(track, "instrument", track.instrument.id, "instrument", "tone", track.instrument.parameters.tone, 0, 1, "%")}
+              ${soundRange(track, "instrument", track.instrument.id, "instrument", "attack", track.instrument.parameters.attack, 0, 1, "%", "", "Amp EG attack")}
+              ${soundRange(track, "instrument", track.instrument.id, "instrument", "release", track.instrument.parameters.release, 0, 1, "%", "", "Amp EG release")}
+              ${soundRange(track, "instrument", track.instrument.id, "instrument", "cutoff", track.instrument.parameters.cutoff, 0, 1, "%", "", "Filter 1 cutoff")}
+              ${soundRange(track, "instrument", track.instrument.id, "instrument", "resonance", track.instrument.parameters.resonance, 0, 1, "%", "", "Filter 1 resonance")}
+              ${soundRange(track, "instrument", track.instrument.id, "instrument", "pitch", track.instrument.parameters.pitch, 0, 1, "%", "", "Scene pitch")}
             </div>
           </div>
           <div class="sound-tool effects-tool">
@@ -647,24 +654,6 @@
     return `<label class="tool-control">${escapeHtml(label)}
       <span class="range-with-output"><input type="range" min="${minimum}" max="${maximum}" step="any" value="${value}" data-sound-tool="${tool}" data-track-id="${track.id}" data-tool-id="${toolId}" data-parameter="${parameter}" data-unit="${unit}" data-control-key="${key}"${clipAttribute} aria-label="${escapeHtml(accessibleName)}"><output>${formatSoundValue(value, unit)}</output></span>
     </label>`;
-  }
-
-  function renderOscillator(track, oscillator, index) {
-    const number = index + 1;
-    const prefix = `oscillator${number}`;
-    const waveformParameter = index === 0 ? "waveform" : `${prefix}.waveform`;
-    return `<div class="oscillator-card">
-      <strong>Oscillator ${number}</strong>
-      <div class="tool-controls">
-        <label class="tool-control">Waveform
-          <select data-sound-tool="instrument" data-track-id="${track.id}" data-tool-id="${track.instrument.id}" data-parameter="${waveformParameter}" data-control-key="${track.id}-instrument-${track.instrument.id}-${waveformParameter}" aria-label="${escapeHtml(`${track.name} instrument #${track.instrument.id} oscillator ${number} waveform`)}">
-            ${selectOptions(["sine", "triangle", "sawtooth", "square"], oscillator.waveform)}
-          </select>
-        </label>
-        ${soundRange(track, "instrument", track.instrument.id, "instrument", `${prefix}.tuning`, oscillator.tuning, -24, 24, "st", "", "Tuning")}
-        ${soundRange(track, "instrument", track.instrument.id, "instrument", `${prefix}.level`, oscillator.level, 0, 1, "%", "", "Level")}
-      </div>
-    </div>`;
   }
 
   function soundToggle(track, tool, toolId, name, enabled) {

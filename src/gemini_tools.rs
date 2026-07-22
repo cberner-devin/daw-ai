@@ -312,7 +312,7 @@ pub(crate) fn prepare_audio_render(
     let project = current_project(session_path)?;
     let (track_ids, start, end) = audio_region_arguments(&project, arguments)?;
     let description = format!(
-        "Rendered {} from {:.3} to {:.3} seconds through the same custom Rust audio engine used for DAW playback. Listen to the audio itself and describe the audible rhythm, subdivision, energy contour, timbre, transitions, and shortcomings before deciding what to do next.",
+        "Rendered {} from {:.3} to {:.3} seconds through the same Surge XT-backed audio path used for DAW playback. Listen to the audio itself and describe the audible rhythm, subdivision, energy contour, timbre, transitions, and shortcomings before deciding what to do next.",
         selected_channel_labels(&project, &track_ids),
         start,
         end,
@@ -766,14 +766,14 @@ fn write_replace(path: &Path, source: &str) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    fn waveform_edit(tool_id: u64, waveform: &str) -> JsonValue {
+    fn preset_edit(tool_id: u64, preset: &str) -> JsonValue {
         serde_json::json!({
-            "summary": "Changed the bass waveform",
+            "summary": "Changed the bass patch",
             "musicalPlan": "Give the bass a more useful harmonic profile.",
             "actions": [{
                 "kind": "configure", "target": "bass", "name": "None", "value": 0,
                 "trackId": 2, "tool": "instrument", "toolId": tool_id, "clipId": 0,
-                "parameter": "waveform", "setting": waveform, "start": 0, "end": 1,
+                "parameter": "preset", "setting": preset, "start": 0, "end": 1,
                 "rate": 0, "events": []
             }]
         })
@@ -831,7 +831,7 @@ mod tests {
         let original = Project::demo();
         let session =
             EditSession::create(&original, "shape the bass", 4.0, 8.0).expect("edit session");
-        let error = apply_sound_graph_edits(session.path(), &waveform_edit(999, "sawtooth"))
+        let error = apply_sound_graph_edits(session.path(), &preset_edit(999, "Surge Lead"))
             .expect_err("unknown stable ID");
         assert!(error.contains("stable IDs"));
         assert_eq!(
@@ -839,12 +839,12 @@ mod tests {
             original.to_json()
         );
 
-        let response = apply_sound_graph_edits(session.path(), &waveform_edit(201, "sawtooth"))
+        let response = apply_sound_graph_edits(session.path(), &preset_edit(201, "Surge Lead"))
             .expect("valid graph edit");
         assert!(response.contains("updated the sound graph"));
         let (plan, project) = session.take_update().unwrap().expect("published update");
-        assert_eq!(plan.summary, "Changed the bass waveform");
-        assert_eq!(project.tracks[1].instrument.waveform, "sawtooth");
+        assert_eq!(plan.summary, "Changed the bass patch");
+        assert_eq!(project.tracks[1].instrument.preset, "Surge Lead");
     }
 
     #[test]

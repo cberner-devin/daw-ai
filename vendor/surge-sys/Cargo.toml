@@ -1,0 +1,22 @@
+[package]
+name = "surge-sys"
+version = "0.1.0"
+authors = ["NV4 <cattobyte@kyararanbii.xyz>"]
+edition = "2024"
+description = "(Official) Raw FFI bindings for the Surge XT synthesizer."
+license = "GPL-3.0-or-later"
+keywords = ["audio", "synthesis", "ffi"]
+categories = ["multimedia::audio", "external-ffi-bindings"]
+links = "surge"
+exclude = ["/sbmod"]	# should?...
+
+[build-dependencies]
+bindgen = "0.72.1"
+cc = "1.2.57"
+cmake = "0.1.57"
+serde_json = "1.0.149"
+shell-words = "1.1.1"
+git2 = "0.20.4"
+
+[features]
+in-surge-tree = []

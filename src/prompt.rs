@@ -46,7 +46,7 @@ pub enum Action {
         role: TrackRole,
     },
     Instrument {
-        waveform: &'static str,
+        preset: &'static str,
         target: TrackRole,
     },
     Modulator {
@@ -232,7 +232,7 @@ impl PromptEngine {
                 } else if contains_any(&normalized, &["volume", "level", "tremolo"]) {
                     "track.volume"
                 } else {
-                    "instrument.tone"
+                    "instrument.cutoff"
                 };
                 return EditPlan {
                     action: Action::Modulator {
@@ -251,25 +251,25 @@ impl PromptEngine {
             }
         }
 
-        if let (Some(waveform), Some(target)) = (waveform_name(&normalized), target) {
+        if let (Some(preset), Some(target)) = (surge_preset_name(&normalized), target) {
             if wants_addition {
                 return EditPlan {
                     action: Action::Compound {
                         actions: vec![
                             Action::AddTrack { role: target },
-                            Action::Instrument { waveform, target },
+                            Action::Instrument { preset, target },
                         ],
                     },
                     summary: format!(
-                        "Added a new {} part with a {waveform} waveform",
+                        "Added a new {} part with the {preset} patch",
                         target.display_name()
                     ),
                 };
             }
             return EditPlan {
-                action: Action::Instrument { waveform, target },
+                action: Action::Instrument { preset, target },
                 summary: format!(
-                    "Changed the {} instrument to a {waveform} waveform",
+                    "Changed the {} instrument to the {preset} patch",
                     target.display_name()
                 ),
             };
@@ -528,12 +528,12 @@ fn electronic_drop_plan(context: Option<PromptContext<'_>>) -> EditPlan {
             tool: "instrument",
             tool_id: bass.instrument_id,
             clip_id: None,
-            parameter: "waveform",
-            value: "sawtooth".to_owned(),
+            parameter: "preset",
+            value: "Surge Bass".to_owned(),
         });
     } else {
         actions.push(Action::Instrument {
-            waveform: "sawtooth",
+            preset: "Surge Bass",
             target: TrackRole::Bass,
         });
     }
@@ -580,7 +580,7 @@ fn electronic_drop_plan(context: Option<PromptContext<'_>>) -> EditPlan {
         ]);
     } else {
         actions.push(Action::Modulator {
-            parameter: "instrument.tone".to_owned(),
+            parameter: "instrument.cutoff".to_owned(),
             shape: "square",
             rate: 2.0,
             depth: 0.72,
@@ -640,7 +640,7 @@ fn drop_bass_for_selection(context: PromptContext<'_>) -> Option<DropBass> {
                 .modulators
                 .iter()
                 .rev()
-                .find(|modulator| modulator.target == "instrument.tone")
+                .find(|modulator| modulator.target == "instrument.cutoff")
                 .map(|modulator| modulator.id),
         })
     })
@@ -813,15 +813,15 @@ fn removable_effect_names(prompt: &str) -> Vec<&'static str> {
     names
 }
 
-fn waveform_name(prompt: &str) -> Option<&'static str> {
+fn surge_preset_name(prompt: &str) -> Option<&'static str> {
     if contains_any(prompt, &["saw", "sawtooth"]) {
-        Some("sawtooth")
+        Some("Surge Lead")
     } else if contains_any(prompt, &["square", "pulse wave"]) {
-        Some("square")
+        Some("Surge Bass")
     } else if contains_any(prompt, &["triangle wave", "triangle waveform"]) {
-        Some("triangle")
+        Some("Surge Pad")
     } else if contains_any(prompt, &["sine", "sine wave"]) {
-        Some("sine")
+        Some("Init")
     } else {
         None
     }
@@ -1049,7 +1049,7 @@ mod tests {
                         role: TrackRole::Lead,
                     },
                     Action::Instrument {
-                        waveform: "sawtooth",
+                        preset: "Surge Lead",
                         target: TrackRole::Lead,
                     },
                 ],
@@ -1080,7 +1080,7 @@ mod tests {
         assert_eq!(
             PromptEngine::interpret("use a sawtooth waveform for the bass", 112).action,
             Action::Instrument {
-                waveform: "sawtooth",
+                preset: "Surge Lead",
                 target: TrackRole::Bass,
             }
         );
@@ -1097,7 +1097,7 @@ mod tests {
         assert_eq!(
             PromptEngine::interpret("add a sawtooth LFO to the bass", 112).action,
             Action::Modulator {
-                parameter: "instrument.tone".to_owned(),
+                parameter: "instrument.cutoff".to_owned(),
                 shape: "sine",
                 rate: 0.5,
                 depth: 0.2,
