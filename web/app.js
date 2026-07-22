@@ -49,6 +49,8 @@
     refreshGeminiSessions: document.querySelector("#refresh-gemini-sessions"),
     geminiSessionList: document.querySelector("#gemini-session-list"),
     toast: document.querySelector("#toast"),
+    toastMessage: document.querySelector("#toast-message"),
+    toastClose: document.querySelector("#toast-close"),
   };
 
   const state = {
@@ -75,6 +77,8 @@
   const PENDING_EDIT_STORAGE_KEY = "daw-ai.pending-edit.v1";
   const AUDIO_RETRY_DELAYS_MS = [250, 500, 1000];
   const AUDIO_SEEK_DEBOUNCE_MS = 200;
+  const TOAST_DISMISS_MS = 4200;
+  const ERROR_TOAST_DISMISS_MS = 60_000;
   const SURGE_PRESETS = ["Init", "Surge Percussion", "Surge Bass", "Surge Pad", "Surge Lead", "Surge Atmosphere"];
 
   class AudioEngine {
@@ -1904,14 +1908,24 @@
     }
   }
 
-  function showToast(message, isError = false) {
+  function dismissToast() {
     window.clearTimeout(state.toastTimer);
-    elements.toast.textContent = message;
+    state.toastTimer = null;
+    elements.toast.hidden = true;
+  }
+
+  function showToast(message, isError = false) {
+    dismissToast();
+    const dismissAfterMs = isError ? ERROR_TOAST_DISMISS_MS : TOAST_DISMISS_MS;
+    elements.toastMessage.textContent = message;
     elements.toast.classList.toggle("is-error", isError);
+    elements.toast.setAttribute("role", isError ? "alert" : "status");
+    elements.toast.setAttribute("aria-live", isError ? "assertive" : "polite");
+    elements.toast.dataset.autoDismissMs = String(dismissAfterMs);
     elements.toast.hidden = false;
     state.toastTimer = window.setTimeout(() => {
-      elements.toast.hidden = true;
-    }, 4200);
+      dismissToast();
+    }, dismissAfterMs);
   }
 
   function updateTransport() {
@@ -1970,6 +1984,7 @@
   elements.copyDebug.addEventListener("click", () => void copyDebugReport());
   elements.clearDebug.addEventListener("click", clearDebugIssues);
   elements.refreshGeminiSessions.addEventListener("click", () => void loadGeminiSessions());
+  elements.toastClose.addEventListener("click", dismissToast);
   document.querySelectorAll("[data-prompt]").forEach((button) => {
     button.addEventListener("click", () => {
       elements.promptInput.value = button.dataset.prompt;
