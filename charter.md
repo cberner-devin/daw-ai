@@ -16,8 +16,13 @@ as simple as "increase volume" or as complex as "insert a sick drop here". The A
 #### Advanced Mode
 There is also an advanced view which the user can open that shows the details of the instruments, effects,...etc
 that the agent has implemented for the track. This should be similar to a traditional DAW, but prioritize simple
-interfaces over super powerful tools. It allows the user to directly edit any of the channels, and also create
-or delete entire channels of the sound graph.
+interfaces over super powerful tools. It allows the user to directly edit any of the tracks, and also create
+or delete entire tracks of the sound graph.
+
+MIDI clips are shown with a standard MIDI visualization and editor.
+
+Instruments, modulators, and effects are shown in an associated sound graph. Click a node in the graph shows
+a side pane that displays the relevant parameters and settings.
 
 These two views are separate tabs, each filling most of the screen, and there is a prominent tab near the top to
 switch between AI Mode and Advanced.
