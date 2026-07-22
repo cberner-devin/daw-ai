@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::model::{Project, Studio};
 
 pub(crate) const PROJECT_PATH_ENV: &str = "DAW_AI_PROJECT_PATH";
-const DEFAULT_PROJECT_FILE: &str = "sound-graph.json";
-const MAX_PROJECT_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_PROJECT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PROJECT_DOCUMENT_BYTES: u64 = 20 * 1024 * 1024;
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -16,14 +16,6 @@ pub(crate) struct ProjectStore {
 }
 
 impl ProjectStore {
-    pub(crate) fn open_from_environment() -> io::Result<(Self, Studio)> {
-        let path = match std::env::var_os(PROJECT_PATH_ENV) {
-            Some(path) if !path.is_empty() => PathBuf::from(path),
-            _ => std::env::current_dir()?.join(DEFAULT_PROJECT_FILE),
-        };
-        Self::open(path)
-    }
-
     pub(crate) fn open(path: PathBuf) -> io::Result<(Self, Studio)> {
         let store = Self { path };
         if store.path.exists() {
@@ -41,46 +33,68 @@ impl ProjectStore {
     }
 
     pub(crate) fn read(&self) -> io::Result<Project> {
-        let file = OpenOptions::new().read(true).open(&self.path)?;
-        let metadata = file.metadata()?;
-        if metadata.len() > MAX_PROJECT_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("sound graph exceeds the {MAX_PROJECT_BYTES}-byte limit"),
-            ));
-        }
-        let mut source = String::with_capacity(metadata.len() as usize);
-        file.take(MAX_PROJECT_BYTES + 1)
-            .read_to_string(&mut source)?;
-        if source.len() as u64 > MAX_PROJECT_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("sound graph exceeds the {MAX_PROJECT_BYTES}-byte limit"),
-            ));
-        }
-        Project::from_json(&source).map_err(|error| {
+        let source = self.read_source()?;
+        let project = Project::from_json(&source).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid sound graph {}: {error}", self.path.display()),
             )
-        })
-    }
-
-    pub(crate) fn save(&self, project: &Project) -> io::Result<()> {
-        let source = format!("{}\n", project.to_json());
-        if source.len() as u64 > MAX_PROJECT_BYTES {
+        })?;
+        if project.to_json().len() > MAX_PROJECT_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("sound graph exceeds the {MAX_PROJECT_BYTES}-byte limit"),
             ));
         }
-        Project::from_json(&source).map_err(|error| {
+        Ok(project)
+    }
+
+    pub(crate) fn read_source(&self) -> io::Result<String> {
+        let file = OpenOptions::new().read(true).open(&self.path)?;
+        let metadata = file.metadata()?;
+        if metadata.len() > MAX_PROJECT_DOCUMENT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("sound graph document exceeds the {MAX_PROJECT_DOCUMENT_BYTES}-byte limit"),
+            ));
+        }
+        let mut source = String::with_capacity(metadata.len() as usize);
+        file.take(MAX_PROJECT_DOCUMENT_BYTES + 1)
+            .read_to_string(&mut source)?;
+        if source.len() as u64 > MAX_PROJECT_DOCUMENT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("sound graph document exceeds the {MAX_PROJECT_DOCUMENT_BYTES}-byte limit"),
+            ));
+        }
+        Ok(source)
+    }
+
+    pub(crate) fn save(&self, project: &Project) -> io::Result<()> {
+        let source = format!("{}\n", project.to_json());
+        self.save_source(&source)
+    }
+
+    pub(crate) fn save_source(&self, source: &str) -> io::Result<()> {
+        if source.len() as u64 > MAX_PROJECT_DOCUMENT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("sound graph document exceeds the {MAX_PROJECT_DOCUMENT_BYTES}-byte limit"),
+            ));
+        }
+        let project = Project::from_json(source).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("refusing to save an invalid sound graph: {error}"),
             )
         })?;
-        replace_text_file(&self.path, &source)
+        if project.to_json().len() > MAX_PROJECT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("sound graph exceeds the {MAX_PROJECT_BYTES}-byte limit"),
+            ));
+        }
+        replace_text_file(&self.path, source)
     }
 }
 
@@ -189,7 +203,7 @@ mod tests {
         let (store, studio) = ProjectStore::open(path.clone()).expect("new store");
         let original = fs::read_to_string(&path).expect("stored graph");
         let mut project = studio.project().clone();
-        project.name = "x".repeat(MAX_PROJECT_BYTES as usize);
+        project.name = "x".repeat(MAX_PROJECT_BYTES);
 
         let error = store.save(&project).expect_err("oversized graph must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);

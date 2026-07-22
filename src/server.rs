@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as FmtWrite;
-use std::fs::File;
+use std::fs::{self, File};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,10 +13,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::audio_analysis;
 use crate::gemini::{EDIT_TIMEOUT_SECONDS, GeminiEdit, GeminiPlanner, PlannerError};
-use crate::gemini_tools::render_audio_request;
-use crate::model::{ChannelOperationAction, Studio, StudioError, json_string};
+use crate::gemini_tools::render_audio_request_with_backend;
+use crate::model::{ChannelOperationAction, Project, Studio, StudioError, json_string};
 use crate::prompt::{EditPlan, PromptEngine};
-use crate::storage::ProjectStore;
+use crate::storage::{ProjectStore, replace_text_file};
 
 const MAX_REQUEST_BYTES: usize = 6 * 1024 * 1024;
 const MAX_ACTIVE_EDIT_JOBS: usize = 4;
@@ -84,13 +86,31 @@ fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let response = match Request::read(stream) {
         Ok(request) => {
+            let (scoped, new_user) = if request_needs_user_scope(&request) {
+                match router.scoped(&request) {
+                    Ok(scoped) => scoped,
+                    Err(error) => return scope_error_response(&error).write(stream),
+                }
+            } else {
+                (router.clone(), None)
+            };
+            let new_user_cookie = new_user.as_ref().map(|user_id| {
+                format!("daw_ai_user={user_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000")
+            });
+            if request.path == "/api/export.wav" {
+                return scoped.write_export(&request, stream, new_user_cookie.as_deref());
+            }
             if request.path.starts_with("/api/audio-stream/") {
                 let cancellation_stream = stream.try_clone()?;
-                return router.write_playback_stream_with_cancel(&request, stream, || {
-                    stream_disconnected(&cancellation_stream)
-                });
+                return scoped.write_playback_stream_with_cancel(
+                    &request,
+                    stream,
+                    || stream_disconnected(&cancellation_stream),
+                    new_user_cookie.as_deref(),
+                );
             }
-            let response = router.handle(&request);
+            let mut response = scoped.handle(&request);
+            response.set_cookie = new_user_cookie;
             log_http_response(&request, &response);
             response
         }
@@ -100,6 +120,21 @@ fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
         }
     };
     response.write(stream)
+}
+
+fn scope_error_response(error: &io::Error) -> Response {
+    let status = match error.kind() {
+        io::ErrorKind::PermissionDenied => 401,
+        io::ErrorKind::ResourceBusy => 503,
+        io::ErrorKind::StorageFull => 507,
+        _ => 500,
+    };
+    let mut response = Response::json(status, error_json(&error.to_string()));
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        response.set_cookie =
+            Some("daw_ai_user=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_owned());
+    }
+    response
 }
 
 fn stream_disconnected(stream: &TcpStream) -> bool {
@@ -209,6 +244,236 @@ struct Router {
     edit_jobs: Arc<EditJobs>,
     audio_renderer: Arc<AudioRenderer>,
     audio_token: Arc<String>,
+    users: Option<Arc<UserRegistry>>,
+    history: Arc<Mutex<ProjectHistory>>,
+    builtin_backend: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct ProjectHistory {
+    snapshots: Vec<Project>,
+    current: usize,
+}
+
+impl ProjectHistory {
+    fn new(project: Project) -> Self {
+        Self {
+            snapshots: vec![project],
+            current: 0,
+        }
+    }
+
+    fn push(&mut self, project: Project) {
+        self.snapshots.truncate(self.current + 1);
+        self.snapshots.push(project);
+        self.current = self.snapshots.len() - 1;
+        if self.snapshots.len() > 128 {
+            self.snapshots.remove(0);
+            self.current -= 1;
+        }
+    }
+}
+
+fn load_project_history(path: &std::path::Path, project: &Project) -> io::Result<ProjectHistory> {
+    let source = fs::read_to_string(path)?;
+    let value: serde_json::Value = serde_json::from_str(&source)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let Some(history) = value.get("history") else {
+        return Ok(ProjectHistory::new(project.clone()));
+    };
+    let snapshots = history
+        .get("snapshots")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "history snapshots are required")
+        })?;
+    if snapshots.is_empty() || snapshots.len() > 128 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "history must contain between 1 and 128 snapshots",
+        ));
+    }
+    let snapshots = snapshots
+        .iter()
+        .enumerate()
+        .map(|(index, snapshot)| {
+            if snapshot.is_null() {
+                return Ok((index, None));
+            }
+            Project::from_json(&snapshot.to_string())
+                .map(|snapshot| (index, Some(snapshot)))
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let current = history
+        .get("current")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|current| usize::try_from(current).ok())
+        .filter(|current| *current < snapshots.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "history current is invalid"))?;
+    if snapshots
+        .iter()
+        .filter(|(_, snapshot)| snapshot.is_none())
+        .count()
+        > 1
+        || snapshots
+            .iter()
+            .any(|(index, snapshot)| snapshot.is_none() && *index != current)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "only the current history snapshot may be omitted",
+        ));
+    }
+    let snapshots = snapshots
+        .into_iter()
+        .map(|(_, snapshot)| snapshot.unwrap_or_else(|| project.clone()))
+        .collect::<Vec<_>>();
+    if snapshots[current].to_json() != project.to_json() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "history current does not match the saved project",
+        ));
+    }
+    Ok(ProjectHistory { snapshots, current })
+}
+
+fn project_document(project: &Project, history: &ProjectHistory) -> String {
+    let snapshots = history
+        .snapshots
+        .iter()
+        .enumerate()
+        .map(|(index, snapshot)| {
+            if index == history.current {
+                "null".to_owned()
+            } else {
+                snapshot.to_json()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut source = project.to_json();
+    source.pop();
+    format!(
+        "{source},\"history\":{{\"current\":{},\"snapshots\":[{}]}}}}\n",
+        history.current, snapshots
+    )
+}
+
+const MAX_HISTORY_BYTES: usize = 4 * 1024 * 1024;
+
+fn trim_project_history(project: &Project, history: &mut ProjectHistory) {
+    let maximum = project.to_json().len() + MAX_HISTORY_BYTES;
+    while history.snapshots.len() > 1 && project_document(project, history).len() > maximum {
+        if history.current > 0 {
+            history.snapshots.remove(0);
+            history.current -= 1;
+        } else {
+            history.snapshots.pop();
+        }
+    }
+}
+
+struct UserRegistry {
+    root: PathBuf,
+    planner: Planner,
+    users: Mutex<HashMap<String, CachedUser>>,
+}
+
+struct CachedUser {
+    router: Router,
+    last_used: Instant,
+    last_persisted: Instant,
+}
+
+const MAX_CACHED_USERS: usize = 64;
+const MAX_PERSISTED_USERS: usize = 256;
+const USER_CACHE_IDLE: Duration = Duration::from_secs(60 * 60);
+const USER_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const USER_USE_PERSIST_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const USER_LAST_USED_FILE: &str = ".last-used";
+
+fn persist_user_use(directory: &std::path::Path) -> io::Result<()> {
+    let milliseconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    replace_text_file(
+        &directory.join(USER_LAST_USED_FILE),
+        &format!("{milliseconds}\n"),
+    )
+}
+
+fn persisted_user_use(directory: &std::path::Path) -> io::Result<SystemTime> {
+    let marker = directory.join(USER_LAST_USED_FILE);
+    if let Ok(source) = fs::read_to_string(&marker) {
+        if let Ok(milliseconds) = source.trim().parse::<u64>() {
+            return Ok(UNIX_EPOCH + Duration::from_millis(milliseconds));
+        }
+    }
+    fs::metadata(directory.join("sound-graph.json").as_path())
+        .or_else(|_| fs::metadata(directory))?
+        .modified()
+}
+
+fn expire_persisted_users(
+    root: &std::path::Path,
+    cached: &HashMap<String, CachedUser>,
+) -> io::Result<()> {
+    let now = SystemTime::now();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if !entry.path().is_dir() || cached.contains_key(&id) {
+            continue;
+        }
+        let last_used = persisted_user_use(&entry.path())?;
+        if now.duration_since(last_used).unwrap_or_default() >= USER_RETENTION {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn request_needs_user_scope(request: &Request) -> bool {
+    matches!(
+        request.path.as_str(),
+        "/api/project"
+            | "/api/gemini-sessions"
+            | "/api/history"
+            | "/api/backend"
+            | "/api/edits"
+            | "/api/channels"
+            | "/api/mix"
+            | "/api/sound-tools"
+            | "/api/undo"
+            | "/api/reset"
+            | "/api/audio-access"
+            | "/api/export.wav"
+    ) || request.path.starts_with("/api/edits/")
+        || request.path.starts_with("/api/edit-operations/")
+        || (request.path.starts_with("/api/audio-stream/") && request.user_id().is_some())
+}
+
+fn expire_and_bound_user_cache(users: &mut HashMap<String, CachedUser>) {
+    users.retain(|_, user| user.last_used.elapsed() < USER_CACHE_IDLE || !user.can_evict());
+    while users.len() >= MAX_CACHED_USERS {
+        let Some(oldest) = users
+            .iter()
+            .filter(|(_, user)| user.can_evict())
+            .min_by_key(|(_, user)| user.last_used)
+            .map(|(id, _)| id.clone())
+        else {
+            break;
+        };
+        users.remove(&oldest);
+    }
+}
+
+impl CachedUser {
+    fn can_evict(&self) -> bool {
+        Arc::strong_count(&self.router.studio) == 1 && !self.router.edit_jobs.has_active()
+    }
 }
 
 #[derive(Clone)]
@@ -284,6 +549,9 @@ struct EditJob {
     applied_steps: usize,
     project_version: Option<u64>,
     state: EditJobState,
+    interrupted: bool,
+    cancellation: Arc<AtomicBool>,
+    worker_active: bool,
 }
 
 enum EditJobState {
@@ -328,6 +596,7 @@ impl AudioRenderer {
         &self,
         project: &crate::model::Project,
         start_sample: usize,
+        builtin: bool,
         is_cancelled: &impl Fn() -> bool,
     ) -> Result<(audio_analysis::AudioRegion, usize), AudioRenderError> {
         let project_end_sample = audio_analysis::playback_sample_count(0.0, project.duration);
@@ -339,7 +608,13 @@ impl AudioRenderer {
             start_sample,
             end_sample,
             is_cancelled,
-            audio_analysis::render_project_sample_range,
+            |project, start, end| {
+                if builtin {
+                    audio_analysis::render_project_sample_range_builtin(project, start, end)
+                } else {
+                    audio_analysis::render_project_sample_range(project, start, end)
+                }
+            },
         )
         .map(|region| (region, end_sample))
     }
@@ -349,6 +624,7 @@ impl AudioRenderer {
         project: &crate::model::Project,
         start_sample: usize,
         end_sample: usize,
+        builtin: bool,
         is_cancelled: &impl Fn() -> bool,
     ) -> Result<audio_analysis::AudioRegion, AudioRenderError> {
         self.stream_region_with(
@@ -356,7 +632,13 @@ impl AudioRenderer {
             start_sample,
             end_sample,
             is_cancelled,
-            audio_analysis::render_project_sample_range,
+            |project, start, end| {
+                if builtin {
+                    audio_analysis::render_project_sample_range_builtin(project, start, end)
+                } else {
+                    audio_analysis::render_project_sample_range(project, start, end)
+                }
+            },
         )
     }
 
@@ -420,6 +702,10 @@ impl EditJobs {
         }
     }
 
+    fn has_active(&self) -> bool {
+        self.lock().values().any(|job| job.worker_active)
+    }
+
     fn create(
         &self,
         poll_after_ms: u64,
@@ -434,15 +720,7 @@ impl EditJobs {
                 return Ok((*id, job.operation_id.clone(), false));
             }
         }
-        let active_jobs = jobs
-            .values()
-            .filter(|job| {
-                matches!(
-                    &job.state,
-                    EditJobState::Queued | EditJobState::Running { .. }
-                )
-            })
-            .count();
+        let active_jobs = jobs.values().filter(|job| job.worker_active).count();
         if active_jobs >= MAX_ACTIVE_EDIT_JOBS {
             return Err(());
         }
@@ -472,6 +750,9 @@ impl EditJobs {
                 applied_steps: 0,
                 project_version: None,
                 state: EditJobState::Queued,
+                interrupted: false,
+                cancellation: Arc::new(AtomicBool::new(false)),
+                worker_active: true,
             },
         );
         Ok((id, operation_id, true))
@@ -524,16 +805,62 @@ impl EditJobs {
 
     fn complete(&self, id: u64, message: String) {
         if let Some(job) = self.lock().get_mut(&id) {
+            if job.interrupted {
+                return;
+            }
             job.finished_at = Some(Instant::now());
             job.state = EditJobState::Completed { message };
+            job.worker_active = false;
         }
     }
 
     fn fail(&self, id: u64, status: u16, error: String) {
         if let Some(job) = self.lock().get_mut(&id) {
+            if job.interrupted {
+                return;
+            }
             job.finished_at = Some(Instant::now());
             job.state = EditJobState::Failed { status, error };
+            job.worker_active = false;
         }
+    }
+
+    fn worker_finished(&self, id: u64) {
+        if let Some(job) = self.lock().get_mut(&id) {
+            job.worker_active = false;
+        }
+    }
+
+    fn interrupt(&self, id: u64) -> bool {
+        let mut jobs = self.lock();
+        let Some(job) = jobs.get_mut(&id) else {
+            return false;
+        };
+        if !matches!(
+            job.state,
+            EditJobState::Queued | EditJobState::Running { .. }
+        ) {
+            return false;
+        }
+        job.interrupted = true;
+        job.cancellation.store(true, Ordering::SeqCst);
+        job.finished_at = Some(Instant::now());
+        job.state = EditJobState::Failed {
+            status: 409,
+            error: "Edit interrupted by the user.".to_owned(),
+        };
+        true
+    }
+
+    fn is_interrupted(&self, id: u64) -> bool {
+        self.lock().get(&id).is_some_and(|job| job.interrupted)
+    }
+
+    fn cancellation(&self, id: u64) -> Arc<AtomicBool> {
+        self.lock()
+            .get(&id)
+            .map(|job| Arc::clone(&job.cancellation))
+            .expect("edit job must exist while its worker is running")
     }
 
     fn response(&self, id: u64) -> Option<Response> {
@@ -568,32 +895,208 @@ fn planner_failure(error: PlannerError) -> EditFailure {
 }
 
 impl Router {
+    fn write_export(
+        &self,
+        request: &Request,
+        output: &mut impl Write,
+        set_cookie: Option<&str>,
+    ) -> io::Result<()> {
+        let Some(public_host) = request.public_host() else {
+            return Response::json(400, error_json("invalid host")).write(output);
+        };
+        if request.method != "GET" || !request.is_trusted_request(public_host) {
+            return Response::json(405, error_json("method not allowed")).write(output);
+        }
+        let project = self.lock_studio().project().clone();
+        let builtin_backend = self.builtin_backend.load(Ordering::SeqCst);
+        let sample_count = audio_analysis::playback_sample_count(0.0, project.duration);
+        let total_length = WAV_HEADER_BYTES.saturating_add(sample_count.saturating_mul(2));
+        write_response_head(
+            output,
+            200,
+            "audio/wav",
+            total_length,
+            &[
+                ("Cache-Control", "no-store"),
+                ("Content-Disposition", "attachment; filename=project.wav"),
+            ],
+            set_cookie,
+        )?;
+        output.write_all(&audio_analysis::wav_header(sample_count))?;
+        let mut cursor = 0;
+        while cursor < sample_count {
+            let end = (cursor + AUDIO_RANGE_SAMPLES).min(sample_count);
+            let region = match self.audio_renderer.stream_sample_range(
+                &project,
+                cursor,
+                end,
+                builtin_backend,
+                &|| false,
+            ) {
+                Ok(region) => region,
+                Err(AudioRenderError::Render(error)) => {
+                    eprintln!("error: could not render export: {error}");
+                    return Err(io::Error::other("could not render export"));
+                }
+                Err(AudioRenderError::Cancelled) => return Ok(()),
+            };
+            output.write_all(&audio_analysis::pcm_bytes(&region.samples))?;
+            cursor = end;
+        }
+        Ok(())
+    }
+
     fn new(_port: u16) -> io::Result<Self> {
         let planner = match std::env::var("DAW_AI_PROMPT_ENGINE") {
             Ok(value) if value == "demo" => Planner::Demo,
             _ => Planner::Gemini,
         };
-        let (store, studio) = ProjectStore::open_from_environment()?;
+        let project_path = std::env::var_os(crate::storage::PROJECT_PATH_ENV)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_dir()?.join("sound-graph.json"));
+        let root = project_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("users");
+        fs::create_dir_all(&root)?;
+        let (store, studio) = ProjectStore::open(project_path)?;
+        let mut history = load_project_history(store.path(), studio.project())?;
+        trim_project_history(studio.project(), &mut history);
+        store.save_source(&project_document(studio.project(), &history))?;
+        let users = Arc::new(UserRegistry {
+            root,
+            planner: planner.clone(),
+            users: Mutex::new(HashMap::new()),
+        });
         Ok(Self {
+            history: Arc::new(Mutex::new(history)),
+            builtin_backend: Arc::new(AtomicBool::new(false)),
             studio: Arc::new(Mutex::new(studio)),
             store: Some(store),
             planner,
             edit_jobs: Arc::new(EditJobs::new()),
             audio_renderer: Arc::new(AudioRenderer::default()),
             audio_token: Arc::new(new_operation_id(0)),
+            users: Some(users),
         })
     }
 
     #[cfg(test)]
     fn demo() -> Self {
         Self {
+            history: Arc::new(Mutex::new(ProjectHistory::new(
+                Studio::new().project().clone(),
+            ))),
+            builtin_backend: Arc::new(AtomicBool::new(false)),
             studio: Arc::new(Mutex::new(Studio::new())),
             store: None,
             planner: Planner::Demo,
             edit_jobs: Arc::new(EditJobs::new()),
             audio_renderer: Arc::new(AudioRenderer::default()),
             audio_token: Arc::new("test-audio-token".to_owned()),
+            users: None,
         }
+    }
+
+    fn scoped(&self, request: &Request) -> io::Result<(Self, Option<String>)> {
+        let Some(registry) = &self.users else {
+            return Ok((self.clone(), None));
+        };
+        let existing = request.user_id();
+        if let Some(existing) = existing {
+            let directory = registry.root.join(existing);
+            if !directory.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "unknown user session; clear the site cookie and try again",
+                ));
+            }
+        }
+        let user_id = existing
+            .map(str::to_owned)
+            .unwrap_or_else(|| new_operation_id(0));
+        let mut users = registry
+            .users
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        users.retain(|_, user| user.last_used.elapsed() < USER_CACHE_IDLE || !user.can_evict());
+        if let Some(user) = users.get_mut(&user_id) {
+            user.last_used = Instant::now();
+            if user.last_persisted.elapsed() >= USER_USE_PERSIST_INTERVAL {
+                persist_user_use(
+                    user.router
+                        .project_path()
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new(".")),
+                )?;
+                user.last_persisted = Instant::now();
+            }
+            return Ok((user.router.clone(), existing.is_none().then_some(user_id)));
+        }
+        expire_and_bound_user_cache(&mut users);
+        if users.len() >= MAX_CACHED_USERS {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "all cached user projects have active edits",
+            ));
+        }
+        let directory = registry.root.join(&user_id);
+        fs::create_dir_all(&registry.root)?;
+        if !directory.is_dir() {
+            let persisted_count = fs::read_dir(&registry.root)?
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .take(MAX_PERSISTED_USERS + 1)
+                .count();
+            if persisted_count >= MAX_PERSISTED_USERS {
+                expire_persisted_users(&registry.root, &users)?;
+                if fs::read_dir(&registry.root)?
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.path().is_dir())
+                    .take(MAX_PERSISTED_USERS + 1)
+                    .count()
+                    >= MAX_PERSISTED_USERS
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::StorageFull,
+                        "persistent user project limit reached",
+                    ));
+                }
+            }
+        }
+        fs::create_dir_all(&directory)?;
+        let project_path = directory.join("sound-graph.json");
+        if !project_path.exists() {
+            let studio = Studio::new();
+            let history = ProjectHistory::new(studio.project().clone());
+            replace_text_file(&project_path, &project_document(studio.project(), &history))?;
+        }
+        let (store, studio) = ProjectStore::open(project_path)?;
+        let mut history = load_project_history(store.path(), studio.project())?;
+        trim_project_history(studio.project(), &mut history);
+        store.save_source(&project_document(studio.project(), &history))?;
+        persist_user_use(&directory)?;
+        let router = Self {
+            history: Arc::new(Mutex::new(history)),
+            builtin_backend: Arc::new(AtomicBool::new(false)),
+            studio: Arc::new(Mutex::new(studio)),
+            store: Some(store),
+            planner: registry.planner.clone(),
+            edit_jobs: Arc::new(EditJobs::new()),
+            audio_renderer: Arc::new(AudioRenderer::default()),
+            audio_token: Arc::new(new_operation_id(0)),
+            users: None,
+        };
+        users.insert(
+            user_id.clone(),
+            CachedUser {
+                router: router.clone(),
+                last_used: Instant::now(),
+                last_persisted: Instant::now(),
+            },
+        );
+        Ok((router, existing.is_none().then_some(user_id)))
     }
 
     fn handle(&self, request: &Request) -> Response {
@@ -629,6 +1132,17 @@ impl Router {
         if request.path.starts_with("/api/edit-operations/") {
             return Response::json(404, error_json("edit operation not found"));
         }
+        if let Some(job_id) = interrupted_edit_job_id(&request.path) {
+            return if request.method == "POST" {
+                if self.edit_jobs.interrupt(job_id) {
+                    self.edit_jobs.response(job_id).expect("interrupted job")
+                } else {
+                    Response::json(409, error_json("edit job is not interruptible"))
+                }
+            } else {
+                Response::json(405, error_json("method not allowed")).with_header("Allow", "POST")
+            };
+        }
         if let Some(job_id) = edit_job_id(&request.path) {
             return if request.method == "GET" {
                 self.edit_status(job_id)
@@ -647,9 +1161,11 @@ impl Router {
             ("GET", "/api/health") => Response::json(200, "{\"status\":\"ok\"}".to_owned()),
             ("GET", "/api/project") => {
                 let studio = self.lock_studio();
-                Response::json(200, studio.to_json())
+                self.project_response(&studio)
             }
             ("GET", "/api/gemini-sessions") => self.gemini_sessions(),
+            ("GET", "/api/history") => self.history_response(),
+            ("GET", "/api/backend") => self.backend_response(),
             ("POST", "/api/edits") => self.start_edit(&request.body),
             ("POST", "/api/channels") => self.change_channel(&request.body),
             ("POST", "/api/mix") => self.change_mix(&request.body),
@@ -657,6 +1173,8 @@ impl Router {
             ("POST", "/api/logs") => Self::client_log(&request.body),
             ("POST", "/api/undo") => self.undo(),
             ("POST", "/api/reset") => self.reset(),
+            ("POST", "/api/history") => self.select_history(&request.body),
+            ("POST", "/api/backend") => self.set_backend(&request.body),
             (
                 _,
                 "/api/edits" | "/api/channels" | "/api/mix" | "/api/sound-tools" | "/api/logs"
@@ -665,6 +1183,10 @@ impl Router {
             (_, "/api/project" | "/api/health" | "/api/gemini-sessions") => {
                 Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
             }
+            (_, "/api/history") => Response::json(405, error_json("method not allowed"))
+                .with_header("Allow", "GET, POST"),
+            (_, "/api/backend") => Response::json(405, error_json("method not allowed"))
+                .with_header("Allow", "GET, POST"),
             _ => Response::json(404, error_json("not found")),
         }
     }
@@ -749,7 +1271,7 @@ impl Router {
 
     #[cfg(test)]
     fn write_playback_stream(&self, request: &Request, output: &mut impl Write) -> io::Result<()> {
-        self.write_playback_stream_with_cancel(request, output, || false)
+        self.write_playback_stream_with_cancel(request, output, || false, None)
     }
 
     fn write_playback_stream_with_cancel(
@@ -757,6 +1279,7 @@ impl Router {
         request: &Request,
         output: &mut impl Write,
         is_cancelled: impl Fn() -> bool,
+        set_cookie: Option<&str>,
     ) -> io::Result<()> {
         let Some(public_host) = request.public_host() else {
             return Response::json(400, error_json("invalid host")).write(output);
@@ -808,6 +1331,7 @@ impl Router {
                             ("Accept-Ranges", "bytes"),
                             ("Content-Range", content_range.as_str()),
                         ],
+                        set_cookie,
                     );
                 }
             };
@@ -822,6 +1346,7 @@ impl Router {
                     ("Accept-Ranges", "bytes"),
                     ("Content-Range", content_range.as_str()),
                 ],
+                set_cookie,
             )?;
             return self.write_playback_byte_range(
                 &project,
@@ -839,6 +1364,7 @@ impl Router {
             "audio/wav",
             total_length,
             &[("Cache-Control", "no-store"), ("Accept-Ranges", "bytes")],
+            set_cookie,
         )?;
         output.write_all(&audio_analysis::wav_header(sample_count))?;
 
@@ -851,18 +1377,19 @@ impl Router {
             if !wait_for_stream_window(generated_samples, stream_started, &is_cancelled) {
                 return Ok(());
             }
-            let (region, end) =
-                match self
-                    .audio_renderer
-                    .stream_region(&project, cursor, &is_cancelled)
-                {
-                    Ok(rendered) => rendered,
-                    Err(AudioRenderError::Render(error)) => {
-                        eprintln!("error: could not render playback stream: {error}");
-                        return Err(io::Error::other("could not render playback stream"));
-                    }
-                    Err(AudioRenderError::Cancelled) => return Ok(()),
-                };
+            let (region, end) = match self.audio_renderer.stream_region(
+                &project,
+                cursor,
+                self.builtin_backend.load(Ordering::SeqCst),
+                &is_cancelled,
+            ) {
+                Ok(rendered) => rendered,
+                Err(AudioRenderError::Render(error)) => {
+                    eprintln!("error: could not render playback stream: {error}");
+                    return Err(io::Error::other("could not render playback stream"));
+                }
+                Err(AudioRenderError::Cancelled) => return Ok(()),
+            };
             let count = region.samples.len().min(remaining);
             if is_cancelled() {
                 return Ok(());
@@ -902,6 +1429,7 @@ impl Router {
             project,
             stream_start_sample + first_sample,
             stream_start_sample + end_sample,
+            self.builtin_backend.load(Ordering::SeqCst),
             is_cancelled,
         ) {
             Ok(region) => region,
@@ -962,6 +1490,7 @@ impl Router {
                 self.edit_jobs.fail(job_id, 500, message);
             }
         }
+        self.edit_jobs.worker_finished(job_id);
     }
 
     fn perform_edit(&self, job_id: u64, edit: EditRequest) -> Result<String, EditFailure> {
@@ -976,6 +1505,9 @@ impl Router {
         let plan = self
             .plan_edit(&edit.prompt, edit.start, edit.end, &edit.project)
             .map_err(|message| EditFailure::new(503, message))?;
+        if self.edit_jobs.is_interrupted(job_id) {
+            return Err(EditFailure::new(409, "edit interrupted by the user"));
+        }
         self.edit_jobs.set_running(
             job_id,
             "applying",
@@ -1000,18 +1532,24 @@ impl Router {
     fn perform_gemini_edit(&self, job_id: u64, edit: EditRequest) -> Result<String, EditFailure> {
         let mut expected_version = edit.project.version;
         let mut published_update = false;
+        let cancellation = self.edit_jobs.cancellation(job_id);
         let completed = GeminiPlanner::interpret_with_audio_renderer_updates(
+            &self.gemini_session_root(),
             &edit.prompt,
             edit.start,
             edit.end,
             &edit.project,
+            cancellation,
             |request| {
                 self.edit_jobs.set_running(
                     job_id,
                     "rendering",
                     "Rendering the current sound graph with the Rust audio engine",
                 );
-                let result = render_audio_request(request);
+                let result = render_audio_request_with_backend(
+                    request,
+                    self.builtin_backend.load(Ordering::SeqCst),
+                );
                 self.edit_jobs.set_running(
                     job_id,
                     "planning",
@@ -1053,7 +1591,10 @@ impl Router {
         expected_version: &mut u64,
         published_update: &mut bool,
         graph_edit: GeminiEdit,
-    ) -> Result<(), PlannerError> {
+    ) -> Result<Project, PlannerError> {
+        if self.edit_jobs.is_interrupted(job_id) {
+            return Err(PlannerError::Interrupted);
+        }
         let summary = graph_edit.plan.summary.clone();
         let mut studio = self.lock_studio();
         if studio.project().version != *expected_version {
@@ -1080,7 +1621,7 @@ impl Router {
         *published_update = true;
         self.edit_jobs
             .publish_update(job_id, *expected_version, &summary);
-        Ok(())
+        Ok(studio.project().clone())
     }
 
     fn complete_gemini_operation(
@@ -1091,6 +1632,9 @@ impl Router {
         message: &str,
     ) -> Result<(), PlannerError> {
         let mut studio = self.lock_studio();
+        if self.edit_jobs.is_interrupted(job_id) {
+            return Err(PlannerError::Interrupted);
+        }
         if studio.project().version != *expected_version {
             return Err(PlannerError::ProjectChanged);
         }
@@ -1100,7 +1644,7 @@ impl Router {
                 "could not mark the completed edit operation".to_owned(),
             ));
         }
-        self.commit(&mut studio, candidate)
+        self.commit_metadata(&mut studio, candidate)
             .map_err(|_| PlannerError::SaveFailed)?;
         *expected_version = studio.project().version;
         self.edit_jobs.finalize_updates(job_id, *expected_version);
@@ -1279,7 +1823,7 @@ impl Router {
     }
 
     fn gemini_sessions(&self) -> Response {
-        match crate::gemini_tools::session_summaries() {
+        match crate::gemini_tools::session_summaries_in(&self.gemini_session_root()) {
             Ok(sessions) => {
                 Response::json(200, serde_json::json!({"sessions": sessions}).to_string())
             }
@@ -1322,25 +1866,159 @@ impl Router {
 
     fn undo(&self) -> Response {
         let mut studio = self.lock_studio();
-        let mut candidate = studio.clone();
-        if candidate.undo() {
-            match self.commit(&mut studio, candidate) {
-                Ok(()) => Response::json(200, studio.to_json()),
-                Err(response) => response,
-            }
-        } else {
-            Response::json(409, error_json("nothing to undo"))
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(previous_index) = history.current.checked_sub(1) else {
+            return Response::json(409, error_json("nothing to undo"));
+        };
+        let mut project = history.snapshots[previous_index].clone();
+        let Some(version) = studio.project().version.checked_add(1) else {
+            return Response::json(500, error_json("project revision limit reached"));
+        };
+        project.version = version;
+        let mut candidate_history = history.clone();
+        candidate_history.current = previous_index;
+        candidate_history.snapshots[previous_index] = project.clone();
+        if let Err(error) = self.save_state(&project, &mut candidate_history) {
+            eprintln!("error: could not save undone project state: {error}");
+            return Response::json(500, error_json("could not undo project change"));
         }
+        *history = candidate_history;
+        *studio = Studio::from_project(project);
+        Response::json(200, studio.to_json_with_can_undo(history.current > 0))
     }
 
     fn reset(&self) -> Response {
         let mut studio = self.lock_studio();
         let mut candidate = studio.clone();
         candidate.reset();
-        match self.commit(&mut studio, candidate) {
-            Ok(()) => Response::json(200, studio.to_json()),
-            Err(response) => response,
+        let mut history = ProjectHistory::new(candidate.project().clone());
+        if let Err(error) = self.save_state(candidate.project(), &mut history) {
+            eprintln!("error: could not reset project and history: {error}");
+            return Response::json(500, error_json("could not reset the project"));
         }
+        *studio = candidate;
+        *self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = history;
+        Response::json(200, studio.to_json_with_can_undo(false))
+    }
+
+    fn history_response(&self) -> Response {
+        let history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entries = history
+            .snapshots
+            .iter()
+            .enumerate()
+            .map(|(index, project)| {
+                let previous_edit_count = index
+                    .checked_sub(1)
+                    .and_then(|previous| history.snapshots.get(previous))
+                    .map_or(0, |previous| previous.edits.len());
+                let edit = (project.edits.len() > previous_edit_count)
+                    .then(|| project.edits.last())
+                    .flatten();
+                let (summary, source, prompt, start, end) = if index == 0 {
+                    ("Initial project", "Project", None, None, None)
+                } else if let Some(edit) = edit {
+                    (
+                        edit.summary.as_str(),
+                        "Gemini",
+                        Some(edit.prompt.as_str()),
+                        Some(edit.start),
+                        Some(edit.end),
+                    )
+                } else {
+                    ("Manual project change", "Manual", None, None, None)
+                };
+                serde_json::json!({
+                    "index":index,
+                    "version":project.version,
+                    "summary":summary,
+                    "source":source,
+                    "prompt":prompt,
+                    "start":start,
+                    "end":end
+                })
+            })
+            .collect::<Vec<_>>();
+        Response::json(
+            200,
+            serde_json::json!({
+                "current":history.current,
+                "currentVersion":history.snapshots[history.current].version,
+                "currentEditCount":history.snapshots[history.current].edits.len(),
+                "entries":entries
+            })
+            .to_string(),
+        )
+    }
+
+    fn backend_response(&self) -> Response {
+        let backend = if self.builtin_backend.load(Ordering::SeqCst) {
+            "built-in"
+        } else {
+            "Surge XT"
+        };
+        Response::json(200, serde_json::json!({"backend":backend}).to_string())
+    }
+
+    fn set_backend(&self, body: &str) -> Response {
+        let backend = parse_form(body).get("backend").cloned().unwrap_or_default();
+        let builtin = match backend.as_str() {
+            "Surge XT" => false,
+            "built-in" => true,
+            _ => return Response::json(422, error_json("unknown instrument backend")),
+        };
+        self.builtin_backend.store(builtin, Ordering::SeqCst);
+        self.backend_response()
+    }
+
+    fn select_history(&self, body: &str) -> Response {
+        let Some(index) = parse_form(body)
+            .get("index")
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            return Response::json(422, error_json("history index is required"));
+        };
+        let mut studio = self.lock_studio();
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(mut project) = history.snapshots.get(index).cloned() else {
+            return Response::json(404, error_json("history state not found"));
+        };
+        let Some(version) = studio.project().version.checked_add(1) else {
+            return Response::json(500, error_json("project revision limit reached"));
+        };
+        project.version = version;
+        let mut candidate_history = history.clone();
+        candidate_history.current = index;
+        candidate_history.snapshots[index] = project.clone();
+        if let Err(error) = self.save_state(&project, &mut candidate_history) {
+            eprintln!("error: could not save selected history state: {error}");
+            return Response::json(500, error_json("could not select history state"));
+        }
+        *history = candidate_history;
+        *studio = Studio::from_project(project);
+        Response::json(200, studio.to_json_with_can_undo(history.current > 0))
+    }
+
+    fn project_response(&self, studio: &Studio) -> Response {
+        let can_undo = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current
+            > 0;
+        Response::json(200, studio.to_json_with_can_undo(can_undo))
     }
 
     fn commit(
@@ -1348,17 +2026,62 @@ impl Router {
         studio: &mut std::sync::MutexGuard<'_, Studio>,
         candidate: Studio,
     ) -> Result<(), Response> {
-        if let Some(store) = &self.store {
-            if let Err(error) = store.save(candidate.project()) {
-                eprintln!("error: could not save sound graph: {error}");
-                return Err(Response::json(
-                    500,
-                    error_json("could not save the sound graph"),
-                ));
-            }
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        history.push(candidate.project().clone());
+        if let Err(error) = self.save_state(candidate.project(), &mut history) {
+            eprintln!("error: could not save project history: {error}");
+            return Err(Response::json(
+                500,
+                error_json("could not save project history"),
+            ));
         }
         **studio = candidate;
+        *self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = history;
         Ok(())
+    }
+
+    fn commit_metadata(
+        &self,
+        studio: &mut std::sync::MutexGuard<'_, Studio>,
+        candidate: Studio,
+    ) -> Result<(), Response> {
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let current = history.current;
+        if let Some(snapshot) = history.snapshots.get_mut(current) {
+            *snapshot = candidate.project().clone();
+        }
+        if let Err(error) = self.save_state(candidate.project(), &mut history) {
+            eprintln!("error: could not save project history metadata: {error}");
+            return Err(Response::json(
+                500,
+                error_json("could not save project history"),
+            ));
+        }
+        **studio = candidate;
+        *self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = history;
+        Ok(())
+    }
+
+    fn save_state(&self, project: &Project, history: &mut ProjectHistory) -> io::Result<()> {
+        trim_project_history(project, history);
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        store.save_source(&project_document(project, history))
     }
 
     fn project_path(&self) -> &std::path::Path {
@@ -1366,6 +2089,20 @@ impl Router {
             .as_ref()
             .expect("production router has a project store")
             .path()
+    }
+
+    fn gemini_session_root(&self) -> PathBuf {
+        if let Some(store) = &self.store {
+            return store
+                .path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("gemini-sessions");
+        }
+        #[cfg(test)]
+        return crate::gemini_tools::session_root();
+        #[cfg(not(test))]
+        unreachable!("production routers always have project storage")
     }
 
     fn lock_studio(&self) -> std::sync::MutexGuard<'_, Studio> {
@@ -1383,6 +2120,13 @@ struct Request {
 }
 
 impl Request {
+    fn user_id(&self) -> Option<&str> {
+        self.headers.get("cookie")?.split(';').find_map(|part| {
+            let (name, value) = part.trim().split_once('=')?;
+            (name == "daw_ai_user" && valid_user_id(value)).then_some(value)
+        })
+    }
+
     fn read(stream: &mut impl Read) -> Result<Self, String> {
         let mut bytes = Vec::with_capacity(2048);
         let header_end = loop {
@@ -1508,11 +2252,16 @@ impl Request {
     }
 }
 
+fn valid_user_id(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 struct Response {
     status: u16,
     content_type: &'static str,
     body: String,
     headers: Vec<(&'static str, &'static str)>,
+    set_cookie: Option<String>,
 }
 
 impl Response {
@@ -1522,6 +2271,7 @@ impl Response {
             content_type: "application/json; charset=utf-8",
             body,
             headers: vec![("Cache-Control", "no-store")],
+            set_cookie: None,
         }
     }
 
@@ -1530,7 +2280,11 @@ impl Response {
             status: 200,
             content_type,
             body: body.to_owned(),
-            headers: vec![("Cache-Control", "no-cache")],
+            headers: vec![(
+                "Cache-Control",
+                "no-store, no-cache, must-revalidate, max-age=0",
+            )],
+            set_cookie: None,
         }
     }
 
@@ -1546,6 +2300,7 @@ impl Response {
             self.content_type,
             self.body.len(),
             &self.headers,
+            self.set_cookie.as_deref(),
         )?;
         stream.write_all(self.body.as_bytes())
     }
@@ -1557,18 +2312,23 @@ fn write_response_head(
     content_type: &str,
     content_length: usize,
     headers: &[(&str, &str)],
+    set_cookie: Option<&str>,
 ) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
         202 => "Accepted",
         206 => "Partial Content",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
         416 => "Range Not Satisfiable",
         422 => "Unprocessable Content",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        507 => "Insufficient Storage",
         _ => "Error",
     };
     let mut head = format!(
@@ -1588,6 +2348,11 @@ fn write_response_head(
         head.push_str(value);
         head.push_str("\r\n");
     }
+    if let Some(cookie) = set_cookie {
+        head.push_str("Set-Cookie: ");
+        head.push_str(cookie);
+        head.push_str("\r\n");
+    }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes())
 }
@@ -1604,11 +2369,34 @@ fn new_operation_id(id: u64) -> String {
         }
         return token;
     }
+    if let Ok(uuid) = fs::read_to_string("/proc/sys/kernel/random/uuid") {
+        let token = uuid
+            .bytes()
+            .filter(|byte| byte.is_ascii_hexdigit())
+            .map(char::from)
+            .collect::<String>();
+        if valid_user_id(&token) {
+            return token;
+        }
+    }
+    fallback_operation_id(id)
+}
+
+fn fallback_operation_id(id: u64) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("{nanos:x}-{:x}-{id:x}", std::process::id())
+    let hash = |domain: u8| {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        domain.hash(&mut hasher);
+        nanos.hash(&mut hasher);
+        std::process::id().hash(&mut hasher);
+        std::thread::current().id().hash(&mut hasher);
+        id.hash(&mut hasher);
+        hasher.finish()
+    };
+    format!("{:016x}{:016x}", hash(0), hash(1))
 }
 
 fn valid_operation_id(operation_id: &str) -> bool {
@@ -1718,6 +2506,13 @@ fn edit_job_id(path: &str) -> Option<u64> {
     (!id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
         .then(|| id.parse::<u64>().ok())
         .flatten()
+}
+
+fn interrupted_edit_job_id(path: &str) -> Option<u64> {
+    path.strip_prefix("/api/edits/")?
+        .strip_suffix("/interrupt")?
+        .parse()
+        .ok()
 }
 
 fn playback_audio_stream(path: &str) -> Option<(&str, u64, u64)> {
@@ -1970,12 +2765,15 @@ mod tests {
         let (store, studio) = ProjectStore::open(path.clone()).expect("test project store");
         (
             Router {
+                history: Arc::new(Mutex::new(ProjectHistory::new(studio.project().clone()))),
+                builtin_backend: Arc::new(AtomicBool::new(false)),
                 studio: Arc::new(Mutex::new(studio)),
                 store: Some(store),
                 planner: Planner::Demo,
                 edit_jobs: Arc::new(EditJobs::new()),
                 audio_renderer: Arc::new(AudioRenderer::default()),
                 audio_token: Arc::new("test-audio-token".to_owned()),
+                users: None,
             },
             path,
         )
@@ -1987,7 +2785,16 @@ mod tests {
         let page = router.handle(&request("GET", "/", ""));
         assert_eq!(page.status, 200);
         assert!(page.body.contains("DAW-AI"));
-
+        assert!(page.headers.contains(&(
+            "Cache-Control",
+            "no-store, no-cache, must-revalidate, max-age=0"
+        )));
+        let script = router.handle(&request("GET", "/app.js", ""));
+        assert_eq!(script.status, 200);
+        assert!(script.headers.contains(&(
+            "Cache-Control",
+            "no-store, no-cache, must-revalidate, max-age=0"
+        )));
         let project = router.handle(&request("GET", "/api/project", ""));
         assert_eq!(project.status, 200);
         assert!(project.body.contains("\"tracks\""));
@@ -2349,16 +3156,34 @@ mod tests {
                 .all(|edit| edit.operation_id.as_deref() != Some(operation_id.as_str()))
         );
 
+        assert!(router.edit_jobs.interrupt(job_id));
+        assert!(matches!(
+            router.complete_gemini_operation(
+                job_id,
+                &edit,
+                &mut expected_version,
+                "Finished shaping the bass",
+            ),
+            Err(PlannerError::Interrupted)
+        ));
+        assert!(
+            !router.lock_studio().project().edit_operations[0].completed,
+            "an interrupted job must remain recoverably partial"
+        );
+
         router.edit_jobs.remove(job_id);
         let persisted = crate::model::Project::from_json(&router.lock_studio().project().to_json())
             .expect("persisted partial operation");
         let restarted = Router {
+            history: Arc::new(Mutex::new(ProjectHistory::new(persisted.clone()))),
+            builtin_backend: Arc::new(AtomicBool::new(false)),
             studio: Arc::new(Mutex::new(Studio::from_project(persisted))),
             store: None,
             planner: Planner::Demo,
             edit_jobs: Arc::new(EditJobs::new()),
             audio_renderer: Arc::new(AudioRenderer::default()),
             audio_token: Arc::new("test-audio-token".to_owned()),
+            users: None,
         };
         let retried = restarted.handle(&request(
             "POST",
@@ -2836,6 +3661,31 @@ mod tests {
                 * 2;
         assert_ne!(&body[render_boundary..render_boundary + 4], b"RIFF");
 
+        let mut cookie_stream = Vec::new();
+        let mut cookie_request = request(
+            "GET",
+            &format!("/api/audio-stream/test-audio-token/{version}/0"),
+            "",
+        );
+        cookie_request
+            .headers
+            .insert("range".to_owned(), "bytes=0-43".to_owned());
+        router
+            .write_playback_stream_with_cancel(
+                &cookie_request,
+                &mut cookie_stream,
+                || false,
+                Some("daw_ai_user=0123456789abcdef0123456789abcdef; Path=/"),
+            )
+            .expect("cookie-bearing WAV stream");
+        let cookie_head_end = find_bytes(&cookie_stream, b"\r\n\r\n").expect("cookie head") + 4;
+        let cookie_head =
+            std::str::from_utf8(&cookie_stream[..cookie_head_end]).expect("cookie UTF-8");
+        assert!(
+            cookie_head
+                .contains("Set-Cookie: daw_ai_user=0123456789abcdef0123456789abcdef; Path=/\r\n")
+        );
+
         let mut rejected = Vec::new();
         router
             .write_playback_stream(
@@ -2848,6 +3698,72 @@ mod tests {
             )
             .expect("rejected stream response");
         assert!(rejected.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
+    }
+
+    #[test]
+    fn export_streams_wav_bytes_and_sets_a_new_user_cookie() {
+        let router = Router::demo();
+        router.builtin_backend.store(true, Ordering::SeqCst);
+        let mut project = router.lock_studio().project().clone();
+        project.duration = 0.5;
+        *router.lock_studio() = Studio::from_project(project);
+        let mut response = Vec::new();
+
+        router
+            .write_export(
+                &request("GET", "/api/export.wav", ""),
+                &mut response,
+                Some("daw_ai_user=0123456789abcdef0123456789abcdef; Path=/"),
+            )
+            .expect("streamed export");
+
+        let body_start = find_bytes(&response, b"\r\n\r\n").expect("export response head") + 4;
+        let head = std::str::from_utf8(&response[..body_start]).expect("export UTF-8 head");
+        let expected_samples = audio_analysis::playback_sample_count(0.0, 0.5);
+        assert!(
+            head.contains("Set-Cookie: daw_ai_user=0123456789abcdef0123456789abcdef; Path=/\r\n")
+        );
+        assert_eq!(
+            response.len() - body_start,
+            WAV_HEADER_BYTES + expected_samples * 2
+        );
+        assert_eq!(&response[body_start..body_start + 4], b"RIFF");
+
+        struct BackendFlippingWriter {
+            bytes: Vec<u8>,
+            backend: Arc<AtomicBool>,
+            flipped: bool,
+        }
+
+        impl Write for BackendFlippingWriter {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                if !self.flipped {
+                    self.backend.store(false, Ordering::SeqCst);
+                    self.flipped = true;
+                }
+                self.bytes.extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        router.builtin_backend.store(true, Ordering::SeqCst);
+        let mut flipping_response = BackendFlippingWriter {
+            bytes: Vec::new(),
+            backend: Arc::clone(&router.builtin_backend),
+            flipped: false,
+        };
+        router
+            .write_export(
+                &request("GET", "/api/export.wav", ""),
+                &mut flipping_response,
+                Some("daw_ai_user=0123456789abcdef0123456789abcdef; Path=/"),
+            )
+            .expect("export with backend changed after response starts");
+        assert_eq!(flipping_response.bytes, response);
     }
 
     #[test]
@@ -3088,5 +4004,388 @@ mod tests {
         let rendered = String::from_utf8(bytes).expect("UTF-8 response");
         assert!(rendered.contains("Content-Length: 11"));
         assert!(rendered.contains("X-Content-Type-Options: nosniff"));
+    }
+
+    #[test]
+    fn backend_selection_is_explicit_and_per_router() {
+        let router = Router::demo();
+        let initial = router.handle(&request("GET", "/api/backend", ""));
+        assert_eq!(initial.status, 200);
+        assert!(initial.body.contains("Surge XT"));
+
+        let selected = router.handle(&request("POST", "/api/backend", "backend=built-in"));
+        assert_eq!(selected.status, 200);
+        assert!(router.builtin_backend.load(Ordering::Relaxed));
+        assert_eq!(
+            router
+                .handle(&request("POST", "/api/backend", "backend=unknown"))
+                .status,
+            422
+        );
+    }
+
+    #[test]
+    fn cookie_scoped_users_have_independent_projects() {
+        let id = TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("daw-ai-users-test-{}-{id}", std::process::id()));
+        let base = Router::demo();
+        assert_eq!(
+            base.handle(&request(
+                "POST",
+                "/api/mix",
+                "track_id=2&volume=0.31&muted=false",
+            ))
+            .status,
+            200
+        );
+        let registry = Arc::new(UserRegistry {
+            root: root.clone(),
+            planner: Planner::Demo,
+            users: Mutex::new(HashMap::new()),
+        });
+        let base = Router {
+            users: Some(registry),
+            ..base
+        };
+        let (first, first_id) = base
+            .scoped(&request("GET", "/api/project", ""))
+            .expect("first user");
+        let (second, second_id) = base
+            .scoped(&request("GET", "/api/project", ""))
+            .expect("second user");
+        assert_ne!(first_id, second_id);
+        assert!((first.lock_studio().project().tracks[1].volume - 0.31).abs() > f32::EPSILON);
+        assert_ne!(first.gemini_session_root(), second.gemini_session_root());
+        let first_session = first.gemini_session_root().join("first-session");
+        let second_session = second.gemini_session_root().join("second-session");
+        fs::create_dir_all(&first_session).expect("first session directory");
+        fs::create_dir_all(&second_session).expect("second session directory");
+        replace_text_file(
+            &first_session.join("session.json"),
+            r#"{"id":"first-private-session","updatedAt":1}"#,
+        )
+        .expect("first private session");
+        replace_text_file(
+            &second_session.join("session.json"),
+            r#"{"id":"second-private-session","updatedAt":2}"#,
+        )
+        .expect("second private session");
+        let first_sessions = first.handle(&request("GET", "/api/gemini-sessions", ""));
+        assert!(first_sessions.body.contains("first-private-session"));
+        assert!(!first_sessions.body.contains("second-private-session"));
+        assert_eq!(
+            first
+                .handle(&request(
+                    "POST",
+                    "/api/mix",
+                    "track_id=2&volume=0.25&muted=false",
+                ))
+                .status,
+            200
+        );
+        assert!((first.lock_studio().project().tracks[1].volume - 0.25).abs() < f32::EPSILON);
+        assert!((second.lock_studio().project().tracks[1].volume - 0.25).abs() > f32::EPSILON);
+        std::fs::remove_dir_all(root).expect("remove user test projects");
+    }
+
+    #[test]
+    fn history_navigation_preserves_forward_snapshots() {
+        let router = Router::demo();
+        assert_eq!(
+            router
+                .handle(&request(
+                    "POST",
+                    "/api/mix",
+                    "track_id=2&volume=0.4&muted=false",
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .handle(&request(
+                    "POST",
+                    "/api/mix",
+                    "track_id=2&volume=1.1&muted=false",
+                ))
+                .status,
+            200
+        );
+        let history: serde_json::Value =
+            serde_json::from_str(&router.handle(&request("GET", "/api/history", "")).body)
+                .expect("history response");
+        let latest_version = router.lock_studio().project().version;
+        assert_eq!(history["entries"][1]["source"], "Manual");
+        assert_eq!(history["entries"][1]["summary"], "Manual project change");
+        let restored: serde_json::Value = serde_json::from_str(
+            &router
+                .handle(&request("POST", "/api/history", "index=0"))
+                .body,
+        )
+        .expect("restored project");
+        assert_eq!(restored["version"], latest_version + 1);
+        let forward: serde_json::Value = serde_json::from_str(
+            &router
+                .handle(&request("POST", "/api/history", "index=2"))
+                .body,
+        )
+        .expect("forward project");
+        assert_eq!(forward["version"], latest_version + 2);
+        assert!((router.lock_studio().project().tracks[1].volume - 1.1).abs() < f32::EPSILON);
+        let reloaded: serde_json::Value =
+            serde_json::from_str(&router.handle(&request("GET", "/api/project", "")).body)
+                .expect("reloaded project");
+        assert_eq!(reloaded["canUndo"], true);
+        assert_eq!(router.handle(&request("POST", "/api/undo", "")).status, 200);
+        assert_eq!(router.handle(&request("POST", "/api/undo", "")).status, 200);
+        assert_eq!(router.lock_studio().project().edits.len(), 0);
+        assert_eq!(
+            router
+                .history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .current,
+            0
+        );
+    }
+
+    #[test]
+    fn history_is_bounded_by_bytes_and_keeps_the_current_project() {
+        let mut snapshots = Vec::new();
+        for index in 0..8 {
+            let mut project = Studio::new().project().clone();
+            project.name = format!("{index}{}", "x".repeat(1024 * 1024));
+            snapshots.push(project);
+        }
+        let current_project = snapshots.last().expect("current snapshot").clone();
+        let mut history = ProjectHistory {
+            current: snapshots.len() - 1,
+            snapshots,
+        };
+
+        trim_project_history(&current_project, &mut history);
+
+        assert!(
+            project_document(&current_project, &history).len()
+                <= current_project.to_json().len() + MAX_HISTORY_BYTES
+        );
+        assert_eq!(
+            history.snapshots[history.current].name,
+            current_project.name
+        );
+        assert!(history.snapshots.len() < 8);
+    }
+
+    #[test]
+    fn static_requests_do_not_create_users_and_user_storage_is_bounded() {
+        assert!(!request_needs_user_scope(&request("GET", "/", "")));
+        assert!(!request_needs_user_scope(&request("GET", "/app.js", "")));
+        assert!(!request_needs_user_scope(&request("GET", "/missing", "")));
+        assert!(!request_needs_user_scope(&request(
+            "GET",
+            "/api/missing",
+            ""
+        )));
+        let mut audio_stream = request("GET", "/api/audio-stream/token/1/0", "");
+        assert!(!request_needs_user_scope(&audio_stream));
+        audio_stream.headers.insert(
+            "cookie".to_owned(),
+            "daw_ai_user=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        );
+        assert!(request_needs_user_scope(&audio_stream));
+        assert!(request_needs_user_scope(&request(
+            "GET",
+            "/api/project",
+            ""
+        )));
+
+        let mut cache = HashMap::new();
+        let active_router = Router::demo();
+        active_router
+            .edit_jobs
+            .create(100, None)
+            .expect("active cached edit");
+        cache.insert(
+            "expired".to_owned(),
+            CachedUser {
+                router: active_router,
+                last_used: Instant::now() - USER_CACHE_IDLE - Duration::from_secs(1),
+                last_persisted: Instant::now(),
+            },
+        );
+        for index in 0..MAX_CACHED_USERS {
+            cache.insert(
+                index.to_string(),
+                CachedUser {
+                    router: Router::demo(),
+                    last_used: Instant::now(),
+                    last_persisted: Instant::now(),
+                },
+            );
+        }
+        expire_and_bound_user_cache(&mut cache);
+        assert!(cache.contains_key("expired"));
+        assert!(cache.len() < MAX_CACHED_USERS);
+
+        let id = TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "daw-ai-user-limit-test-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("user limit root");
+        for index in 0..MAX_PERSISTED_USERS {
+            fs::create_dir(root.join(format!("{index:032x}"))).expect("bounded user directory");
+        }
+        replace_text_file(
+            &root.join(format!("{:032x}", 0)).join(USER_LAST_USED_FILE),
+            "0\n",
+        )
+        .expect("expired user marker");
+        let base = Router {
+            users: Some(Arc::new(UserRegistry {
+                root: root.clone(),
+                planner: Planner::Demo,
+                users: Mutex::new(HashMap::new()),
+            })),
+            ..Router::demo()
+        };
+        let mut forged_user = request("GET", "/api/project", "");
+        forged_user.headers.insert(
+            "cookie".to_owned(),
+            "daw_ai_user=ffffffffffffffffffffffffffffffff".to_owned(),
+        );
+        let error = match base.scoped(&forged_user) {
+            Ok(_) => panic!("a client-chosen user ID must not allocate storage"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let response = scope_error_response(&error);
+        assert_eq!(response.status, 401);
+        assert!(
+            response
+                .set_cookie
+                .is_some_and(|cookie| cookie.contains("Max-Age=0"))
+        );
+        let (_, replacement_id) = base
+            .scoped(&request("GET", "/api/project", ""))
+            .expect("expired persisted user is reclaimed");
+        assert!(replacement_id.is_some());
+        assert!(!root.join(format!("{:032x}", 0)).exists());
+        let error = match base.scoped(&request("GET", "/api/project", "")) {
+            Ok(_) => panic!("new persistent user must be rejected at the bound"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(scope_error_response(&error).status, 507);
+        fs::remove_dir_all(root).expect("remove user limit root");
+    }
+
+    #[test]
+    fn project_history_survives_a_server_restart() {
+        let (router, project_path) = persisted_demo();
+        assert_eq!(
+            router
+                .handle(&request(
+                    "POST",
+                    "/api/mix",
+                    "track_id=2&volume=0.4&muted=false",
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .handle(&request(
+                    "POST",
+                    "/api/mix",
+                    "track_id=2&volume=1.1&muted=false",
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .handle(&request("POST", "/api/history", "index=0"))
+                .status,
+            200
+        );
+
+        let reopened = ProjectStore::open(project_path.clone())
+            .expect("reopened project")
+            .1;
+        let history = load_project_history(&project_path, reopened.project())
+            .expect("reopened project history");
+        assert_eq!(history.current, 0);
+        assert_eq!(history.snapshots.len(), 3);
+        assert!((history.snapshots[2].tracks[1].volume - 1.1).abs() < f32::EPSILON);
+        assert!(
+            std::fs::read_to_string(&project_path)
+                .expect("project document")
+                .contains("\"history\"")
+        );
+        std::fs::remove_file(project_path).expect("remove project test file");
+    }
+
+    #[test]
+    fn reset_clears_project_history() {
+        let (router, project_path) = persisted_demo();
+        assert_eq!(
+            router
+                .handle(&request(
+                    "POST",
+                    "/api/mix",
+                    "track_id=2&volume=0.4&muted=false",
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            router.handle(&request("POST", "/api/reset", "")).status,
+            200
+        );
+
+        let reopened = ProjectStore::open(project_path.clone())
+            .expect("reopened reset project")
+            .1;
+        let history = load_project_history(&project_path, reopened.project())
+            .expect("reopened reset history");
+        assert_eq!(history.current, 0);
+        assert_eq!(history.snapshots.len(), 1);
+        std::fs::remove_file(project_path).expect("remove project test file");
+    }
+
+    #[test]
+    fn interrupt_is_terminal_and_blocks_late_completion() {
+        let jobs = EditJobs::new();
+        let (id, _, _) = jobs.create(100, None).expect("job");
+        let other_jobs = (1..MAX_ACTIVE_EDIT_JOBS)
+            .map(|_| jobs.create(100, None).expect("other active job").0)
+            .collect::<Vec<_>>();
+        let cancellation = jobs.cancellation(id);
+        jobs.set_running(id, "editing", "working");
+        assert!(jobs.interrupt(id));
+        assert!(cancellation.load(Ordering::SeqCst));
+        jobs.complete(id, "too late".to_owned());
+        let response = jobs.response(id).expect("interrupted response");
+        let body: serde_json::Value = serde_json::from_str(&response.body).expect("job JSON");
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["errorStatus"], 409);
+        assert!(jobs.is_interrupted(id));
+        assert!(jobs.create(100, None).is_err());
+        jobs.worker_finished(id);
+        assert!(jobs.create(100, None).is_ok());
+        for other_id in other_jobs {
+            jobs.fail(other_id, 500, "test cleanup".to_owned());
+        }
+    }
+
+    #[test]
+    fn fallback_user_ids_preserve_the_cookie_contract() {
+        let first = fallback_operation_id(1);
+        let second = fallback_operation_id(2);
+        assert!(valid_user_id(&first));
+        assert!(valid_user_id(&second));
+        assert_ne!(first, second);
     }
 }

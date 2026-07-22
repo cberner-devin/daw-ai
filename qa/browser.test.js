@@ -209,7 +209,7 @@ async function submitPrompt(cdp, sessionId, prompt, expectedEditCount) {
   })()`);
   await waitFor(
     async () =>
-      evaluate(cdp, sessionId, `document.querySelectorAll('.edit-item').length === ${expectedEditCount}`),
+      evaluate(cdp, sessionId, `Number(document.querySelector('#session-history-list').dataset.currentEditCount) === ${expectedEditCount}`),
     `prompt: ${prompt}`,
   );
 }
@@ -385,6 +385,27 @@ async function run() {
       async () => evaluate(cdp, appSession, "document.querySelectorAll('.track-row').length === 3"),
       "initial arrangement",
     );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `({
+        historyHeading: document.querySelector('#session-history-heading').textContent,
+        duplicateGeminiHistory: Boolean(document.querySelector('#edit-log-title')),
+        suggestions: [...document.querySelectorAll('.prompt-suggestions button')]
+          .map((button) => ({ label: button.textContent, prompt: button.dataset.prompt })),
+      })`),
+      {
+        historyHeading: "History",
+        duplicateGeminiHistory: false,
+        suggestions: [
+          { label: "Waltz", prompt: "Turn this section into a waltz" },
+          {
+            label: "Drop",
+            prompt: "Turn this section into a classic dubstep drop. It builds in speed and intensity for the first 80%, then the drop, and then the outro into the rest of the track",
+          },
+          { label: "warm", prompt: "Make the chords warm and spacious, and this section relaxing" },
+        ],
+      },
+      "history and prompt suggestions",
+    );
     const offlineRender = await evaluate(
       cdp,
       appSession,
@@ -501,7 +522,8 @@ async function run() {
         cdp,
         appSession,
         `window.__reloadPollCount >= 1 &&
-          document.querySelector('#compose-button').disabled &&
+          !document.querySelector('#compose-button').disabled &&
+          document.querySelector('#compose-button span').textContent === 'Interrupt' &&
           !document.querySelector('#edit-progress').hidden &&
           document.querySelector('#edit-progress-label').textContent === 'Gemini is planning the reloaded edit' &&
           document.querySelector('#prompt-input').value === 'resume after reload'`,
@@ -1050,7 +1072,7 @@ async function run() {
       promptSingleFlight,
       {
         requests: 1,
-        submitDisabled: true,
+        submitDisabled: false,
         transportActive: false,
         progressVisible: true,
         progressText: "Starting the AI edit",
@@ -1086,10 +1108,10 @@ async function run() {
         submitDisabled: document.querySelector('#compose-button').disabled,
         progressVisible: !document.querySelector('#edit-progress').hidden,
         progressText: document.querySelector('#edit-progress-label').textContent,
-        renderedEdits: document.querySelectorAll('.edit-item').length,
+        renderedEdits: Number(document.querySelector('#session-history-list').dataset.currentEditCount),
       })`),
       {
-        submitDisabled: true,
+        submitDisabled: false,
         progressVisible: true,
         progressText: "Connection interrupted; still waiting for the accepted edit",
         renderedEdits: 0,
@@ -1097,7 +1119,7 @@ async function run() {
       "poll failures must leave the accepted edit pending until status reconciliation",
     );
     await waitFor(
-      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 1"),
+      async () => evaluate(cdp, appSession, 'Number(document.querySelector(\'#session-history-list\').dataset.currentEditCount) === 1'),
       "single-flight prompt reconciliation after status loss",
     );
     await waitFor(
@@ -1124,7 +1146,7 @@ async function run() {
       return {
         serverVersion: project.version,
         serverEdits: project.edits.length,
-        renderedEdits: document.querySelectorAll('.edit-item').length,
+        renderedEdits: Number(document.querySelector('#session-history-list').dataset.currentEditCount),
         savedState: document.querySelector('#saved-state').textContent,
         errorToast: !document.querySelector('#toast').hidden &&
           document.querySelector('#toast').classList.contains('is-error'),
@@ -1135,6 +1157,53 @@ async function run() {
     assert.equal(reconciledPrompt.renderedEdits, reconciledPrompt.serverEdits);
     assert.equal(reconciledPrompt.savedState, `Version ${reconciledPrompt.serverVersion}`);
     assert.equal(reconciledPrompt.errorToast, false, reconciledPrompt.toastText);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.querySelectorAll('#session-history-list [data-history-index]').length >= 2`,
+      ),
+      "session history after completed edit",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, `(() => {
+        const indexes = [...document.querySelectorAll('#session-history-list [data-history-index]')]
+          .map((item) => Number(item.dataset.historyIndex));
+        return indexes.every((index, position) => position === 0 || indexes[position - 1] > index);
+      })()`),
+      true,
+      "session history must display the most recent state first",
+    );
+    const historyIndexes = await evaluate(cdp, appSession, `(() => {
+      const items = [...document.querySelectorAll('#session-history-list [data-history-index]')];
+      return { newest: items[0].dataset.historyIndex, oldest: items.at(-1).dataset.historyIndex };
+    })()`);
+    await evaluate(
+      cdp,
+      appSession,
+      `document.querySelector('#session-history-list [data-history-index="${historyIndexes.oldest}"]').click()`,
+    );
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.querySelector('#session-history-list [aria-current="step"]')?.dataset.historyIndex === '${historyIndexes.oldest}'`,
+      ),
+      "backward session history navigation",
+    );
+    await evaluate(
+      cdp,
+      appSession,
+      `document.querySelector('#session-history-list [data-history-index="${historyIndexes.newest}"]').click()`,
+    );
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.querySelector('#session-history-list [aria-current="step"]')?.dataset.historyIndex === '${historyIndexes.newest}'`,
+      ),
+      "forward session history navigation",
+    );
     assert.equal(
       await evaluate(cdp, appSession, "document.querySelector('#compose-button').disabled"),
       false,
@@ -1197,7 +1266,7 @@ async function run() {
       document.querySelector('#prompt-form').requestSubmit();
     })()`);
     await waitFor(
-      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 2"),
+      async () => evaluate(cdp, appSession, `Number(document.querySelector('#session-history-list').dataset.currentEditCount) === 2`),
       "compound AI edit after project refresh retry",
     );
     await waitFor(
@@ -1300,7 +1369,7 @@ async function run() {
         appSession,
         `window.__mixDuringPromptRequests === 1 &&
           document.querySelector('[data-volume-track="1"]').value === '0.51' &&
-          document.querySelector('#compose-button').disabled`,
+          !document.querySelector('#compose-button').disabled`,
       ),
       "manual mixer mutation during accepted edit polling",
     );
@@ -1403,7 +1472,13 @@ async function run() {
       window.__releaseNextUndoRequest();
     })()`);
     await waitFor(
-      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 0"),
+      async () => evaluate(cdp, appSession, `(async () => {
+        const project = await fetch('/api/project').then((response) => response.json());
+        const currentHistory = document.querySelector('#session-history-list [aria-current="step"]');
+        return project.edits.length === 0 &&
+          document.querySelector('#saved-state').textContent === 'Version ' + project.version &&
+          Number(currentHistory?.dataset.historyVersion) === project.version;
+      })()`),
       "serialized undo completion",
     );
 
@@ -1462,7 +1537,7 @@ async function run() {
       const project = await fetch('/api/project').then((response) => response.json());
       return {
         competingOperationId: window.__competingOperationId,
-        renderedEdits: document.querySelectorAll('.edit-item').length,
+        renderedEdits: Number(document.querySelector('#session-history-list').dataset.currentEditCount),
         prompt: document.querySelector('#prompt-input').value,
         projectOperationId: project.edits.at(-1).operationId,
         missingOperationId: window.__missingOperationId,
@@ -1478,7 +1553,7 @@ async function run() {
       document.querySelector('#undo-button').click();
     })()`);
     await waitFor(
-      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 0"),
+      async () => evaluate(cdp, appSession, 'Number(document.querySelector(\'#session-history-list\').dataset.currentEditCount) === 0'),
       "operation identity test cleanup",
     );
 
@@ -1534,6 +1609,22 @@ async function run() {
             headers: { 'Content-Type': 'application/json' },
           });
         }
+        if (resource === '/api/history' && window.__incrementalProjectReleased) {
+          return new Response(JSON.stringify({
+            current: 1,
+            currentVersion: published.version,
+            entries: [
+              {
+                index: 0, version: project.version, summary: 'Initial project', source: 'Project',
+                prompt: null, start: null, end: null,
+              },
+              {
+                index: 1, version: published.version, summary: 'Added the first staged layer', source: 'Gemini',
+                prompt: 'build this in stages', start: 8, end: 16,
+              },
+            ],
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
         if (resource === '/api/project') {
           if (window.__incrementalProjectReleased) {
             return new Response(JSON.stringify(published), {
@@ -1583,9 +1674,9 @@ async function run() {
         cdp,
         appSession,
         `window.__incrementalPolls >= 1 &&
-          document.querySelectorAll('.edit-item').length === window.__incrementalBaseEditCount + 1 &&
-          document.querySelector('.edit-item strong').textContent === 'Added the first staged layer' &&
-          document.querySelector('#compose-button').disabled &&
+          Number(document.querySelector('#session-history-list').dataset.currentEditCount) === window.__incrementalBaseEditCount + 1 &&
+          document.querySelector('[data-history-source="Gemini"] strong').textContent === 'Added the first staged layer' &&
+          !document.querySelector('#compose-button').disabled &&
           document.querySelector('#edit-progress-label').textContent ===
             'Applied step 1 of 2: Added the first staged layer' &&
           document.querySelector('#edit-progress-fill').style.width === '55%' &&
@@ -1613,7 +1704,7 @@ async function run() {
             'Gemini stopped unexpectedly. 1 partial change was saved; review the project before retrying.' &&
           document.querySelector('#toast').classList.contains('is-error') &&
           document.querySelector('#prompt-input').value === '' &&
-          document.querySelectorAll('.edit-item').length === window.__incrementalBaseEditCount + 1 &&
+          Number(document.querySelector('#session-history-list').dataset.currentEditCount) === window.__incrementalBaseEditCount + 1 &&
           localStorage.getItem('daw-ai.pending-edit.v1') === null`,
       ),
       "partial edit warning after terminal failure",
@@ -1623,7 +1714,7 @@ async function run() {
         window.__restoreIncrementalFetch();
         return {
           version: Number(document.querySelector('#saved-state').textContent.replace('Version ', '')),
-          edits: document.querySelectorAll('.edit-item').length,
+          edits: Number(document.querySelector('#session-history-list').dataset.currentEditCount),
         };
       })()`),
       { version: incrementalBase.version + 1, edits: incrementalBase.edits + 1 },
@@ -1645,6 +1736,8 @@ async function run() {
         action: { type: 'gain', value: 1.05, target: 'all' },
       });
       window.__acceptanceLossPosts = 0;
+      window.__acceptanceLossPolls = 0;
+      window.__acceptanceLossInterrupts = 0;
       window.fetch = async function fetch(resource, options) {
         if (resource === '/api/edits') {
           window.__acceptanceLossPosts += 1;
@@ -1668,9 +1761,29 @@ async function run() {
         }
         if (typeof resource === 'string' && resource.startsWith('/api/edit-operations/')) {
           return new Response(JSON.stringify({
-            id: 'recovered', operationId: window.__acceptanceLossOperationId, status: 'failed', phase: 'failed',
-            errorStatus: 500, error: 'Gemini stopped before completing the edit.', elapsedSeconds: 0,
+            id: 'recovered', operationId: window.__acceptanceLossOperationId, status: 'running', phase: 'editing',
+            detail: 'Recovered active edit', elapsedSeconds: 1, pollAfterMs: 20,
             timeoutSeconds: 1200, appliedSteps: 1, projectVersion: published.version,
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (resource === '/api/edits/recovered/interrupt') {
+          window.__acceptanceLossInterrupts += 1;
+          return new Response(JSON.stringify({ status: 'interrupted' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (resource === '/api/edits/recovered') {
+          window.__acceptanceLossPolls += 1;
+          const interrupted = window.__acceptanceLossInterrupts > 0;
+          return new Response(JSON.stringify({
+            id: 'recovered', operationId: window.__acceptanceLossOperationId,
+            status: interrupted ? 'failed' : 'running', phase: interrupted ? 'failed' : 'editing',
+            detail: interrupted ? 'Edit interrupted by the user.' : 'Recovered active edit',
+            errorStatus: interrupted ? 409 : undefined,
+            error: interrupted ? 'Edit interrupted by the user.' : undefined,
+            elapsedSeconds: 1, pollAfterMs: 20, timeoutSeconds: 1200,
+            appliedSteps: 1, projectVersion: published.version,
           }), { status: 200, headers: { 'Content-Type': 'application/json' } });
         }
         if (resource === '/api/project') {
@@ -1691,13 +1804,24 @@ async function run() {
       async () => evaluate(
         cdp,
         appSession,
+        `window.__acceptanceLossPolls > 0 &&
+          document.querySelector('#compose-button span').textContent === 'Interrupt'`,
+      ),
+      "interruptible recovered edit after acceptance loss",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#compose-button').click()");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
         `!document.querySelector('#compose-button').disabled &&
           window.__acceptanceLossPosts === 2 &&
+          window.__acceptanceLossInterrupts === 1 &&
           document.querySelector('#toast-message').textContent ===
-            'Gemini stopped before completing the edit. 1 partial change was saved; review the project before retrying.' &&
+            'Edit interrupted by the user. 1 partial change was saved; review the project before retrying.' &&
           document.querySelector('#toast').classList.contains('is-error') &&
           document.querySelector('#prompt-input').value === '' &&
-          document.querySelectorAll('.edit-item').length === ${acceptanceLossBase.edits + 1} &&
+          Number(document.querySelector('#session-history-list').dataset.currentEditCount) === ${acceptanceLossBase.edits + 1} &&
           localStorage.getItem('daw-ai.pending-edit.v1') === null`,
       ),
       "partial publication recovery after edit acceptance loss",
@@ -2693,7 +2817,7 @@ async function run() {
         evaluate(
           cdp,
           appSession,
-          "document.querySelectorAll('.edit-item').length === 1 && !document.querySelector('#compose-button').disabled",
+          `Number(document.querySelector('#session-history-list').dataset.currentEditCount) === 1 && !document.querySelector('#compose-button').disabled`,
         ),
       "queued prompt completion",
     );
@@ -2706,7 +2830,7 @@ async function run() {
     assert.equal(queuedPromptProject.edits[0].end, 16);
     await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
     await waitFor(
-      async () => evaluate(cdp, appSession, "document.querySelectorAll('.edit-item').length === 0"),
+      async () => evaluate(cdp, appSession, `Number(document.querySelector('#session-history-list').dataset.currentEditCount) === 0`),
       "queued prompt undo",
     );
     await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
@@ -2723,6 +2847,7 @@ async function run() {
       const source = await fetch('/app.js').then((response) => response.text());
       const engine = source.slice(source.indexOf('class AudioEngine'), source.indexOf('const audio = new AudioEngine'));
       return {
+        apiNoStore: source.includes('cache: "no-store"'),
         audioContext: source.includes('AudioContext'),
         offlineContext: source.includes('OfflineAudioContext'),
         oscillator: source.includes('createOscillator'),
@@ -2737,6 +2862,7 @@ async function run() {
     assert.deepEqual(
       clientAudioBoundary,
       {
+        apiNoStore: true,
         audioContext: false,
         offlineContext: false,
         oscillator: false,

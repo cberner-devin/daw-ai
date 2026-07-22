@@ -409,6 +409,7 @@ main {
 
 .timeline-panel,
 .prompt-panel,
+.session-history,
 .edit-log-panel {
   border: 1px solid var(--line);
   border-radius: 14px;
@@ -945,6 +946,148 @@ main {
 .edit-log-panel {
   margin-top: 17px;
   padding: 20px 24px 22px;
+}
+
+.session-history {
+  margin-top: 17px;
+  padding: 20px 24px 22px;
+}
+
+.session-history .section-heading {
+  margin-bottom: 5px;
+}
+
+.session-history-hint {
+  margin: 0 0 16px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.history-list {
+  display: grid;
+  gap: 7px;
+}
+
+.history-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.018);
+  text-align: left;
+  transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
+}
+
+.history-item:hover {
+  border-color: rgba(189, 255, 93, 0.26);
+  background: rgba(255, 255, 255, 0.035);
+  transform: translateY(-1px);
+}
+
+.history-item[aria-current="step"] {
+  border-color: rgba(189, 255, 93, 0.3);
+  background: linear-gradient(90deg, rgba(189, 255, 93, 0.09), rgba(189, 255, 93, 0.025));
+  cursor: default;
+}
+
+.history-marker {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  place-items: center;
+  border-radius: 7px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.045);
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.history-item[aria-current="step"] .history-marker {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.history-copy {
+  min-width: 0;
+}
+
+.history-copy strong,
+.history-copy span {
+  display: block;
+}
+
+.history-copy strong {
+  overflow: hidden;
+  margin-bottom: 3px;
+  font-size: 10px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-title {
+  display: flex !important;
+  align-items: center;
+  gap: 7px;
+}
+
+.history-title strong {
+  min-width: 0;
+}
+
+.history-source {
+  flex: none;
+  padding: 2px 5px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 7px;
+  font-style: normal;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.history-source-gemini {
+  border-color: rgba(189, 255, 93, 0.2);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.history-prompt {
+  overflow: hidden;
+  margin-bottom: 3px;
+  color: var(--muted) !important;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-copy span {
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.history-current {
+  visibility: hidden;
+  padding: 4px 7px;
+  border-radius: 999px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.history-item[aria-current="step"] .history-current {
+  visibility: visible;
 }
 
 .section-heading {
@@ -2046,6 +2189,7 @@ input[type="range"]::-moz-range-thumb {
     width: 100%;
   }
 
+  .session-history,
   .edit-log-panel {
     padding: 18px;
   }

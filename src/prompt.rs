@@ -18,6 +18,7 @@ pub struct AutomationPoint {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
+    GraphMutation,
     Compound {
         actions: Vec<Action>,
     },

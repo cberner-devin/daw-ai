@@ -4,10 +4,9 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::model::{
     ChannelOperation, ChannelOperationAction, Clip, ClipEvent, Edit, EditOperation, Effect,
-    FILTER_CUTOFF_MAX_HZ, FILTER_CUTOFF_MIN_HZ, FILTER_RESONANCE_DEFAULT, FILTER_RESONANCE_MAX,
-    FILTER_RESONANCE_MIN, Instrument, MAX_PROMPT_CHARACTERS, Modulator, Project, ProjectFileError,
-    Routing, SURGE_ENGINE, Track, TrackRole, automation_target_range, legacy_filter_cutoff_hz,
-    valid_surge_preset,
+    FILTER_CUTOFF_MAX_HZ, FILTER_CUTOFF_MIN_HZ, FILTER_RESONANCE_MAX, FILTER_RESONANCE_MIN,
+    Instrument, MAX_PROMPT_CHARACTERS, Modulator, Project, ProjectFileError, Routing, SURGE_ENGINE,
+    Track, TrackRole, automation_target_range, valid_surge_preset,
 };
 use crate::prompt::{Action, AutomationPoint, MAX_COMPOUND_ACTIONS, MidiNote};
 
@@ -48,54 +47,17 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         .enumerate()
         .map(|(index, value)| parse_track(value, index, duration, &mut ids, &mut event_ids))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut edits = match (root.get("edits"), root.get("regionalEdits")) {
-        (Some(_), Some(_)) => {
-            return Err(invalid(
-                "sound graph cannot contain both edits and regionalEdits",
-            ));
-        }
-        (Some(value), None) => {
-            let values = value
-                .as_array()
-                .ok_or_else(|| invalid("edits must be an array"))?;
-            if values.len() > MAX_EDITS {
-                return Err(invalid(format!(
-                    "edits supports at most {MAX_EDITS} entries"
-                )));
-            }
-            values
-                .iter()
-                .enumerate()
-                .map(|(index, value)| parse_edit(value, index, duration, &mut ids))
-                .collect::<Result<Vec<_>, _>>()?
-        }
-        (None, Some(value)) => {
-            let values = value
-                .as_array()
-                .ok_or_else(|| invalid("regionalEdits must be an array"))?;
-            if values.len() > MAX_EDITS {
-                return Err(invalid(format!(
-                    "regionalEdits supports at most {MAX_EDITS} entries"
-                )));
-            }
-            let mut next_id = ids
-                .iter()
-                .chain(event_ids.iter())
-                .copied()
-                .max()
-                .unwrap_or(0)
-                .checked_add(1)
-                .ok_or_else(|| invalid("sound graph ID namespace is exhausted"))?;
-            values
-                .iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    parse_regional_edit(value, index, duration, &mut next_id, &mut ids)
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        }
-        (None, None) => Vec::new(),
-    };
+    let edit_values = array(root, "edits")?;
+    if edit_values.len() > MAX_EDITS {
+        return Err(invalid(format!(
+            "edits supports at most {MAX_EDITS} entries"
+        )));
+    }
+    let mut edits = edit_values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| parse_edit(value, index, duration, &mut ids))
+        .collect::<Result<Vec<_>, _>>()?;
     for edit in &mut edits {
         validate_loaded_automation(&mut edit.action, &tracks)?;
     }
@@ -107,21 +69,13 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     {
         return Err(invalid("edit operation IDs must be unique"));
     }
-    let operation_values = root
-        .get("editOperations")
-        .map(|value| {
-            value
-                .as_array()
-                .ok_or_else(|| invalid("editOperations must be an array"))
-        })
-        .transpose()?
-        .map_or(&[][..], Vec::as_slice);
+    let operation_values = array(root, "editOperations")?;
     if operation_values.len() > MAX_EDITS {
         return Err(invalid(format!(
             "editOperations supports at most {MAX_EDITS} entries"
         )));
     }
-    let mut edit_operations = operation_values
+    let edit_operations = operation_values
         .iter()
         .enumerate()
         .map(|(index, value)| parse_edit_operation(value, index, version))
@@ -132,20 +86,6 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         .any(|operation| !recorded_operation_ids.insert(operation.operation_id.clone()))
     {
         return Err(invalid("edit operation records must be unique"));
-    }
-    for edit in &edits {
-        let Some(operation_id) = &edit.operation_id else {
-            continue;
-        };
-        if valid_operation_id(operation_id) && recorded_operation_ids.insert(operation_id.clone()) {
-            edit_operations.push(EditOperation {
-                operation_id: operation_id.clone(),
-                completed: true,
-                applied_steps: 1,
-                project_version: version,
-                message: edit.summary.clone(),
-            });
-        }
     }
     let channel_operation_values = root
         .get("channelOperations")
@@ -211,15 +151,10 @@ fn parse_track(
     let instrument_object = object(instrument_value, "instrument")?;
     let instrument_id = unique_id(instrument_object, "id", ids, "instrument")?;
     expect_type(instrument_object, "instrument")?;
-    let _legacy_engine = limited_string(instrument_object, "engine", 1, 64)?;
-    let legacy_preset = instrument_object
-        .get("preset")
-        .map_or(Ok("Custom"), |value| {
-            value
-                .as_str()
-                .ok_or_else(|| invalid("preset must be a string"))
-        })?;
-    let preset = migrate_surge_preset(legacy_preset, role);
+    if string(instrument_object, "engine")? != SURGE_ENGINE {
+        return Err(invalid("instrument engine must be Surge XT"));
+    }
+    let preset = string(instrument_object, "preset")?;
     if !valid_surge_preset(preset) {
         return Err(invalid("instrument preset is unsupported"));
     }
@@ -227,27 +162,15 @@ fn parse_track(
         field(instrument_object, "parameters")?,
         "instrument parameters",
     )?;
-    let attack = optional_range(instrument_parameters, "attack", 0.05, 0.0, 2.0)?;
-    let release = optional_range(instrument_parameters, "release", 0.3, 0.0, 5.0)?;
     let instrument = Instrument {
         id: instrument_id,
         engine: SURGE_ENGINE.to_owned(),
         preset: preset.to_owned(),
-        attack: if attack > 1.0 { attack / 2.0 } else { attack },
-        release: if release > 1.0 {
-            release / 5.0
-        } else {
-            release
-        },
-        cutoff: optional_range(
-            instrument_parameters,
-            "cutoff",
-            optional_range(instrument_parameters, "tone", 0.6, 0.0, 1.0)?,
-            0.0,
-            1.0,
-        )?,
-        resonance: optional_range(instrument_parameters, "resonance", 0.18, 0.0, 1.0)?,
-        pitch: optional_range(instrument_parameters, "pitch", 0.5, 0.0, 1.0)?,
+        attack: range(instrument_parameters, "attack", 0.0, 1.0)?,
+        release: range(instrument_parameters, "release", 0.0, 1.0)?,
+        cutoff: range(instrument_parameters, "cutoff", 0.0, 1.0)?,
+        resonance: range(instrument_parameters, "resonance", 0.0, 1.0)?,
+        pitch: range(instrument_parameters, "pitch", 0.0, 1.0)?,
     };
 
     let effect_values = array(track, "effects")?;
@@ -258,7 +181,7 @@ fn parse_track(
     }
     let effects = effect_values
         .iter()
-        .map(|value| parse_effect(value, role, ids))
+        .map(|value| parse_effect(value, ids))
         .collect::<Result<Vec<_>, _>>()?;
 
     let modulator_values = array(track, "modulators")?;
@@ -318,65 +241,7 @@ fn parse_track(
     Ok(parsed)
 }
 
-fn migrate_surge_preset(preset: &str, role: TrackRole) -> &str {
-    match preset {
-        "Punch Kit" => "Surge Percussion",
-        "Deep Bass" => "Surge Bass",
-        "Warm Pad" => "Surge Pad",
-        "Bright Lead" => "Surge Lead",
-        "Air Texture" => "Surge Atmosphere",
-        "Custom" => match role {
-            TrackRole::Drums => "Surge Percussion",
-            TrackRole::Bass => "Surge Bass",
-            TrackRole::Chords => "Surge Pad",
-            TrackRole::Lead => "Surge Lead",
-            TrackRole::Texture => "Surge Atmosphere",
-        },
-        _ => preset,
-    }
-}
-
-fn migrate_surge_parameter(parameter: &str) -> &str {
-    match parameter {
-        "instrument.tone" => "instrument.cutoff",
-        "instrument.oscillator1.tuning" | "instrument.oscillator2.tuning" => "instrument.pitch",
-        "instrument.oscillator1.level" | "instrument.oscillator2.level" => "track.volume",
-        _ => parameter,
-    }
-}
-
-fn migrate_surge_automation_points(parameter: &str, points: &mut [AutomationPoint]) {
-    let transform: Option<fn(f32) -> f32> = match parameter {
-        "instrument.oscillator1.tuning" | "instrument.oscillator2.tuning" => {
-            Some(|value: f32| (value + 24.0) / 48.0)
-        }
-        "instrument.attack" if points.iter().any(|point| point.value > 1.0) => {
-            Some(|value: f32| value / 2.0)
-        }
-        "instrument.release" if points.iter().any(|point| point.value > 1.0) => {
-            Some(|value: f32| value / 5.0)
-        }
-        "instrument.pitch"
-            if points
-                .iter()
-                .any(|point| !(0.0..=1.0).contains(&point.value)) =>
-        {
-            Some(|value: f32| (value + 2.0) / 4.0)
-        }
-        _ => None,
-    };
-    if let Some(transform) = transform {
-        for point in points {
-            point.value = transform(point.value).clamp(0.0, 1.0);
-        }
-    }
-}
-
-fn parse_effect(
-    value: &JsonValue,
-    role: TrackRole,
-    ids: &mut HashSet<u64>,
-) -> Result<Effect, ProjectFileError> {
+fn parse_effect(value: &JsonValue, ids: &mut HashSet<u64>) -> Result<Effect, ProjectFileError> {
     let effect = object(value, "effect")?;
     let id = unique_id(effect, "id", ids, "effect")?;
     expect_type(effect, "effect")?;
@@ -391,10 +256,9 @@ fn parse_effect(
         name,
         mix: range(parameters, "mix", 0.0, 1.0)?,
         cutoff_hz: if is_filter {
-            Some(optional_range(
+            Some(range(
                 parameters,
                 "cutoff",
-                legacy_filter_cutoff_hz(role),
                 FILTER_CUTOFF_MIN_HZ,
                 FILTER_CUTOFF_MAX_HZ,
             )?)
@@ -402,10 +266,9 @@ fn parse_effect(
             None
         },
         resonance: if is_filter {
-            Some(optional_range(
+            Some(range(
                 parameters,
                 "resonance",
-                FILTER_RESONANCE_DEFAULT,
                 FILTER_RESONANCE_MIN,
                 FILTER_RESONANCE_MAX,
             )?)
@@ -437,10 +300,10 @@ fn parse_modulator(
         name: limited_string(modulator, "name", 1, 64)?,
         shape,
         rate: range(parameters, "rate", 0.01, 20.0)?,
-        rate_mode: optional_enum(modulator, "rateMode", "hz", &["hz", "tempo"])?,
-        trigger: optional_enum(modulator, "trigger", "free", &["free", "midi"])?,
+        rate_mode: required_enum(modulator, "rateMode", &["hz", "tempo"])?,
+        trigger: required_enum(modulator, "trigger", &["free", "midi"])?,
         depth: range(parameters, "depth", 0.0, 1.0)?,
-        target: migrate_surge_parameter(&target).to_owned(),
+        target,
         enabled: boolean(modulator, "enabled")?,
     })
 }
@@ -509,7 +372,7 @@ fn validate_control_routing(
         let route = object(route, &format!("routing control entry {}", index + 1))?;
         let connection = (
             string(route, "source")?.to_owned(),
-            migrate_surge_parameter(string(route, "target")?).to_owned(),
+            string(route, "target")?.to_owned(),
         );
         if !expected.contains(&connection) || !seen.insert(connection) {
             return Err(invalid(
@@ -572,7 +435,7 @@ fn validate_routing_edges(
         let edge = object(edge, &format!("routing edge {}", index + 1))?;
         let connection = (
             string(edge, "source")?.to_owned(),
-            migrate_surge_parameter(string(edge, "target")?).to_owned(),
+            string(edge, "target")?.to_owned(),
             string(edge, "type")?.to_owned(),
         );
         if !expected.contains(&connection) || !seen.insert(connection) {
@@ -771,47 +634,15 @@ fn valid_operation_id(operation_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-fn parse_regional_edit(
-    value: &JsonValue,
-    index: usize,
-    project_duration: f32,
-    next_id: &mut u64,
-    ids: &mut HashSet<u64>,
-) -> Result<Edit, ProjectFileError> {
-    let edit = object(value, "regional edit")?;
-    let context = format!("regional edit {}", index + 1);
-    let start = range(edit, "start", 0.0, project_duration)?;
-    let end = range(edit, "end", 0.0, project_duration)?;
-    if end <= start {
-        return Err(invalid(format!("{context} end must be after its start")));
-    }
-    if *next_id > MAX_SAFE_INTEGER {
-        return Err(invalid("sound graph ID namespace is exhausted"));
-    }
-    let id = *next_id;
-    *next_id = next_id
-        .checked_add(1)
-        .ok_or_else(|| invalid("sound graph ID namespace is exhausted"))?;
-    if !ids.insert(id) {
-        return Err(invalid(format!("duplicate sound graph ID: {id}")));
-    }
-    Ok(Edit {
-        id,
-        operation_id: None,
-        start,
-        end,
-        prompt: "Prior regional edit".to_owned(),
-        summary: "Active regional state".to_owned(),
-        action: parse_action(field(edit, "action")?, 0)?,
-    })
-}
-
 fn parse_action(value: &JsonValue, depth: usize) -> Result<Action, ProjectFileError> {
     if depth > 8 {
         return Err(invalid("compound action nesting is too deep"));
     }
     let action = object(value, "edit action")?;
     let action_type = string(action, "type")?;
+    if action_type == "graph-mutation" {
+        return Ok(Action::GraphMutation);
+    }
     if action_type == "compound" {
         let values = array(action, "actions")?;
         if values.is_empty() || values.len() > MAX_COMPOUND_ACTIONS {
@@ -901,7 +732,7 @@ fn parse_action(value: &JsonValue, depth: usize) -> Result<Action, ProjectFileEr
             if !(2..=16).contains(&points.len()) {
                 return Err(invalid("automation requires between 2 and 16 points"));
             }
-            let mut points = points
+            let points = points
                 .iter()
                 .map(|point| {
                     let point = object(point, "automation point")?;
@@ -913,14 +744,9 @@ fn parse_action(value: &JsonValue, depth: usize) -> Result<Action, ProjectFileEr
                 .collect::<Result<Vec<_>, ProjectFileError>>()?;
             validate_automation_points(&points)?;
             let parameter = limited_string(action, "name", 1, 64)?;
-            migrate_surge_automation_points(&parameter, &mut points);
             Ok(Action::Automation {
-                track_id: action
-                    .get("trackId")
-                    .map(|_| integer(action, "trackId"))
-                    .transpose()?
-                    .unwrap_or(0),
-                parameter: migrate_surge_parameter(&parameter).to_owned(),
+                track_id: integer(action, "trackId")?,
+                parameter,
                 curve: automation_curve(string(action, "curve")?)?,
                 points,
                 target: required_target(target, "automation")?,
@@ -970,6 +796,7 @@ fn validate_loaded_automation(
     tracks: &[Track],
 ) -> Result<(), ProjectFileError> {
     match action {
+        Action::GraphMutation => {}
         Action::Compound { actions } => {
             for action in actions {
                 validate_loaded_automation(action, tracks)?;
@@ -1107,15 +934,6 @@ fn sound_tool(value: &str) -> Result<&'static str, ProjectFileError> {
 
 fn sound_parameter(value: &str) -> Result<&'static str, ProjectFileError> {
     match value {
-        // Retained edit history is descriptive and may predate Surge XT.
-        "waveform" => Ok("waveform"),
-        "oscillator1.waveform" => Ok("oscillator1.waveform"),
-        "oscillator1.tuning" => Ok("oscillator1.tuning"),
-        "oscillator1.level" => Ok("oscillator1.level"),
-        "oscillator2.waveform" => Ok("oscillator2.waveform"),
-        "oscillator2.tuning" => Ok("oscillator2.tuning"),
-        "oscillator2.level" => Ok("oscillator2.level"),
-        "tone" => Ok("tone"),
         "preset" => Ok("preset"),
         "attack" => Ok("attack"),
         "release" => Ok("release"),
@@ -1206,17 +1024,12 @@ fn limited_string(
     Ok(value.to_owned())
 }
 
-fn optional_enum(
+fn required_enum(
     object: &Object,
     name: &str,
-    default: &str,
     allowed: &[&str],
 ) -> Result<String, ProjectFileError> {
-    let value = object.get(name).map_or(Ok(default), |value| {
-        value
-            .as_str()
-            .ok_or_else(|| invalid(format!("{name} must be a string")))
-    })?;
+    let value = string(object, name)?;
     if allowed.contains(&value) {
         Ok(value.to_owned())
     } else {
@@ -1251,20 +1064,6 @@ fn range(object: &Object, name: &str, minimum: f32, maximum: f32) -> Result<f32,
         )));
     }
     Ok(value)
-}
-
-fn optional_range(
-    object: &Object,
-    name: &str,
-    default: f32,
-    minimum: f32,
-    maximum: f32,
-) -> Result<f32, ProjectFileError> {
-    if object.contains_key(name) {
-        range(object, name, minimum, maximum)
-    } else {
-        Ok(default)
-    }
 }
 
 fn relative_range(object: &Object, name: &str) -> Result<f32, ProjectFileError> {
@@ -1342,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_automation_is_migrated_and_cross_validated() {
+    fn persisted_automation_is_cross_validated() {
         let mut studio = crate::model::Studio::new();
         let bass_id = studio.project().tracks[1].id;
         studio
@@ -1382,153 +1181,20 @@ mod tests {
         out_of_range["edits"][0]["action"]["points"][1]["value"] = JsonValue::from(99.0);
         assert!(parse_project(&out_of_range.to_string()).is_err());
 
-        let mut legacy: JsonValue = serde_json::from_str(&source).unwrap();
-        legacy["edits"][0]["action"]
+        let mut missing_owner: JsonValue = serde_json::from_str(&source).unwrap();
+        missing_owner["edits"][0]["action"]
             .as_object_mut()
             .expect("automation action")
             .remove("trackId");
-        let migrated = parse_project(&legacy.to_string()).expect("legacy automation owner");
-        assert!(
-            migrated
-                .to_json()
-                .contains(&format!("\"trackId\":{bass_id}"))
-        );
+        assert!(parse_project(&missing_owner.to_string()).is_err());
 
-        let mut legacy_tuning: JsonValue = serde_json::from_str(&source).unwrap();
-        legacy_tuning["edits"][0]["action"]["name"] =
+        let mut unsupported_tuning: JsonValue = serde_json::from_str(&source).unwrap();
+        unsupported_tuning["edits"][0]["action"]["name"] =
             JsonValue::String("instrument.oscillator1.tuning".to_owned());
-        legacy_tuning["edits"][0]["action"]["points"][0]["value"] = JsonValue::from(-12.0);
-        legacy_tuning["edits"][0]["action"]["points"][1]["value"] = JsonValue::from(12.0);
-        let migrated = parse_project(&legacy_tuning.to_string()).expect("legacy tuning lane");
-        let Action::Automation {
-            parameter, points, ..
-        } = &migrated.edits[0].action
-        else {
-            panic!("expected automation action");
-        };
-        assert_eq!(parameter, "instrument.pitch");
-        assert_eq!(points[0].value, 0.25);
-        assert_eq!(points[1].value, 0.75);
+        unsupported_tuning["edits"][0]["action"]["points"][0]["value"] = JsonValue::from(-12.0);
+        unsupported_tuning["edits"][0]["action"]["points"][1]["value"] = JsonValue::from(12.0);
+        assert!(parse_project(&unsupported_tuning.to_string()).is_err());
     }
-
-    #[test]
-    fn accepts_legacy_configure_parameters_in_retained_history() {
-        for parameter in [
-            "waveform",
-            "oscillator1.waveform",
-            "oscillator1.tuning",
-            "oscillator1.level",
-            "oscillator2.waveform",
-            "oscillator2.tuning",
-            "oscillator2.level",
-            "tone",
-        ] {
-            assert_eq!(sound_parameter(parameter).unwrap(), parameter);
-        }
-    }
-
-    #[test]
-    fn legacy_edit_operation_ids_remain_saveable() {
-        let mut studio = crate::model::Studio::new();
-        studio
-            .apply_prompt(4.0, 8.0, "increase volume")
-            .expect("valid edit");
-        let mut legacy: JsonValue = serde_json::from_str(&studio.project().to_json()).unwrap();
-        legacy["edits"][0]["operationId"] = JsonValue::String("legacy:id".to_owned());
-        legacy
-            .as_object_mut()
-            .expect("project object")
-            .remove("editOperations");
-
-        let parsed = parse_project(&legacy.to_string()).expect("legacy operation ID");
-        assert!(parsed.edit_operations.is_empty());
-        let mut reloaded = crate::model::Studio::from_project(parsed);
-        reloaded
-            .set_mix(1, Some(0.75), None)
-            .expect("mutation after legacy load");
-        parse_project(&reloaded.project().to_json()).expect("saveable mutated project");
-    }
-
-    #[test]
-    fn legacy_custom_instruments_and_routes_are_migrated() {
-        let mut legacy: JsonValue = serde_json::from_str(&Project::demo().to_json()).unwrap();
-        for track in legacy["tracks"].as_array_mut().expect("tracks") {
-            let instrument = track["instrument"].as_object_mut().expect("instrument");
-            instrument.remove("preset");
-            instrument.remove("oscillators");
-            let parameters = instrument["parameters"]
-                .as_object_mut()
-                .expect("instrument parameters");
-            let cutoff = parameters.remove("cutoff").expect("native cutoff");
-            parameters.insert("tone".to_owned(), cutoff);
-            instrument.insert(
-                "engine".to_owned(),
-                JsonValue::String("Legacy built-in synth".to_owned()),
-            );
-            for modulator in track["modulators"].as_array_mut().expect("modulators") {
-                let modulator = modulator.as_object_mut().expect("modulator");
-                modulator.remove("rateMode");
-                modulator.remove("trigger");
-                modulator.insert(
-                    "target".to_owned(),
-                    JsonValue::String("instrument.tone".to_owned()),
-                );
-            }
-            for effect in track["effects"].as_array_mut().expect("effects") {
-                let parameters = effect["parameters"]
-                    .as_object_mut()
-                    .expect("effect parameters");
-                parameters.remove("cutoff");
-                parameters.remove("resonance");
-            }
-            let edges = track["routing"]["edges"]
-                .as_array_mut()
-                .expect("routing edges");
-            edges.retain(|edge| {
-                edge["type"] != "midi"
-                    || !edge["target"]
-                        .as_str()
-                        .is_some_and(|target| target.starts_with("modulator:"))
-            });
-            for edge in edges {
-                if edge["type"] == "control" {
-                    edge["target"] = JsonValue::String("instrument.tone".to_owned());
-                }
-            }
-            for route in track["routing"]["control"]
-                .as_array_mut()
-                .expect("control routes")
-            {
-                route["target"] = JsonValue::String("instrument.tone".to_owned());
-            }
-        }
-
-        let parsed = parse_project(&legacy.to_string()).expect("legacy sound graph");
-        assert!(
-            parsed
-                .tracks
-                .iter()
-                .all(|track| track.instrument.engine == SURGE_ENGINE)
-        );
-        assert_eq!(parsed.tracks[0].instrument.preset, "Surge Percussion");
-        assert_eq!(parsed.tracks[1].instrument.preset, "Surge Bass");
-        assert_eq!(parsed.tracks[2].instrument.preset, "Surge Pad");
-        assert!(parsed.tracks.iter().all(|track| {
-            track.modulators.iter().all(|modulator| {
-                modulator.rate_mode == "hz"
-                    && modulator.trigger == "free"
-                    && modulator.target == "instrument.cutoff"
-            })
-        }));
-        let bass_filter = &parsed.tracks[1].effects[0];
-        assert_eq!(
-            bass_filter.cutoff_hz,
-            Some(legacy_filter_cutoff_hz(TrackRole::Bass))
-        );
-        assert_eq!(bass_filter.resonance, Some(FILTER_RESONANCE_DEFAULT));
-        parse_project(&parsed.to_json()).expect("migrated graph remains saveable");
-    }
-
     #[test]
     fn accepts_retained_clip_slices_with_shared_event_ids() {
         let mut studio = crate::model::Studio::new();
@@ -1569,23 +1235,5 @@ mod tests {
             1,
         );
         assert!(parse_project(&edge).is_err());
-    }
-
-    #[test]
-    fn parses_the_bounded_regional_session_projection() {
-        let mut studio = crate::model::Studio::new();
-        studio
-            .apply_prompt(4.0, 8.0, "increase volume")
-            .expect("valid regional edit");
-        studio
-            .apply_prompt(8.0, 12.0, "use a sawtooth bass")
-            .expect("valid baseline edit");
-
-        let source = studio.project().planner_json();
-        let parsed = parse_project(&source).expect("valid session projection");
-        assert_eq!(parsed.edits.len(), 1);
-        assert!(source.contains("\"regionalEdits\":["));
-        assert!(!source.contains("\"prompt\":"));
-        assert!(!source.contains("\"type\":\"instrument\",\"name\":\"sawtooth\""));
     }
 }

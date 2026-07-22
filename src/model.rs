@@ -76,7 +76,7 @@ impl TrackRole {
     }
 }
 
-pub(crate) const fn legacy_filter_cutoff_hz(role: TrackRole) -> f32 {
+pub(crate) const fn role_default_filter_cutoff_hz(role: TrackRole) -> f32 {
     match role {
         TrackRole::Drums => 3_150.0,
         TrackRole::Bass => 420.0,
@@ -211,6 +211,14 @@ pub struct Project {
     pub channel_operations: Vec<ChannelOperation>,
 }
 
+pub(crate) struct MidiClipSpec {
+    pub(crate) label: String,
+    pub(crate) start: f32,
+    pub(crate) end: f32,
+    pub(crate) loop_beats: f32,
+    pub(crate) notes: Vec<crate::prompt::MidiNote>,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct ProjectFileError(String);
 
@@ -303,32 +311,6 @@ impl Project {
                 output.push(',');
             }
             operation.write_json(&mut output);
-        }
-        output.push_str("]}");
-        output
-    }
-
-    #[must_use]
-    pub(crate) fn planner_json(&self) -> String {
-        let mut output = String::with_capacity(4096);
-        self.write_graph_json(&mut output);
-        output.push_str(",\"regionalEdits\":[");
-        let regional_count = self
-            .edits
-            .iter()
-            .filter(|edit| edit.action.has_regional_state())
-            .count();
-        for (index, edit) in self
-            .edits
-            .iter()
-            .filter(|edit| edit.action.has_regional_state())
-            .skip(regional_count.saturating_sub(EDIT_LOG_LIMIT))
-            .enumerate()
-        {
-            if index > 0 {
-                output.push(',');
-            }
-            edit.write_regional_json(&mut output);
         }
         output.push_str("]}");
         output
@@ -637,18 +619,6 @@ impl Edit {
         self.action.write_json(output);
         output.push('}');
     }
-
-    fn write_regional_json(&self, output: &mut String) {
-        write!(
-            output,
-            "{{\"start\":{},\"end\":{},\"action\":",
-            decimal(self.start),
-            decimal(self.end)
-        )
-        .expect("writing to a string cannot fail");
-        self.action.write_regional_json(output);
-        output.push('}');
-    }
 }
 
 impl EditOperation {
@@ -699,6 +669,7 @@ impl ChannelOperation {
 impl Action {
     fn retain_after_track_deletion(&mut self, track_id: u64) -> bool {
         match self {
+            Self::GraphMutation => true,
             Self::Compound { actions } => {
                 actions.retain_mut(|action| action.retain_after_track_deletion(track_id));
                 !actions.is_empty()
@@ -713,6 +684,7 @@ impl Action {
 
     fn has_regional_state(&self) -> bool {
         match self {
+            Self::GraphMutation => false,
             Self::Compound { actions } => actions.iter().any(Self::has_regional_state),
             Self::Timed { action, .. } => action.has_regional_state(),
             Self::Gain { .. }
@@ -731,28 +703,9 @@ impl Action {
         }
     }
 
-    fn write_regional_json(&self, output: &mut String) {
-        if let Self::Compound { actions } = self {
-            output.push_str("{\"type\":\"compound\",\"actions\":[");
-            for (index, action) in actions
-                .iter()
-                .filter(|action| action.has_regional_state())
-                .enumerate()
-            {
-                if index > 0 {
-                    output.push(',');
-                }
-                action.write_regional_json(output);
-            }
-            output.push_str("]}");
-        } else {
-            debug_assert!(self.has_regional_state());
-            self.write_json(output);
-        }
-    }
-
     fn write_json(&self, output: &mut String) {
         match self {
+            Self::GraphMutation => write!(output, "{{\"type\":\"graph-mutation\"}}"),
             Self::Compound { actions } => {
                 output.push_str("{\"type\":\"compound\",\"actions\":[");
                 for (index, action) in actions.iter().enumerate() {
@@ -1020,10 +973,14 @@ impl Studio {
 
     #[must_use]
     pub fn to_json(&self) -> String {
+        self.to_json_with_can_undo(!self.history.is_empty())
+    }
+
+    #[must_use]
+    pub(crate) fn to_json_with_can_undo(&self, can_undo: bool) -> String {
         let mut json = self.project.to_json();
         json.pop();
-        write!(json, ",\"canUndo\":{}}}", !self.history.is_empty())
-            .expect("writing to a string cannot fail");
+        write!(json, ",\"canUndo\":{can_undo}}}").expect("writing to a string cannot fail");
         json
     }
 
@@ -1205,6 +1162,7 @@ impl Studio {
 
     fn apply_action(&mut self, action: &Action, start: f32, end: f32) -> Result<(), StudioError> {
         match action {
+            Action::GraphMutation => Ok(()),
             Action::Compound { actions } => {
                 for action in actions {
                     self.apply_action(action, start, end)?;
@@ -1397,6 +1355,338 @@ impl Studio {
             .retain_mut(|edit| edit.action.retain_after_track_deletion(track_id));
         self.project.version += 1;
         Ok(())
+    }
+
+    pub(crate) fn delete_midi_clip(
+        &mut self,
+        track_id: u64,
+        clip_id: u64,
+        selection_start: f32,
+        selection_end: f32,
+    ) -> Result<(), StudioError> {
+        if selection_end <= selection_start {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        let mut project = self.project.clone();
+        let track_index = project
+            .tracks
+            .iter()
+            .position(|track| track.id == track_id)
+            .ok_or(StudioError::UnknownTrack)?;
+        let clip_index = project.tracks[track_index]
+            .clips
+            .iter()
+            .position(|clip| clip.id == clip_id)
+            .ok_or(StudioError::UnknownSoundTool)?;
+        let original = project.tracks[track_index].clips.remove(clip_index);
+        if original.end <= selection_start || original.start >= selection_end {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        let mut retained = Vec::with_capacity(2);
+        if original.start < selection_start {
+            let mut left = original.clone();
+            left.end = selection_start;
+            retained.push(left);
+        }
+        if original.end > selection_end {
+            let mut right = original;
+            if !retained.is_empty() {
+                right.id = self.take_id();
+            }
+            right.start = selection_end;
+            retained.push(right);
+        }
+        project.tracks[track_index].clips.extend(retained);
+        project.tracks[track_index]
+            .clips
+            .sort_by(|left, right| left.start.total_cmp(&right.start));
+        self.remember();
+        project.version = self.project.version + 1;
+        self.project = project;
+        Ok(())
+    }
+
+    pub(crate) fn create_midi_clip(
+        &mut self,
+        track_id: u64,
+        spec: &MidiClipSpec,
+    ) -> Result<u64, StudioError> {
+        let role = self
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map(|track| track.role)
+            .ok_or(StudioError::UnknownTrack)?;
+        validate_clip_fields(
+            &spec.label,
+            spec.start,
+            spec.end,
+            spec.loop_beats,
+            &spec.notes,
+            self.project.duration,
+        )?;
+        let clip_id = self.take_id();
+        let events = spec
+            .notes
+            .iter()
+            .map(|note| ClipEvent {
+                id: self.take_id(),
+                kind: "note".to_owned(),
+                time: note.time,
+                duration: note.duration,
+                pitch: note.pitch,
+                velocity: note.velocity,
+            })
+            .collect();
+        self.remember();
+        let track = self
+            .project
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id && track.role == role)
+            .expect("track was validated");
+        track.clips.push(Clip {
+            id: clip_id,
+            label: spec.label.trim().to_owned(),
+            start: spec.start,
+            end: spec.end,
+            source_start: spec.start,
+            style: "generated".to_owned(),
+            loop_beats: spec.loop_beats,
+            events,
+        });
+        track
+            .clips
+            .sort_by(|left, right| left.start.total_cmp(&right.start));
+        self.project.version += 1;
+        Ok(clip_id)
+    }
+
+    pub(crate) fn replace_midi_clip(
+        &mut self,
+        track_id: u64,
+        clip_id: u64,
+        spec: &MidiClipSpec,
+        selection_start: f32,
+        selection_end: f32,
+    ) -> Result<(), StudioError> {
+        validate_clip_fields(
+            &spec.label,
+            spec.start,
+            spec.end,
+            spec.loop_beats,
+            &spec.notes,
+            self.project.duration,
+        )?;
+        if spec.start < selection_start
+            || spec.end > selection_end
+            || selection_end <= selection_start
+        {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        let mut project = self.project.clone();
+        let track_index = project
+            .tracks
+            .iter()
+            .position(|track| track.id == track_id)
+            .ok_or(StudioError::UnknownTrack)?;
+        let clip_index = project.tracks[track_index]
+            .clips
+            .iter()
+            .position(|clip| clip.id == clip_id)
+            .ok_or(StudioError::UnknownSoundTool)?;
+        let original = project.tracks[track_index].clips.remove(clip_index);
+        if original.end <= selection_start || original.start >= selection_end {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        if original.end <= spec.start || original.start >= spec.end {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        let events = spec
+            .notes
+            .iter()
+            .map(|note| ClipEvent {
+                id: self.take_id(),
+                kind: "note".to_owned(),
+                time: note.time,
+                duration: note.duration,
+                pitch: note.pitch,
+                velocity: note.velocity,
+            })
+            .collect();
+        let mut replacements = Vec::with_capacity(3);
+        if original.start < spec.start {
+            let mut left = original.clone();
+            left.id = self.take_id();
+            left.end = spec.start;
+            replacements.push(left);
+        }
+        replacements.push(Clip {
+            id: clip_id,
+            label: spec.label.trim().to_owned(),
+            start: spec.start,
+            end: spec.end,
+            source_start: spec.start,
+            style: "generated".to_owned(),
+            loop_beats: spec.loop_beats,
+            events,
+        });
+        if original.end > spec.end {
+            let mut right = original;
+            right.id = self.take_id();
+            right.start = spec.end;
+            replacements.push(right);
+        }
+        let track = &mut project.tracks[track_index];
+        track.clips.extend(replacements);
+        track
+            .clips
+            .sort_by(|left, right| left.start.total_cmp(&right.start));
+        self.remember();
+        project.version = self.project.version + 1;
+        self.project = project;
+        Ok(())
+    }
+
+    pub(crate) fn delete_modulator(
+        &mut self,
+        track_id: u64,
+        modulator_id: u64,
+    ) -> Result<(), StudioError> {
+        let mut project = self.project.clone();
+        let track = project
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or(StudioError::UnknownTrack)?;
+        let index = track
+            .modulators
+            .iter()
+            .position(|modulator| modulator.id == modulator_id)
+            .ok_or(StudioError::UnknownSoundTool)?;
+        track.modulators.remove(index);
+        self.remember();
+        project.version = self.project.version + 1;
+        self.project = project;
+        Ok(())
+    }
+
+    pub(crate) fn create_effect(
+        &mut self,
+        track_id: u64,
+        name: &str,
+        mix: f32,
+    ) -> Result<u64, StudioError> {
+        if !matches!(
+            name,
+            "Reverb"
+                | "Room"
+                | "Echo"
+                | "Chorus"
+                | "Low-pass filter"
+                | "Punch compressor"
+                | "Drive"
+                | "Shimmer"
+        ) || !mix.is_finite()
+            || !(0.0..=1.0).contains(&mix)
+        {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        let track_index = self
+            .project
+            .tracks
+            .iter()
+            .position(|track| track.id == track_id)
+            .ok_or(StudioError::UnknownTrack)?;
+        let id = self.take_id();
+        self.remember();
+        self.project.tracks[track_index]
+            .effects
+            .push(effect(id, name, mix));
+        self.project.tracks[track_index]
+            .routing
+            .effect_order
+            .push(id);
+        self.project.version += 1;
+        Ok(id)
+    }
+
+    pub(crate) fn delete_effect(
+        &mut self,
+        track_id: u64,
+        effect_id: u64,
+    ) -> Result<(), StudioError> {
+        let mut project = self.project.clone();
+        let track = project
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or(StudioError::UnknownTrack)?;
+        let index = track
+            .effects
+            .iter()
+            .position(|effect| effect.id == effect_id)
+            .ok_or(StudioError::UnknownSoundTool)?;
+        track.effects.remove(index);
+        track.routing.effect_order.retain(|id| *id != effect_id);
+        self.remember();
+        project.version = self.project.version + 1;
+        self.project = project;
+        Ok(())
+    }
+
+    pub(crate) fn set_tempo(&mut self, bpm: u16) -> Result<(), StudioError> {
+        if !(60..=180).contains(&bpm) {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        self.remember();
+        self.project.bpm = bpm;
+        self.project.version += 1;
+        Ok(())
+    }
+
+    pub(crate) fn create_modulator(
+        &mut self,
+        track_id: u64,
+        parameter: &str,
+        shape: &str,
+        rate: f32,
+        depth: f32,
+    ) -> Result<u64, StudioError> {
+        let track_index = self
+            .project
+            .tracks
+            .iter()
+            .position(|track| track.id == track_id)
+            .ok_or(StudioError::UnknownTrack)?;
+        if !valid_modulator_target(&self.project.tracks[track_index], parameter)
+            || !matches!(
+                shape,
+                "sine" | "triangle" | "square" | "random" | "envelope"
+            )
+            || !rate.is_finite()
+            || !(0.01..=20.0).contains(&rate)
+            || !depth.is_finite()
+            || !(0.0..=1.0).contains(&depth)
+        {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        let id = self.take_id();
+        self.remember();
+        self.project.tracks[track_index].modulators.push(Modulator {
+            id,
+            name: "AI modulation".to_owned(),
+            shape: shape.to_owned(),
+            rate,
+            rate_mode: "hz".to_owned(),
+            trigger: "free".to_owned(),
+            depth,
+            target: parameter.to_owned(),
+            enabled: true,
+        });
+        self.project.version += 1;
+        Ok(id)
     }
 
     pub(crate) fn record_channel_operation(
@@ -1768,6 +2058,39 @@ fn configure_track_tool(
         }
         "routing" => Err(StudioError::InvalidSoundTool),
         _ => Err(StudioError::UnknownSoundTool),
+    }
+}
+
+fn validate_clip_fields(
+    label: &str,
+    start: f32,
+    end: f32,
+    loop_beats: f32,
+    notes: &[crate::prompt::MidiNote],
+    project_duration: f32,
+) -> Result<(), StudioError> {
+    if label.trim().is_empty()
+        || label.chars().count() > 64
+        || !start.is_finite()
+        || !end.is_finite()
+        || start < 0.0
+        || end <= start
+        || end > project_duration
+        || !loop_beats.is_finite()
+        || !(0.25..=16.0).contains(&loop_beats)
+        || notes.len() > 32
+        || notes.iter().any(|note| {
+            !note.time.is_finite()
+                || !(0.0..loop_beats).contains(&note.time)
+                || !note.duration.is_finite()
+                || !(0.0625..=loop_beats).contains(&note.duration)
+                || !note.velocity.is_finite()
+                || !(0.01..=1.0).contains(&note.velocity)
+        })
+    {
+        Err(StudioError::InvalidSoundTool)
+    } else {
+        Ok(())
     }
 }
 
@@ -3435,35 +3758,6 @@ mod tests {
         let mut restored = studio.project().clone();
         restored.version = 1;
         assert_eq!(restored.to_json(), before);
-    }
-
-    #[test]
-    fn planner_projection_omits_materialized_history_payloads() {
-        let mut studio = Studio::new();
-        for _ in 0..64 {
-            studio
-                .apply_prompt(8.0, 16.0, "make the drop hit harder")
-                .expect("repeatable genre edit");
-        }
-
-        let full_json = studio.project().to_json();
-        let planner_json = studio.project().planner_json();
-        let current_clip_count = studio
-            .project()
-            .tracks
-            .iter()
-            .map(|track| track.clips.len())
-            .sum::<usize>();
-        assert!(full_json.len() > 128 * 1024);
-        assert!(planner_json.len() < 64 * 1024);
-        assert_eq!(
-            planner_json.matches("\"events\":[").count(),
-            current_clip_count
-        );
-        assert!(!planner_json.contains("\"type\":\"midi-clip\""));
-        assert!(!planner_json.contains("\"prompt\":"));
-        assert!(planner_json.contains("\"regionalEdits\":["));
-        assert!(planner_json.contains("\"type\":\"effect\""));
     }
 
     #[test]

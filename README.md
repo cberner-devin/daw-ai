@@ -2,7 +2,7 @@
 
 DAW-AI is a local, prompt-driven music studio for making music without learning a traditional DAW. Select a region of the timeline, describe the change in everyday language, and hear the arrangement update immediately.
 
-The project is a Rust server with a responsive browser client. Surge XT executes instrument nodes in the backend through its official Rust bindings, and the browser only plays the resulting WAV. Prompted edits are produced by Gemini 3.6 Flash, which hears renders made by that same backend engine.
+The project is a small Rust server with a responsive browser client. Surge XT renders the sound graph by default, with a custom built-in Rust backend available for debugging, and the browser only plays the resulting WAV. Prompted edits are produced by Gemini 3.6 Flash, which can hear renders made by the selected backend.
 
 ## Run it
 
@@ -10,11 +10,8 @@ Prerequisites:
 
 - Rust 1.85 or newer
 - `curl`
-- CMake, a C++20 compiler, Clang/libclang, pkg-config, and OpenSSL development headers
 - A [Gemini API key](https://ai.google.dev/gemini-api/docs/api-key)
 - `just` (optional, but recommended)
-
-On Ubuntu, the native build prerequisites can be installed with `apt install cmake clang libclang-dev pkg-config libssl-dev`. The first build downloads and compiles Surge XT and its submodules, so it is substantially slower than subsequent builds.
 
 Set the standard environment variable:
 
@@ -48,14 +45,15 @@ cargo run -- --port 8888
 
 1. Drag over any part of the arrangement to set the edit region. On touch devices, swipe to pan normally or tap **Select region** before dragging a selection.
 2. Enter a request such as `increase the volume`, `add a bass`, `make the chords warm and spacious`, or `turn this section into a dubstep drop`.
-3. Press **Make change**, then use the transport to hear the result.
-4. Switch to **Advanced** to edit clips in a piano roll and inspect the track's typed sound graph. Selecting an instrument, effect, or modulator node opens its parameters in the side pane. The **Debug** tab lists retained Gemini sessions and provides a copyable environment and browser-error report.
+3. Press **Make change**, then use the transport to hear the result. The button becomes **Interrupt** while Gemini is working.
+4. Use session history to inspect earlier states and move forward again, or download the complete arrangement with **Export WAV**.
+5. Switch to **Advanced** to edit MIDI notes in the piano roll and select instrument, effect, and modulator nodes in the sound graph to edit their parameters. Tracks can also be created and deleted there. The **Debug** tab selects the Surge XT or built-in instrument backend, lists retained Gemini sessions, and provides a copyable environment and browser-error report.
 
-The current project is stored as `sound-graph.json` in the working directory. Set `DAW_AI_PROJECT_PATH` to use another path. DAW-AI validates an existing file at startup, creates the demo graph when it is missing, and safely saves every accepted prompt, mixer change, Advanced edit, undo, and reset. This makes the graph directly inspectable and editable while the server is stopped.
+No login is required. DAW-AI assigns each browser a private random cookie and stores its project under `users/<cookie>/sound-graph.json` beside `DAW_AI_PROJECT_PATH` (or beside the working-directory default). Each user has independent edit jobs, history, playback, backend selection, and project state. DAW-AI creates the demo graph for a new user and safely saves every accepted prompt, mixer change, Advanced edit, undo, reset, and history selection.
 
-For each prompt, Gemini receives the selected edit range and the checked-in synth contract under `gemini/`. It can read the latest graph, apply validated edit batches, search for musical context, and choose the tracks plus absolute project start/end times to render as WAV audio directly into its next multimodal turn. Listening is independent of edit scope, so Gemini can hear context before or after a transition. The Rust backend drives the complete Surge XT engine through the official alpha `surge-rs` bindings: Surge handles MIDI notes, polyphonic voices, oscillators, envelopes, filters, patch parameters, and audio blocks, after which DAW-AI applies its routed effects, automation, and master mix. The integration enforces an audible baseline before the first edit and another listen after every successful batch. Gemini evaluates pulse, subdivision, groove, tension, impact, timbre, and contrast from the audio itself, then iterates as needed.
+For each prompt, Gemini receives the selected edit range and the checked-in synth contract under `gemini/`. It can read the latest graph; create, update, and delete tracks and their MIDI clips, effects, and modulators through narrow stable-ID functions; set instrument and routing parameters, track mute, and tempo; undo its latest mutation; search for musical context; and choose channels plus absolute project start/end times to render as WAV audio directly into its next multimodal turn. Listening is independent of edit scope and entirely model-directed: the integration encourages it when useful but never requires it. The Rust backend renders the project without depending on the user's tab.
 
-When the producer claims completion, a fresh Gemini interaction receives the user request and exact latest WAV but none of the producer transcript. This independent judge accepts the result or returns detailed audible evidence and required corrections. A rejection forces another concrete edit and listen before the producer can request a new verdict. There is no predetermined iteration, judge-review, or tool-call limit; the overall 20-minute request timeout is the loop boundary. The server publishes each successful tool batch as an undoable edit while Gemini is still working, then records a completion marker only after the judge accepts. Direct Advanced edits and track creation or deletion use the same persisted graph.
+Gemini may render before or after edits whenever listening would help, but no separate model reviews or rejects its completion decision. It may also complete based on graph inspection alone. There is no predetermined iteration or tool-call limit; the overall 20-minute request timeout is the loop boundary. The server publishes each successful atomic mutation as an undoable edit while Gemini is still working. Direct Advanced edits and channel creation or deletion use the same persisted graph.
 
 Prompted edits run as asynchronous jobs so reverse proxies never need to hold one request open while Gemini works. The browser polls short status requests, fetches each published intermediate project and the completed project, and shows the current phase, applied steps, and elapsed time. Gemini may spend up to 20 minutes on an edit; if the project changes before that edit finishes, the result is rejected instead of overwriting newer work.
 
