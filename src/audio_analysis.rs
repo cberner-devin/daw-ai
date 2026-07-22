@@ -256,7 +256,7 @@ pub(crate) fn playback_sample_count(start: f32, end: f32) -> usize {
 }
 
 pub(crate) fn playback_start_sample(time: f32) -> usize {
-    (f64::from(time) * f64::from(SAMPLE_RATE)).round() as usize
+    midi_event_sample(f64::from(time))
 }
 
 pub(crate) fn playback_start_sample_milliseconds(milliseconds: u64) -> usize {
@@ -272,6 +272,10 @@ fn playback_end_sample(time: f32) -> usize {
 
 fn sample_time(sample: usize) -> f32 {
     precise_sample_time(sample) as f32
+}
+
+fn midi_event_sample(time: f64) -> usize {
+    (time.max(0.0) * f64::from(SAMPLE_RATE)).round() as usize
 }
 
 fn precise_sample_time(sample: usize) -> f64 {
@@ -403,14 +407,14 @@ fn render_track(
             .wrapping_mul(1_000_003)
             .wrapping_add(sequence as u64);
         midi.push(ScheduledMidiEvent {
-            sample: playback_start_sample(onset.max(0.0) as f32),
+            sample: midi_event_sample(onset),
             note_id,
             pitch: occurrence.event.pitch,
             velocity: occurrence.velocity,
             note_on: true,
         });
         midi.push(ScheduledMidiEvent {
-            sample: playback_start_sample((onset + duration).max(0.0) as f32),
+            sample: midi_event_sample(onset + duration),
             note_id,
             pitch: occurrence.event.pitch,
             velocity: 0.0,
@@ -424,17 +428,14 @@ fn render_track(
     let mut output_index = 0;
     while output_index < output.len() {
         let block_start = start_sample + output_index;
-        let block_end = block_start + crate::surge::BLOCK_SIZE;
-        while let Some(event) = midi
-            .get(event_index)
-            .filter(|event| event.sample < block_end)
-        {
+        let count = crate::surge::BLOCK_SIZE.min(output.len() - output_index);
+        let block_end = block_start + count;
+        for event in scheduled_midi_events_before(&midi, &mut event_index, block_end) {
             if event.note_on {
                 engine.play_note(event.pitch, event.velocity, event.note_id);
             } else {
                 engine.release_note(event.pitch, event.note_id);
             }
-            event_index += 1;
         }
         let time = precise_sample_time(block_start);
         for (name, target, base) in [
@@ -455,7 +456,6 @@ fn render_track(
             engine.set_parameter(name, value)?;
         }
         let block = engine.process();
-        let count = crate::surge::BLOCK_SIZE.min(output.len() - output_index);
         for index in 0..count {
             output[output_index + index] = (block[0][index] + block[1][index]) * 0.5;
         }
@@ -470,6 +470,16 @@ struct ScheduledMidiEvent {
     pitch: u8,
     velocity: f32,
     note_on: bool,
+}
+
+fn scheduled_midi_events_before<'a>(
+    midi: &'a [ScheduledMidiEvent],
+    event_index: &mut usize,
+    block_end: usize,
+) -> &'a [ScheduledMidiEvent] {
+    let start = *event_index;
+    *event_index += midi[start..].partition_point(|event| event.sample < block_end);
+    &midi[start..*event_index]
 }
 
 fn clip_pattern(clip: &Clip) -> (Vec<f32>, Vec<PatternEvent<'_>>) {
@@ -1978,6 +1988,44 @@ mod tests {
 
         assert!((sample_times[1] - sample_times[0] - 1.0 / f64::from(SAMPLE_RATE)).abs() < 1e-10);
         assert!(values.windows(2).all(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn late_midi_events_keep_sub_f32_sample_precision() {
+        let onset = 80_000.001_f64;
+        let precise = midi_event_sample(onset);
+
+        assert_eq!(precise, 80_000 * SAMPLE_RATE as usize + 16);
+        assert_ne!(precise, playback_start_sample(onset as f32));
+    }
+
+    #[test]
+    fn final_partial_block_does_not_dispatch_later_events() {
+        let block_start = crate::surge::BLOCK_SIZE;
+        let copied_block_end = block_start + 1;
+        let midi = [
+            ScheduledMidiEvent {
+                sample: block_start,
+                note_id: 1,
+                pitch: 60,
+                velocity: 1.0,
+                note_on: true,
+            },
+            ScheduledMidiEvent {
+                sample: copied_block_end,
+                note_id: 2,
+                pitch: 62,
+                velocity: 1.0,
+                note_on: true,
+            },
+        ];
+        let mut event_index = 0;
+
+        let dispatched = scheduled_midi_events_before(&midi, &mut event_index, copied_block_end);
+
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].note_id, 1);
+        assert_eq!(event_index, 1);
     }
 
     #[test]
