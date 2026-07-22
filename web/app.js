@@ -30,8 +30,7 @@
     undoButton: document.querySelector("#undo-button"),
     resetButton: document.querySelector("#reset-button"),
     savedState: document.querySelector("#saved-state"),
-    editLog: document.querySelector("#edit-log"),
-    editCount: document.querySelector("#edit-count"),
+    historyCount: document.querySelector("#history-count"),
     aiModeButton: document.querySelector("#ai-mode-button"),
     aiModePanel: document.querySelector("#ai-mode-panel"),
     advancedButton: document.querySelector("#advanced-button"),
@@ -48,6 +47,8 @@
     clearDebug: document.querySelector("#clear-debug"),
     refreshGeminiSessions: document.querySelector("#refresh-gemini-sessions"),
     geminiSessionList: document.querySelector("#gemini-session-list"),
+    audioBackend: document.querySelector("#audio-backend"),
+    sessionHistoryList: document.querySelector("#session-history-list"),
     toast: document.querySelector("#toast"),
     toastMessage: document.querySelector("#toast-message"),
     toastClose: document.querySelector("#toast-close"),
@@ -61,6 +62,8 @@
     dragAnchor: 0,
     touchSelectionMode: false,
     promptPending: false,
+    activeEditJobId: null,
+    interruptPending: false,
     editProgressPercent: 0,
     channelMutationPending: false,
     centeredInitialSelection: false,
@@ -68,8 +71,10 @@
     activeView: "ai",
     clientIssues: [],
     geminiSessions: [],
+    projectHistory: { current: 0, entries: [] },
     graphNodeSelection: {},
   };
+  let historyLoadQueue = Promise.resolve();
 
   let projectMutationQueue = Promise.resolve();
   const RECONCILED_REQUEST_TIMEOUT_MS = 2000;
@@ -299,12 +304,12 @@
   }
 
   async function api(path, options = {}, timeoutMs = null) {
-    let requestOptions = options;
+    let requestOptions = { ...options, cache: "no-store" };
     let timeout = null;
     if (timeoutMs !== null) {
       const controller = new AbortController();
       timeout = window.setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
-      requestOptions = { ...options, signal: controller.signal };
+      requestOptions = { ...requestOptions, signal: controller.signal };
     }
     try {
       const response = await fetch(path, requestOptions);
@@ -373,6 +378,8 @@
   async function loadProject() {
     try {
       state.project = await api("/api/project");
+      const backend = await api("/api/backend");
+      elements.audioBackend.value = backend.backend;
       renderProject();
     } catch (error) {
       showError(error, "loading the project");
@@ -380,9 +387,26 @@
     }
   }
 
+  async function changeAudioBackend() {
+    try {
+      const response = await api("/api/backend", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ backend: elements.audioBackend.value }),
+      });
+      elements.audioBackend.value = response.backend;
+      audio.stop(true);
+      showToast(`Using ${response.backend} instrument backend`);
+    } catch (error) {
+      showError(error, "changing the instrument backend");
+    }
+  }
+
   function renderProject() {
     const project = state.project;
     if (!project) return;
+    elements.sessionHistoryList.dataset.currentEditCount = String(project.edits.length);
+    void loadProjectHistory(project.version);
     elements.projectName.textContent = project.name;
     elements.tempo.textContent = project.bpm;
     elements.totalTime.textContent = `/ ${formatTime(project.duration, false)}`;
@@ -394,13 +418,56 @@
     renderTracks();
     renderSelection();
     renderPlayhead();
-    renderEditLog();
     renderAdvanced();
     renderDebug();
     updateTransport();
     if (!state.centeredInitialSelection) {
       state.centeredInitialSelection = true;
       window.requestAnimationFrame(centerSelectionOnNarrowTimeline);
+    }
+  }
+
+  async function loadProjectHistory(expectedVersion = state.project?.version) {
+    const load = historyLoadQueue.then(async () => {
+      if (state.project?.version !== expectedVersion) return;
+      try {
+        const history = await api("/api/history");
+        if (history.currentVersion !== expectedVersion || state.project?.version !== expectedVersion) return;
+        state.projectHistory = history;
+        const changeCount = Math.max(0, state.projectHistory.entries.length - 1);
+        elements.historyCount.textContent = `${changeCount} ${changeCount === 1 ? "change" : "changes"}`;
+        elements.sessionHistoryList.innerHTML = state.projectHistory.entries
+          .slice()
+          .reverse()
+          .map(
+            (entry) => `<button class="history-item" type="button" data-history-index="${entry.index}" data-history-version="${entry.version}" data-history-source="${escapeHtml(entry.source)}" ${entry.index === state.projectHistory.current ? 'aria-current="step"' : ""}><span class="history-marker" aria-hidden="true">${entry.index + 1}</span><span class="history-copy"><span class="history-title"><strong>${escapeHtml(entry.summary)}</strong><em class="history-source history-source-${entry.source.toLowerCase()}">${escapeHtml(entry.source)}</em></span>${entry.prompt ? `<span class="history-prompt">&ldquo;${escapeHtml(entry.prompt)}&rdquo;</span>` : ""}<span>Version ${entry.version}${entry.start == null ? "" : ` &middot; ${entry.start.toFixed(1)} - ${entry.end.toFixed(1)}s`}</span></span><span class="history-current">Current</span></button>`,
+          )
+          .join("");
+      } catch (error) {
+        reportClientIssue("warning", error, "loading project history");
+      }
+    });
+    historyLoadQueue = load.catch(() => {});
+    return load;
+  }
+
+  async function selectProjectHistory(event) {
+    const button = event.target.closest("[data-history-index]");
+    if (!button) return;
+    if (Number(button.dataset.historyIndex) === state.projectHistory.current) return;
+    try {
+      await replaceProject(async () => {
+        state.project = await api("/api/history", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ index: button.dataset.historyIndex }),
+        });
+        renderProject();
+      });
+      showToast("Project history restored");
+    } catch (error) {
+      await loadProjectHistory();
+      showError(error, "restoring project history");
     }
   }
 
@@ -481,25 +548,6 @@
     const centerTime = (state.selectionStart + state.selectionEnd) / 2;
     const centerPosition = sidebarWidth + (centerTime / state.project.duration) * elements.rulerLane.offsetWidth;
     scroll.scrollLeft = Math.max(0, centerPosition - sidebarWidth - availableWidth / 2);
-  }
-
-  function renderEditLog() {
-    const edits = state.project.edits;
-    elements.editCount.textContent = `${edits.length} ${edits.length === 1 ? "edit" : "edits"}`;
-    if (edits.length === 0) {
-      elements.editLog.innerHTML = '<div class="empty-log">Select part of the timeline and ask Gemini to shape it.</div>';
-      return;
-    }
-    elements.editLog.innerHTML = [...edits]
-      .reverse()
-      .map(
-        (edit, index) => `<article class="edit-item">
-          <span class="edit-number">${edits.length - index}</span>
-          <div><strong>${escapeHtml(edit.summary)}</strong><span class="edit-prompt">"${escapeHtml(edit.prompt)}"</span></div>
-          <span class="edit-time">${edit.start.toFixed(1)} - ${edit.end.toFixed(1)}s</span>
-        </article>`,
-      )
-      .join("");
   }
 
   function renderAdvanced() {
@@ -1248,12 +1296,11 @@
     );
     elements.editProgressTrack.removeAttribute("aria-valuenow");
     elements.savedState.textContent = `${detail} - ${formatTime(elapsed, false)} elapsed`;
-    elements.composeButton.querySelector("span").textContent =
-      job.phase === "syncing"
-        ? "Refreshing project..."
-        : job.phase === "applying"
-          ? "Applying change..."
-          : "Gemini is working...";
+    elements.composeButton.querySelector("span").textContent = state.promptPending
+      ? state.interruptPending
+        ? "Interrupting..."
+        : "Interrupt"
+      : "Make change";
   }
 
   function hideEditProgress() {
@@ -1602,8 +1649,9 @@
 
   function showPendingEdit(detail) {
     state.promptPending = true;
-    elements.composeButton.disabled = true;
-    elements.composeButton.querySelector("span").textContent = "Starting Gemini...";
+    state.interruptPending = false;
+    elements.composeButton.disabled = false;
+    elements.composeButton.querySelector("span").textContent = "Interrupt";
     elements.savedState.textContent = "Waiting for Gemini";
     showEditProgress({
       phase: "queued",
@@ -1648,6 +1696,7 @@
           persistPendingEdit(pending);
         }
       }
+      state.activeEditJobId = accepted.status === "unavailable" ? null : accepted.id;
       let outcome = accepted.status === "unavailable" ? accepted : await pollAcceptedEdit(accepted);
       if (outcome.status === "unavailable") {
         const recovered = await reconcileUnavailableOperation(clientOperationId);
@@ -1655,6 +1704,7 @@
           if (recovered.status === "queued" || recovered.status === "running") {
             pending.acceptedJob = recovered;
             persistPendingEdit(pending);
+            state.activeEditJobId = recovered.id;
             outcome = await pollAcceptedEdit(recovered);
           } else {
             outcome = recovered;
@@ -1684,6 +1734,8 @@
     } finally {
       clearPendingEdit(clientOperationId);
       state.promptPending = false;
+      state.activeEditJobId = null;
+      state.interruptPending = false;
       hideEditProgress();
       elements.composeButton.disabled = false;
       elements.composeButton.querySelector("span").textContent = "Make change";
@@ -1693,7 +1745,20 @@
 
   async function submitPrompt(event) {
     event.preventDefault();
-    if (state.promptPending) return;
+    if (state.promptPending) {
+      if (state.interruptPending || state.activeEditJobId === null) return;
+      state.interruptPending = true;
+      elements.composeButton.querySelector("span").textContent = "Interrupting...";
+      try {
+        await api(`/api/edits/${encodeURIComponent(state.activeEditJobId)}/interrupt`, {
+          method: "POST",
+        });
+      } catch (error) {
+        state.interruptPending = false;
+        showError(error, "interrupting the prompted edit");
+      }
+      return;
+    }
     const submittedText = elements.promptInput.value;
     const prompt = submittedText.trim();
     if (!prompt) return;
@@ -1719,6 +1784,7 @@
         async () => {
           state.project = await api("/api/undo", { method: "POST" });
           renderProject();
+          await loadProjectHistory(state.project.version);
         },
         { resumePlayback: false },
       );
@@ -1984,6 +2050,10 @@
   elements.copyDebug.addEventListener("click", () => void copyDebugReport());
   elements.clearDebug.addEventListener("click", clearDebugIssues);
   elements.refreshGeminiSessions.addEventListener("click", () => void loadGeminiSessions());
+  elements.audioBackend.addEventListener("change", () => void changeAudioBackend());
+  elements.sessionHistoryList.addEventListener("click", (event) => {
+    void enqueueProjectMutation(() => selectProjectHistory(event));
+  });
   elements.toastClose.addEventListener("click", dismissToast);
   document.querySelectorAll("[data-prompt]").forEach((button) => {
     button.addEventListener("click", () => {

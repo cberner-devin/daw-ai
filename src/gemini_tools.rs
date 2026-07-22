@@ -5,15 +5,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value as JsonValue;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::audio_analysis::{self, MAX_REGION_SECONDS};
-use crate::gemini::{EDIT_SCHEMA, plan_from_json};
-use crate::model::{Project, StudioError, json_string};
-use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS};
+use crate::model::{MidiClipSpec, Project, Studio, StudioError, TrackRole, json_string};
+use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS, MidiNote};
 use crate::storage::ProjectStore;
 
-pub(crate) const APPLY_TOOL_NAME: &str = "apply_sound_graph_edits";
 pub(crate) const READ_TOOL_NAME: &str = "read_sound_graph";
 pub(crate) const AUDIO_TOOL_NAME: &str = "render_audio_region";
 const GRAPH_FILE: &str = "sound-graph.json";
@@ -23,6 +21,24 @@ const PROGRESS_DIRECTORY: &str = "edit-progress";
 const PENDING_PROGRESS_DIRECTORY: &str = ".edit-progress.pending";
 const PROGRESS_PLAN_FILE: &str = "plan.json";
 const PROGRESS_GRAPH_FILE: &str = "project.json";
+const UNDO_GRAPH_FILE: &str = "undo-sound-graph.json";
+pub(crate) const MUTATION_TOOL_NAMES: &[&str] = &[
+    "new_track",
+    "delete_track",
+    "add_midi_clip",
+    "update_midi_clip",
+    "delete_midi_clip",
+    "add_effect",
+    "update_effect",
+    "delete_effect",
+    "add_modulator",
+    "update_modulator",
+    "delete_modulator",
+    "set_parameter",
+    "set_track_mute",
+    "set_tempo",
+    "undo",
+];
 const AUDIO_REGION_SCHEMA: &str = r#"{
   "type": "object",
   "additionalProperties": false,
@@ -30,7 +46,7 @@ const AUDIO_REGION_SCHEMA: &str = r#"{
   "properties": {
     "trackIds": {
       "type": "array",
-      "description": "One or more stable track IDs from sound-graph.json. Choose the full mix when judging an arrangement-level result and isolated tracks when diagnosing a part.",
+      "description": "One or more stable channel IDs from sound-graph.json. Choose the full mix when judging an arrangement-level result and isolated channels when diagnosing a part.",
       "items": { "type": "integer", "minimum": 1 },
       "minItems": 1,
       "maxItems": 32,
@@ -56,15 +72,27 @@ pub(crate) struct EditSession {
 }
 
 impl EditSession {
+    #[cfg(test)]
     pub(crate) fn create(
         project: &Project,
         prompt: &str,
         start: f32,
         end: f32,
     ) -> io::Result<Self> {
-        let path = reserve_session_directory()?;
+        Self::create_in(&session_root(), project, prompt, start, end)
+    }
+
+    pub(crate) fn create_in(
+        root: &Path,
+        project: &Project,
+        prompt: &str,
+        start: f32,
+        end: f32,
+    ) -> io::Result<Self> {
+        let path = reserve_session_directory(root)?;
         let result = (|| {
-            write_new(&path.join(GRAPH_FILE), &project.planner_json())?;
+            let project = project.clone();
+            write_new(&path.join(GRAPH_FILE), &project.to_json())?;
             write_new(
                 &path.join(REQUEST_FILE),
                 &format!(
@@ -85,8 +113,6 @@ impl EditSession {
                     "end": end,
                     "appliedSteps": 0,
                     "audioListens": 0,
-                    "judgeReviews": 0,
-                    "judgeRejections": 0,
                     "detail": "Gemini session started"
                 })
                 .to_string(),
@@ -104,6 +130,14 @@ impl EditSession {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn synchronize_project(&self, project: &Project) -> Result<(), String> {
+        write_replace(
+            &self.path.join(GRAPH_FILE),
+            &format!("{}\n", project.to_json()),
+        )
+        .map_err(|error| format!("could not synchronize committed sound graph: {error}"))
     }
 
     pub(crate) fn record_exchange(
@@ -131,8 +165,6 @@ impl EditSession {
         detail: &str,
         applied_steps: usize,
         audio_listens: usize,
-        judge_reviews: usize,
-        judge_rejections: usize,
     ) -> io::Result<()> {
         let path = self.path.join(SESSION_FILE);
         let source = fs::read_to_string(&path)?;
@@ -146,12 +178,10 @@ impl EditSession {
         object.insert("updatedAt".to_owned(), unix_milliseconds().into());
         object.insert("appliedSteps".to_owned(), applied_steps.into());
         object.insert("audioListens".to_owned(), audio_listens.into());
-        object.insert("judgeReviews".to_owned(), judge_reviews.into());
-        object.insert("judgeRejections".to_owned(), judge_rejections.into());
         write_replace(&path, &value.to_string())
     }
 
-    pub(crate) fn stats(&self) -> io::Result<(usize, usize, usize, usize)> {
+    pub(crate) fn stats(&self) -> io::Result<(usize, usize)> {
         let source = fs::read_to_string(self.path.join(SESSION_FILE))?;
         let value = serde_json::from_str::<JsonValue>(&source)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -163,20 +193,7 @@ impl EditSession {
             .get("audioListens")
             .and_then(JsonValue::as_u64)
             .unwrap_or(0) as usize;
-        let judge_reviews = value
-            .get("judgeReviews")
-            .and_then(JsonValue::as_u64)
-            .unwrap_or(0) as usize;
-        let judge_rejections = value
-            .get("judgeRejections")
-            .and_then(JsonValue::as_u64)
-            .unwrap_or(0) as usize;
-        Ok((
-            applied_steps,
-            audio_listens,
-            judge_reviews,
-            judge_rejections,
-        ))
+        Ok((applied_steps, audio_listens))
     }
 
     pub(crate) fn finish(&self, plans: Vec<EditPlan>) -> Result<(EditPlan, Project), String> {
@@ -187,9 +204,7 @@ impl EditSession {
             summary = Some(plan.summary);
         }
         if actions.is_empty() {
-            return Err(format!(
-                "Gemini did not use the registered {APPLY_TOOL_NAME} tool"
-            ));
+            return Err("Gemini did not use a registered graph mutation tool".to_owned());
         }
         let action = bounded_compound(actions);
         let graph = fs::read_to_string(self.path.join(GRAPH_FILE))
@@ -217,7 +232,22 @@ impl EditSession {
             .map_err(|error| format!("could not read Gemini edit plan progress: {error}"))?;
         let graph_source = fs::read_to_string(path.join(PROGRESS_GRAPH_FILE))
             .map_err(|error| format!("could not read Gemini sound graph progress: {error}"))?;
-        let plan = plan_from_json(&plan_source).map_err(|error| error.to_string())?;
+        let plan = if let Some(summary) = serde_json::from_str::<JsonValue>(&plan_source)
+            .ok()
+            .filter(|value| value.get("graphMutation") == Some(&JsonValue::Bool(true)))
+            .and_then(|value| {
+                value
+                    .get("summary")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned)
+            }) {
+            EditPlan {
+                action: Action::GraphMutation,
+                summary,
+            }
+        } else {
+            return Err("Gemini edit progress did not contain a graph mutation".to_owned());
+        };
         let project = Project::from_json(&graph_source)
             .map_err(|error| format!("Gemini edit progress is invalid: {error}"))?;
         fs::remove_dir_all(&path)
@@ -240,15 +270,13 @@ impl Drop for EditSession {
 }
 
 pub(crate) fn tool_declarations() -> Vec<JsonValue> {
-    let edit_schema =
-        serde_json::from_str::<JsonValue>(EDIT_SCHEMA).expect("embedded edit schema is valid JSON");
     let audio_schema = serde_json::from_str::<JsonValue>(AUDIO_REGION_SCHEMA)
         .expect("embedded audio schema is valid JSON");
-    vec![
+    let mut tools = vec![
         serde_json::json!({
             "type": "function",
             "name": READ_TOOL_NAME,
-            "description": "Read the latest DAW-AI sound graph with stable track, clip, event, instrument, effect, modulator, automation-target, and routing IDs. Call this before editing and again whenever an edit creates IDs needed by a later batch.",
+            "description": "Read the latest DAW-AI sound graph with stable channel, clip, event, instrument, effect, modulator, automation-target, and routing IDs. Call this before editing and again whenever an edit creates IDs needed by a later batch.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -257,17 +285,185 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         }),
         serde_json::json!({
             "type": "function",
-            "name": APPLY_TOOL_NAME,
-            "description": "Apply one validated batch of generic MIDI, instrument, effect, modulation, automation, routing, mix, arrangement, or tempo operations. A validation error leaves the graph unchanged. Use a focused batch, then render and listen before making another batch.",
-            "parameters": edit_schema
-        }),
-        serde_json::json!({
-            "type": "function",
             "name": AUDIO_TOOL_NAME,
-            "description": "Render model-chosen tracks and absolute project start/end times from the latest sound graph as WAV audio for direct musical listening. The listening range is independent of the selected edit scope: include surrounding context when transition, contrast, or continuity matters. Listen before the first edit and after every successful edit.",
+            "description": "Optionally render model-chosen channels and absolute project start/end times from the latest sound graph as WAV audio. Use it whenever hearing the original or an edited result would improve your decision; you decide whether and when to listen. The listening range is independent of the selected edit scope.",
             "parameters": audio_schema
         }),
+    ];
+    tools.extend(mutation_tool_declarations());
+    tools
+}
+
+fn object_schema(properties: JsonValue, required: &[&str]) -> JsonValue {
+    serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false
+    })
+}
+
+fn function(name: &str, description: &str, parameters: JsonValue) -> JsonValue {
+    serde_json::json!({
+        "type": "function",
+        "name": name,
+        "description": description,
+        "parameters": parameters
+    })
+}
+
+fn mutation_tool_declarations() -> Vec<JsonValue> {
+    let id = || serde_json::json!({"type":"integer","minimum":1});
+    let role =
+        || serde_json::json!({"type":"string","enum":["drums","bass","chords","lead","texture"]});
+    let notes = || {
+        serde_json::json!({
+            "type":"array","maxItems":32,"items":{"type":"object","properties":{
+                "time":{"type":"number","minimum":0,"maximum":16},
+                "duration":{"type":"number","minimum":0.0625,"maximum":16},
+                "pitch":{"type":"integer","minimum":0,"maximum":127},
+                "velocity":{"type":"number","minimum":0.01,"maximum":1}
+            },"required":["time","duration","pitch","velocity"],"additionalProperties":false}
+        })
+    };
+    let clip_properties = || {
+        serde_json::json!({
+            "trackId":id(), "label":{"type":"string","minLength":1,"maxLength":64},
+            "start":{"type":"number","minimum":0}, "end":{"type":"number","minimum":0},
+            "loopBeats":{"type":"number","minimum":0.25,"maximum":16}, "events":notes()
+        })
+    };
+    vec![
+        function(
+            "new_track",
+            "Create one track and its required instrument. Returns stable IDs for subsequent calls.",
+            object_schema(serde_json::json!({"role":role()}), &["role"]),
+        ),
+        function(
+            "delete_track",
+            "Delete one track by stable ID. Use undo if this was a mistake.",
+            object_schema(serde_json::json!({"trackId":id()}), &["trackId"]),
+        ),
+        function(
+            "add_midi_clip",
+            "Add a MIDI clip to one track without changing other clips.",
+            object_schema(
+                clip_properties(),
+                &["trackId", "label", "start", "end", "loopBeats", "events"],
+            ),
+        ),
+        function(
+            "update_midi_clip",
+            "Replace all fields and events of one existing MIDI clip. This changes the whole clip; to preserve material outside an edit region, keep it and add a separate regional clip, or explicitly split it into clips that preserve the surrounding material.",
+            object_schema(
+                {
+                    let mut p = clip_properties();
+                    p.as_object_mut().unwrap().insert("clipId".to_owned(), id());
+                    p
+                },
+                &[
+                    "trackId",
+                    "clipId",
+                    "label",
+                    "start",
+                    "end",
+                    "loopBeats",
+                    "events",
+                ],
+            ),
+        ),
+        function(
+            "delete_midi_clip",
+            "Delete one MIDI clip by stable track and clip IDs.",
+            object_schema(
+                serde_json::json!({"trackId":id(),"clipId":id()}),
+                &["trackId", "clipId"],
+            ),
+        ),
+        function(
+            "add_effect",
+            "Add a named effect to one track and set its mix. Returns its stable ID.",
+            object_schema(
+                serde_json::json!({"trackId":id(),"name":{"type":"string","enum":["Reverb","Room","Echo","Chorus","Low-pass filter","Punch compressor","Drive","Shimmer"]},"mix":{"type":"number","minimum":0,"maximum":1}}),
+                &["trackId", "name", "mix"],
+            ),
+        ),
+        function(
+            "update_effect",
+            "Update one effect parameter by stable IDs.",
+            parameter_schema("effectId"),
+        ),
+        function(
+            "delete_effect",
+            "Delete one effect by stable track and effect IDs.",
+            object_schema(
+                serde_json::json!({"trackId":id(),"effectId":id()}),
+                &["trackId", "effectId"],
+            ),
+        ),
+        function(
+            "add_modulator",
+            "Add a modulator to one track and return its stable ID.",
+            object_schema(
+                serde_json::json!({"trackId":id(),"target":{"type":"string","minLength":1,"maxLength":96},"shape":{"type":"string","enum":["sine","triangle","square","random","envelope"]},"rate":{"type":"number","minimum":0.01,"maximum":20},"depth":{"type":"number","minimum":0,"maximum":1}}),
+                &["trackId", "target", "shape", "rate", "depth"],
+            ),
+        ),
+        function(
+            "update_modulator",
+            "Update one modulator parameter by stable IDs.",
+            parameter_schema("modulatorId"),
+        ),
+        function(
+            "delete_modulator",
+            "Delete one modulator by stable track and modulator IDs.",
+            object_schema(
+                serde_json::json!({"trackId":id(),"modulatorId":id()}),
+                &["trackId", "modulatorId"],
+            ),
+        ),
+        function(
+            "set_parameter",
+            "Set one instrument, effect, modulator, MIDI event, or routing parameter using stable IDs from read_sound_graph.",
+            object_schema(
+                serde_json::json!({"trackId":id(),"tool":{"type":"string","enum":["instrument","effect","modulator","event","routing"]},"toolId":id(),"clipId":{"type":"integer","minimum":0},"parameter":{"type":"string","minLength":1,"maxLength":64},"value":{"type":"string","minLength":1,"maxLength":96}}),
+                &["trackId", "tool", "toolId", "clipId", "parameter", "value"],
+            ),
+        ),
+        function(
+            "set_track_mute",
+            "Set the sole authoritative mute state of one track.",
+            object_schema(
+                serde_json::json!({"trackId":id(),"muted":{"type":"boolean"}}),
+                &["trackId", "muted"],
+            ),
+        ),
+        function(
+            "set_tempo",
+            "Set project tempo in beats per minute.",
+            object_schema(
+                serde_json::json!({"bpm":{"type":"integer","minimum":60,"maximum":180}}),
+                &["bpm"],
+            ),
+        ),
+        function(
+            "undo",
+            "Undo the most recent successful graph mutation made in this edit session.",
+            object_schema(serde_json::json!({}), &[]),
+        ),
     ]
+}
+
+fn parameter_schema(id_name: &str) -> JsonValue {
+    object_schema(
+        serde_json::json!({
+            "trackId":{"type":"integer","minimum":1},
+            (id_name):{"type":"integer","minimum":1},
+            "parameter":{"type":"string","minLength":1,"maxLength":64},
+            "value":{"type":"string","minLength":1,"maxLength":96}
+        }),
+        &["trackId", id_name, "parameter", "value"],
+    )
 }
 
 #[derive(Debug)]
@@ -290,11 +486,347 @@ pub(crate) fn read_sound_graph(session_path: &Path) -> Result<String, String> {
         .map_err(|error| format!("could not read current sound graph: {error}"))
 }
 
-pub(crate) fn apply_sound_graph_edits(
+pub(crate) fn is_mutation_tool(name: &str) -> bool {
+    MUTATION_TOOL_NAMES.contains(&name)
+}
+
+pub(crate) fn apply_agent_mutation(
     session_path: &Path,
+    name: &str,
     arguments: &JsonValue,
 ) -> Result<String, String> {
-    apply_graph_edits(session_path, &arguments.to_string())
+    wait_for_progress_handoff(session_path);
+    let graph_path = session_path.join(GRAPH_FILE);
+    let (store, mut studio) = ProjectStore::open(graph_path)
+        .map_err(|error| format!("Could not load sound-graph.json: {error}"))?;
+    let original = studio.project().clone();
+    let (selection_start, selection_end) = edit_selection(session_path)?;
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "tool arguments must be an object".to_owned())?;
+    let mut result_id = None;
+    let summary = match name {
+        "new_track" => {
+            let role = required_role(object, "role")?;
+            let id = studio.add_channel(role).map_err(studio_error_message)?;
+            result_id = Some(id);
+            format!("Created {} track {id}", role.as_str())
+        }
+        "delete_track" => {
+            let id = required_id(object, "trackId")?;
+            studio.delete_channel(id).map_err(studio_error_message)?;
+            format!("Deleted track {id}")
+        }
+        "add_midi_clip" => {
+            let (track_id, spec) = clip_arguments(object)?;
+            validate_clip_selection(&spec, selection_start, selection_end)?;
+            let id = studio
+                .create_midi_clip(track_id, &spec)
+                .map_err(studio_error_message)?;
+            result_id = Some(id);
+            format!("Added MIDI clip {id} to track {track_id}")
+        }
+        "update_midi_clip" => {
+            let clip_id = required_id(object, "clipId")?;
+            let (track_id, spec) = clip_arguments(object)?;
+            studio
+                .replace_midi_clip(track_id, clip_id, &spec, selection_start, selection_end)
+                .map_err(studio_error_message)?;
+            format!("Updated MIDI clip {clip_id} on track {track_id}")
+        }
+        "delete_midi_clip" => {
+            let track_id = required_id(object, "trackId")?;
+            let clip_id = required_id(object, "clipId")?;
+            studio
+                .delete_midi_clip(track_id, clip_id, selection_start, selection_end)
+                .map_err(studio_error_message)?;
+            format!("Deleted MIDI clip {clip_id} from track {track_id}")
+        }
+        "add_effect" => {
+            let track_id = required_id(object, "trackId")?;
+            let effect_name = required_string(object, "name")?;
+            let mix = required_number(object, "mix")?;
+            let effect_id = studio
+                .create_effect(track_id, effect_name, mix as f32)
+                .map_err(studio_error_message)?;
+            result_id = Some(effect_id);
+            format!("Added {effect_name} effect {effect_id} to track {track_id}")
+        }
+        "update_effect" => update_parameter(&mut studio, object, "effect", "effectId")?,
+        "delete_effect" => {
+            let track_id = required_id(object, "trackId")?;
+            let effect_id = required_id(object, "effectId")?;
+            studio
+                .delete_effect(track_id, effect_id)
+                .map_err(studio_error_message)?;
+            format!("Deleted effect {effect_id} from track {track_id}")
+        }
+        "add_modulator" => {
+            let track_id = required_id(object, "trackId")?;
+            let target = required_string(object, "target")?;
+            let shape = required_string(object, "shape")?;
+            let rate = required_number(object, "rate")? as f32;
+            let depth = required_number(object, "depth")? as f32;
+            let id = studio
+                .create_modulator(track_id, target, shape, rate, depth)
+                .map_err(studio_error_message)?;
+            result_id = Some(id);
+            format!("Added modulator {id} to track {track_id}")
+        }
+        "update_modulator" => update_parameter(&mut studio, object, "modulator", "modulatorId")?,
+        "delete_modulator" => {
+            let track_id = required_id(object, "trackId")?;
+            let modulator_id = required_id(object, "modulatorId")?;
+            studio
+                .delete_modulator(track_id, modulator_id)
+                .map_err(studio_error_message)?;
+            format!("Deleted modulator {modulator_id} from track {track_id}")
+        }
+        "set_parameter" => {
+            let track_id = required_id(object, "trackId")?;
+            let tool = required_string(object, "tool")?;
+            let tool_id = required_id(object, "toolId")?;
+            let clip_id = object
+                .get("clipId")
+                .and_then(JsonValue::as_u64)
+                .filter(|id| *id > 0);
+            let parameter = required_string(object, "parameter")?;
+            let value = required_string(object, "value")?;
+            studio
+                .configure_sound_tool(track_id, tool, tool_id, clip_id, parameter, value)
+                .map_err(studio_error_message)?;
+            format!("Set {tool} {tool_id} {parameter} on track {track_id}")
+        }
+        "set_track_mute" => {
+            let track_id = required_id(object, "trackId")?;
+            let muted = object
+                .get("muted")
+                .and_then(JsonValue::as_bool)
+                .ok_or_else(|| "muted must be a boolean".to_owned())?;
+            studio
+                .set_mix(track_id, None, Some(muted))
+                .map_err(studio_error_message)?;
+            format!("Set track {track_id} muted to {muted}")
+        }
+        "set_tempo" => {
+            let bpm = required_id(object, "bpm")?
+                .try_into()
+                .map_err(|_| "bpm is out of range".to_owned())?;
+            studio.set_tempo(bpm).map_err(studio_error_message)?;
+            format!("Set tempo to {bpm} BPM")
+        }
+        "undo" => return undo_agent_mutation(session_path, &store, &original),
+        _ => return Err(format!("unknown graph mutation tool: {name}")),
+    };
+
+    let undo_path = session_path.join(UNDO_GRAPH_FILE);
+    let previous_undo = fs::read_to_string(&undo_path).ok();
+    let transaction = (|| {
+        write_replace(&undo_path, &original.to_json())
+            .map_err(|error| format!("could not save undo snapshot: {error}"))?;
+        store
+            .save(studio.project())
+            .map_err(|error| format!("Could not write sound-graph.json: {error}"))?;
+        publish_progress(session_path, &plan_json(&summary), studio.project())
+    })();
+    if let Err(error) = transaction {
+        let graph_rollback = store
+            .save(&original)
+            .map_err(|rollback| rollback.to_string());
+        let undo_rollback = match previous_undo {
+            Some(source) => write_replace(&undo_path, source.trim_end())
+                .map_err(|rollback| rollback.to_string()),
+            None => match fs::remove_file(&undo_path) {
+                Ok(()) => Ok(()),
+                Err(rollback) if rollback.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(rollback) => Err(rollback.to_string()),
+            },
+        };
+        if let Err(rollback) = graph_rollback.and(undo_rollback) {
+            return Err(format!(
+                "{error}; could not restore failed mutation: {rollback}"
+            ));
+        }
+        return Err(error);
+    }
+    Ok(serde_json::json!({
+        "message": summary,
+        "version": studio.project().version,
+        "id": result_id,
+        "channels": sound_tool_inventory(studio.project())
+    })
+    .to_string())
+}
+
+fn edit_selection(session_path: &Path) -> Result<(f32, f32), String> {
+    let source = fs::read_to_string(session_path.join(REQUEST_FILE))
+        .map_err(|error| format!("could not read edit request: {error}"))?;
+    let request: JsonValue = serde_json::from_str(&source)
+        .map_err(|error| format!("edit request was invalid: {error}"))?;
+    let start = request
+        .get("start")
+        .and_then(JsonValue::as_f64)
+        .ok_or_else(|| "edit request omitted selection start".to_owned())? as f32;
+    let end = request
+        .get("end")
+        .and_then(JsonValue::as_f64)
+        .ok_or_else(|| "edit request omitted selection end".to_owned())? as f32;
+    if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
+        return Err("edit request selection is invalid".to_owned());
+    }
+    Ok((start, end))
+}
+
+fn validate_clip_selection(
+    spec: &MidiClipSpec,
+    selection_start: f32,
+    selection_end: f32,
+) -> Result<(), String> {
+    if spec.start < selection_start || spec.end > selection_end {
+        return Err(format!(
+            "MIDI clip must stay within the selected region ({selection_start}-{selection_end}s)"
+        ));
+    }
+    Ok(())
+}
+
+fn required_id(object: &Map<String, JsonValue>, name: &str) -> Result<u64, String> {
+    object
+        .get(name)
+        .and_then(JsonValue::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("{name} must be a positive integer"))
+}
+
+fn required_number(object: &Map<String, JsonValue>, name: &str) -> Result<f64, String> {
+    object
+        .get(name)
+        .and_then(JsonValue::as_f64)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| format!("{name} must be a finite number"))
+}
+
+fn required_string<'a>(object: &'a Map<String, JsonValue>, name: &str) -> Result<&'a str, String> {
+    object
+        .get(name)
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{name} must be a nonempty string"))
+}
+
+fn required_role(object: &Map<String, JsonValue>, name: &str) -> Result<TrackRole, String> {
+    TrackRole::from_name(required_string(object, name)?)
+        .ok_or_else(|| format!("{name} is not a supported track role"))
+}
+
+fn clip_arguments(object: &Map<String, JsonValue>) -> Result<(u64, MidiClipSpec), String> {
+    let events = object
+        .get("events")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "events must be an array".to_owned())?;
+    let notes = events
+        .iter()
+        .map(|event| {
+            let event = event
+                .as_object()
+                .ok_or_else(|| "each event must be an object".to_owned())?;
+            let pitch = required_id_or_zero(event, "pitch")?
+                .try_into()
+                .map_err(|_| "pitch is out of range".to_owned())?;
+            Ok(MidiNote {
+                time: required_number(event, "time")? as f32,
+                duration: required_number(event, "duration")? as f32,
+                pitch,
+                velocity: required_number(event, "velocity")? as f32,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((
+        required_id(object, "trackId")?,
+        MidiClipSpec {
+            label: required_string(object, "label")?.to_owned(),
+            start: required_number(object, "start")? as f32,
+            end: required_number(object, "end")? as f32,
+            loop_beats: required_number(object, "loopBeats")? as f32,
+            notes,
+        },
+    ))
+}
+
+fn required_id_or_zero(object: &Map<String, JsonValue>, name: &str) -> Result<u64, String> {
+    object
+        .get(name)
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("{name} must be a nonnegative integer"))
+}
+
+fn update_parameter(
+    studio: &mut Studio,
+    object: &Map<String, JsonValue>,
+    tool: &str,
+    id_name: &str,
+) -> Result<String, String> {
+    let track_id = required_id(object, "trackId")?;
+    let tool_id = required_id(object, id_name)?;
+    let parameter = required_string(object, "parameter")?;
+    let value = required_string(object, "value")?;
+    studio
+        .configure_sound_tool(track_id, tool, tool_id, None, parameter, value)
+        .map_err(studio_error_message)?;
+    Ok(format!(
+        "Updated {tool} {tool_id} {parameter} on track {track_id}"
+    ))
+}
+
+fn plan_json(summary: &str) -> String {
+    serde_json::json!({"graphMutation":true,"summary":summary}).to_string()
+}
+
+fn undo_agent_mutation(
+    session_path: &Path,
+    store: &ProjectStore,
+    current: &Project,
+) -> Result<String, String> {
+    let undo_path = session_path.join(UNDO_GRAPH_FILE);
+    let source = fs::read_to_string(&undo_path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            "nothing to undo in this edit session".to_owned()
+        } else {
+            format!("could not read undo snapshot: {error}")
+        }
+    })?;
+    let mut restored = Project::from_json(&source)
+        .map_err(|error| format!("undo snapshot is invalid: {error}"))?;
+    restored.version = current.version.saturating_add(1);
+    let summary = "Undid the previous graph mutation";
+    let transaction = (|| {
+        store
+            .save(&restored)
+            .map_err(|error| format!("could not restore undo snapshot: {error}"))?;
+        fs::remove_file(&undo_path)
+            .map_err(|error| format!("could not consume undo snapshot: {error}"))?;
+        publish_progress(session_path, &plan_json(summary), &restored)
+    })();
+    if let Err(error) = transaction {
+        let graph_rollback = store.save(current).map_err(|rollback| rollback.to_string());
+        let undo_rollback = if undo_path.exists() {
+            Ok(())
+        } else {
+            write_replace(&undo_path, source.trim_end()).map_err(|rollback| rollback.to_string())
+        };
+        if let Err(rollback) = graph_rollback.and(undo_rollback) {
+            return Err(format!(
+                "{error}; could not restore failed undo: {rollback}"
+            ));
+        }
+        return Err(error);
+    }
+    Ok(serde_json::json!({
+        "message":summary,
+        "version":restored.version,
+        "channels":sound_tool_inventory(&restored)
+    })
+    .to_string())
 }
 
 #[cfg(test)]
@@ -312,8 +844,8 @@ pub(crate) fn prepare_audio_render(
     let project = current_project(session_path)?;
     let (track_ids, start, end) = audio_region_arguments(&project, arguments)?;
     let description = format!(
-        "Rendered {} from {:.3} to {:.3} seconds through the same Surge XT-backed audio path used for DAW playback. Listen to the audio itself and describe the audible rhythm, subdivision, energy contour, timbre, transitions, and shortcomings before deciding what to do next.",
-        selected_track_labels(&project, &track_ids),
+        "Rendered {} from {:.3} to {:.3} seconds through the same custom Rust audio engine used for DAW playback. Listen to the audio itself and describe the audible rhythm, subdivision, energy contour, timbre, transitions, and shortcomings before deciding what to do next.",
+        selected_channel_labels(&project, &track_ids),
         start,
         end,
     );
@@ -326,13 +858,30 @@ pub(crate) fn prepare_audio_render(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn render_audio_request(request: AudioRenderRequest) -> Result<AudioRender, String> {
-    let region = audio_analysis::render_region(
-        &request.project,
-        &request.track_ids,
-        request.start,
-        request.end,
-    )?;
+    render_audio_request_with_backend(request, false)
+}
+
+pub(crate) fn render_audio_request_with_backend(
+    request: AudioRenderRequest,
+    builtin: bool,
+) -> Result<AudioRender, String> {
+    let region = if builtin {
+        audio_analysis::render_region_builtin(
+            &request.project,
+            &request.track_ids,
+            request.start,
+            request.end,
+        )
+    } else {
+        audio_analysis::render_region(
+            &request.project,
+            &request.track_ids,
+            request.start,
+            request.end,
+        )
+    }?;
     Ok(AudioRender {
         description: request.description,
         wav: audio_analysis::wav_bytes(&region.samples),
@@ -357,7 +906,7 @@ fn audio_region_arguments(
         .and_then(JsonValue::as_array)
         .ok_or_else(|| "trackIds must be an array".to_owned())?;
     if values.is_empty() || values.len() > 32 {
-        return Err("trackIds must contain between 1 and 32 track IDs".to_owned());
+        return Err("trackIds must contain between 1 and 32 channel IDs".to_owned());
     }
     let mut track_ids = Vec::with_capacity(values.len());
     for value in values {
@@ -366,7 +915,7 @@ fn audio_region_arguments(
             .filter(|track_id| *track_id > 0)
             .ok_or_else(|| "trackIds must contain positive integers".to_owned())?;
         if track_ids.contains(&track_id) {
-            return Err(format!("track {track_id} was requested more than once"));
+            return Err(format!("channel {track_id} was requested more than once"));
         }
         if !project.tracks.iter().any(|track| track.id == track_id) {
             let available = project
@@ -376,7 +925,7 @@ fn audio_region_arguments(
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(format!(
-                "track {track_id} does not exist; available track IDs: {available}"
+                "channel {track_id} does not exist; available channel IDs: {available}"
             ));
         }
         track_ids.push(track_id);
@@ -405,7 +954,7 @@ fn audio_region_arguments(
     Ok((track_ids, start, end))
 }
 
-fn selected_track_labels(project: &Project, track_ids: &[u64]) -> String {
+fn selected_channel_labels(project: &Project, track_ids: &[u64]) -> String {
     track_ids
         .iter()
         .filter_map(|track_id| project.tracks.iter().find(|track| track.id == *track_id))
@@ -439,44 +988,6 @@ fn base64(bytes: &[u8]) -> String {
 
 pub(crate) fn base64_audio(bytes: &[u8]) -> String {
     base64(bytes)
-}
-
-fn apply_graph_edits(session_path: &Path, source: &str) -> Result<String, String> {
-    let plan = plan_from_json(source).map_err(|error| error.to_string())?;
-    let new_action_count = action_count(&plan.action);
-    wait_for_progress_handoff(session_path);
-    let (start, end, prompt) = read_request(session_path)?;
-    let graph_path = session_path.join(GRAPH_FILE);
-    if !graph_path.is_file() {
-        return Err("sound-graph.json is missing from the edit session".to_owned());
-    }
-    let (store, mut studio) = ProjectStore::open(graph_path)
-        .map_err(|error| format!("Could not load sound-graph.json: {error}"))?;
-    let original_project = studio.project().clone();
-    let summary = studio
-        .apply_plan(start, end, &prompt, plan.clone())
-        .map_err(studio_error_message)?;
-    store
-        .save(studio.project())
-        .map_err(|error| format!("Could not write sound-graph.json: {error}"))?;
-    if let Err(error) = publish_progress(session_path, source, studio.project()) {
-        return match store.save(&original_project) {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(format!(
-                "{error}; also could not restore sound-graph.json: {rollback_error}"
-            )),
-        };
-    }
-    Ok(serde_json::json!({
-        "message": format!(
-            "Applied {new_action_count} action(s) and updated the sound graph to version {}: {summary}",
-            studio.project().version
-        ),
-        "version": studio.project().version,
-        "summary": summary,
-        "tracks": sound_tool_inventory(studio.project())
-    })
-    .to_string())
 }
 
 fn sound_tool_inventory(project: &Project) -> Vec<JsonValue> {
@@ -538,30 +1049,6 @@ fn progress_path(session_path: &Path) -> PathBuf {
     session_path.join(PROGRESS_DIRECTORY)
 }
 
-fn read_request(session_path: &Path) -> Result<(f32, f32, String), String> {
-    let source = fs::read_to_string(session_path.join(REQUEST_FILE))
-        .map_err(|error| format!("could not read edit request: {error}"))?;
-    let value = serde_json::from_str::<JsonValue>(&source)
-        .map_err(|error| format!("edit request is invalid: {error}"))?;
-    let request = value
-        .as_object()
-        .ok_or_else(|| "edit request must be an object".to_owned())?;
-    let number = |name: &str| {
-        request
-            .get(name)
-            .and_then(JsonValue::as_f64)
-            .filter(|value| value.is_finite())
-            .map(|value| value as f32)
-            .ok_or_else(|| format!("edit request {name} must be a finite number"))
-    };
-    let prompt = request
-        .get("prompt")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| "edit request prompt must be a string".to_owned())?
-        .to_owned();
-    Ok((number("start")?, number("end")?, prompt))
-}
-
 fn bounded_compound(mut actions: Vec<Action>) -> Action {
     while actions.len() > MAX_COMPOUND_ACTIONS {
         let mut grouped = Vec::with_capacity(actions.len().div_ceil(MAX_COMPOUND_ACTIONS));
@@ -589,13 +1076,6 @@ fn action_group(mut actions: Vec<Action>) -> Action {
     }
 }
 
-fn action_count(action: &Action) -> usize {
-    match action {
-        Action::Compound { actions } => actions.iter().map(action_count).sum(),
-        _ => 1,
-    }
-}
-
 fn studio_error_message(error: StudioError) -> String {
     match error {
         StudioError::EmptyPrompt => "The edit request is empty.".to_owned(),
@@ -609,7 +1089,7 @@ fn studio_error_message(error: StudioError) -> String {
         )
         .to_owned(),
         StudioError::InvalidMix => "A mixer value is outside its published range.".to_owned(),
-        StudioError::InvalidChannel => "A track change exceeds the sound graph limits.".to_owned(),
+        StudioError::InvalidChannel => "A channel change exceeds the sound graph limits.".to_owned(),
         StudioError::UnknownSoundTool => concat!(
             "An action references a sound-tool, clip, or event ID that is not in sound-graph.json. ",
             "Read the graph again and use its stable IDs."
@@ -623,10 +1103,9 @@ fn studio_error_message(error: StudioError) -> String {
     }
 }
 
-fn reserve_session_directory() -> io::Result<PathBuf> {
-    let root = session_root();
-    fs::create_dir_all(&root)?;
-    set_private_directory(&root)?;
+fn reserve_session_directory(root: &Path) -> io::Result<PathBuf> {
+    fs::create_dir_all(root)?;
+    set_private_directory(root)?;
     for _ in 0..64 {
         let id = SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let path = root.join(format!(
@@ -652,6 +1131,7 @@ fn reserve_session_directory() -> io::Result<PathBuf> {
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn session_root() -> PathBuf {
     if let Some(path) =
         std::env::var_os("DAW_AI_GEMINI_SESSION_DIR").filter(|path| !path.is_empty())
@@ -671,8 +1151,12 @@ pub(crate) fn session_root() -> PathBuf {
         .join("gemini-sessions")
 }
 
+#[cfg(test)]
 pub(crate) fn session_summaries() -> io::Result<Vec<JsonValue>> {
-    let root = session_root();
+    session_summaries_in(&session_root())
+}
+
+pub(crate) fn session_summaries_in(root: &Path) -> io::Result<Vec<JsonValue>> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -766,19 +1250,6 @@ fn write_replace(path: &Path, source: &str) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    fn preset_edit(tool_id: u64, preset: &str) -> JsonValue {
-        serde_json::json!({
-            "summary": "Changed the bass patch",
-            "musicalPlan": "Give the bass a more useful harmonic profile.",
-            "actions": [{
-                "kind": "configure", "target": "bass", "name": "None", "value": 0,
-                "trackId": 2, "tool": "instrument", "toolId": tool_id, "clipId": 0,
-                "parameter": "preset", "setting": preset, "start": 0, "end": 1,
-                "rate": 0, "events": []
-            }]
-        })
-    }
-
     #[test]
     fn declares_direct_graph_editing_and_audio_tools() {
         let declarations = tool_declarations();
@@ -786,12 +1257,13 @@ mod tests {
             .iter()
             .filter_map(|tool| tool.get("name").and_then(JsonValue::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(names, [READ_TOOL_NAME, APPLY_TOOL_NAME, AUDIO_TOOL_NAME]);
+        assert_eq!(names[0..2], [READ_TOOL_NAME, AUDIO_TOOL_NAME]);
+        assert_eq!(&names[2..], MUTATION_TOOL_NAMES);
         assert!(
-            declarations[2]["description"]
+            declarations[1]["description"]
                 .as_str()
                 .unwrap()
-                .contains("direct musical listening")
+                .contains("you decide whether and when to listen")
         );
     }
 
@@ -811,7 +1283,7 @@ mod tests {
             .expect("WAV artifact");
         assert!(session.path().join(artifact).is_file());
         session
-            .update_status("completed", "Done", 2, 1, 1, 0)
+            .update_status("completed", "Done", 2, 1)
             .expect("session metadata");
         let session_id = session.path().file_name().unwrap().to_string_lossy();
         let summaries = session_summaries().expect("session summaries");
@@ -822,42 +1294,197 @@ mod tests {
         assert_eq!(summary["status"], "completed");
         assert_eq!(summary["appliedSteps"], 2);
         assert_eq!(summary["audioListens"], 1);
-        assert_eq!(summary["judgeReviews"], 1);
-        assert_eq!(summary["judgeRejections"], 0);
-        assert_eq!(summary["model"], crate::gemini::GEMINI_MODEL);
     }
 
     #[test]
-    fn applies_valid_batches_and_returns_useful_errors_without_mutation() {
+    fn crud_mutations_publish_stable_ids_and_undo_the_last_change() {
         let original = Project::demo();
         let session =
             EditSession::create(&original, "shape the bass", 4.0, 8.0).expect("edit session");
-        let error = apply_sound_graph_edits(session.path(), &preset_edit(999, "Surge Lead"))
-            .expect_err("unknown stable ID");
-        assert!(error.contains("stable IDs"));
-        assert_eq!(
-            current_project(session.path()).unwrap().to_json(),
-            original.to_json()
-        );
-
-        let response = apply_sound_graph_edits(session.path(), &preset_edit(201, "Surge Lead"))
-            .expect("valid graph edit");
-        assert!(response.contains("updated the sound graph"));
+        let response = apply_agent_mutation(
+            session.path(),
+            "new_track",
+            &serde_json::json!({"role":"lead"}),
+        )
+        .expect("new track");
+        let response: JsonValue = serde_json::from_str(&response).unwrap();
+        let track_id = response["id"].as_u64().expect("created track ID");
         let (plan, project) = session.take_update().unwrap().expect("published update");
-        assert_eq!(plan.summary, "Changed the bass patch");
-        assert_eq!(project.tracks[1].instrument.preset, "Surge Lead");
+        assert_eq!(plan.action, Action::GraphMutation);
+        assert!(project.tracks.iter().any(|track| track.id == track_id));
+
+        apply_agent_mutation(session.path(), "undo", &serde_json::json!({})).expect("undo");
+        let (_, project) = session.take_update().unwrap().expect("published undo");
+        assert_eq!(project.tracks.len(), original.tracks.len());
+        assert!(!project.tracks.iter().any(|track| track.id == track_id));
     }
 
     #[test]
-    fn audio_render_validates_stable_track_ids() {
+    fn failed_progress_publication_rolls_back_graph_and_undo_snapshot() {
+        let original = Project::demo();
+        let session = EditSession::create(&original, "change tempo", 0.0, 4.0).expect("session");
+        let mut prior_undo = Studio::from_project(original.clone());
+        prior_undo.set_tempo(90).expect("prior undo state");
+        write_replace(
+            &session.path().join(UNDO_GRAPH_FILE),
+            &prior_undo.project().to_json(),
+        )
+        .expect("prior undo snapshot");
+        let undo_before = fs::read_to_string(session.path().join(UNDO_GRAPH_FILE)).expect("undo");
+        fs::create_dir(session.path().join(PENDING_PROGRESS_DIRECTORY))
+            .expect("blocked progress handoff");
+
+        let error =
+            apply_agent_mutation(session.path(), "set_tempo", &serde_json::json!({"bpm":130}))
+                .expect_err("progress publication failure");
+
+        assert!(error.contains("could not prepare Gemini edit progress"));
+        let restored = ProjectStore::open(session.path().join(GRAPH_FILE))
+            .expect("restored graph")
+            .1;
+        assert_eq!(restored.project().to_json(), original.to_json());
+        assert_eq!(
+            fs::read_to_string(session.path().join(UNDO_GRAPH_FILE)).expect("restored undo"),
+            undo_before
+        );
+
+        fs::create_dir(session.path().join(PENDING_PROGRESS_DIRECTORY))
+            .expect("blocked undo handoff");
+        let error = apply_agent_mutation(session.path(), "undo", &serde_json::json!({}))
+            .expect_err("undo publication failure");
+        assert!(error.contains("could not prepare Gemini edit progress"));
+        let restored = ProjectStore::open(session.path().join(GRAPH_FILE))
+            .expect("graph after failed undo")
+            .1;
+        assert_eq!(restored.project().to_json(), original.to_json());
+        assert_eq!(
+            fs::read_to_string(session.path().join(UNDO_GRAPH_FILE)).expect("undo after failure"),
+            undo_before
+        );
+    }
+
+    #[test]
+    fn committed_graph_metadata_is_synchronized_before_the_next_mutation() {
+        let session =
+            EditSession::create(&Project::demo(), "two edits", 0.0, 8.0).expect("edit session");
+        apply_agent_mutation(session.path(), "set_tempo", &serde_json::json!({"bpm":120}))
+            .expect("first mutation");
+        let (plan, submitted) = session.take_update().unwrap().expect("first update");
+
+        let mut live = Studio::from_project(Project::demo());
+        live.replace_graph(submitted, 0.0, 8.0, "two edits", plan)
+            .expect("server commit metadata");
+        session
+            .synchronize_project(live.project())
+            .expect("canonical synchronization");
+
+        apply_agent_mutation(
+            session.path(),
+            "update_midi_clip",
+            &serde_json::json!({
+                "trackId":1,"clipId":11,"label":"Updated drums","start":0,"end":8,
+                "loopBeats":4,"events":[
+                    {"time":0,"duration":0.25,"pitch":36,"velocity":0.9}
+                ]
+            }),
+        )
+        .expect("second mutation after synchronization");
+        let (_, submitted) = session.take_update().unwrap().expect("second update");
+        live.replace_graph(
+            submitted,
+            0.0,
+            8.0,
+            "two edits",
+            EditPlan {
+                action: Action::GraphMutation,
+                summary: "Updated drums".to_owned(),
+            },
+        )
+        .expect("second server commit has no ID collision");
+        Project::from_json(&live.project().to_json()).expect("committed graph validates");
+        let clips = &live.project().tracks[0].clips;
+        assert_eq!((clips[0].start, clips[0].end), (0.0, 8.0));
+        assert_eq!((clips[1].start, clips[1].end), (8.0, 32.0));
+
+        let error = apply_agent_mutation(
+            session.path(),
+            "add_midi_clip",
+            &serde_json::json!({
+                "trackId":1,"label":"Outside selection","start":8,"end":12,
+                "loopBeats":4,"events":[]
+            }),
+        )
+        .expect_err("MIDI outside the selected region");
+        assert!(error.contains("selected region"));
+
+        apply_agent_mutation(
+            session.path(),
+            "delete_midi_clip",
+            &serde_json::json!({"trackId":1,"clipId":11}),
+        )
+        .expect("selection-scoped MIDI deletion");
+        let (_, deleted) = session.take_update().unwrap().expect("delete update");
+        assert!(deleted.tracks[0].clips.iter().all(|clip| clip.start >= 8.0));
+    }
+
+    #[test]
+    fn mute_is_an_explicit_reversible_track_state_and_effect_delete_is_physical() {
+        let session =
+            EditSession::create(&Project::demo(), "edit safely", 0.0, 4.0).expect("edit session");
+        apply_agent_mutation(
+            session.path(),
+            "set_track_mute",
+            &serde_json::json!({"trackId":2,"muted":true}),
+        )
+        .expect("mute");
+        let (_, muted) = session.take_update().unwrap().expect("mute update");
+        assert!(muted.tracks[1].muted);
+
+        apply_agent_mutation(
+            session.path(),
+            "set_track_mute",
+            &serde_json::json!({"trackId":2,"muted":false}),
+        )
+        .expect("unmute");
+        let (_, unmuted) = session.take_update().unwrap().expect("unmute update");
+        assert!(!unmuted.tracks[1].muted);
+
+        let response = apply_agent_mutation(
+            session.path(),
+            "add_effect",
+            &serde_json::json!({"trackId":2,"name":"Drive","mix":0.5}),
+        )
+        .expect("add effect");
+        let effect_id = serde_json::from_str::<JsonValue>(&response).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        session.take_update().unwrap().expect("effect update");
+        apply_agent_mutation(
+            session.path(),
+            "delete_effect",
+            &serde_json::json!({"trackId":2,"effectId":effect_id}),
+        )
+        .expect("delete effect");
+        let (_, deleted) = session.take_update().unwrap().expect("delete update");
+        assert!(
+            deleted.tracks[1]
+                .effects
+                .iter()
+                .all(|effect| effect.id != effect_id)
+        );
+        assert!(!deleted.tracks[1].routing.effect_order.contains(&effect_id));
+    }
+
+    #[test]
+    fn audio_render_validates_stable_channel_ids() {
         let session =
             EditSession::create(&Project::demo(), "listen", 0.0, 2.0).expect("edit session");
         let error = render_audio(
             session.path(),
             &serde_json::json!({"trackIds": [999], "start": 0, "end": 1}),
         )
-        .expect_err("unknown track");
-        assert!(error.contains("available track IDs"));
+        .expect_err("unknown channel");
+        assert!(error.contains("available channel IDs"));
         assert!(error.contains("1 (Pulse Kit, drums)"));
     }
 

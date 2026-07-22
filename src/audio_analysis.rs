@@ -2,7 +2,8 @@ use std::{collections::HashMap, f32::consts::PI};
 
 use crate::model::{
     Clip, ClipEvent, FILTER_CUTOFF_MAX_HZ, FILTER_CUTOFF_MIN_HZ, FILTER_RESONANCE_DEFAULT,
-    FILTER_RESONANCE_MAX, FILTER_RESONANCE_MIN, Project, Track, TrackRole, legacy_filter_cutoff_hz,
+    FILTER_RESONANCE_MAX, FILTER_RESONANCE_MIN, Project, Track, TrackRole,
+    role_default_filter_cutoff_hz,
 };
 use crate::prompt::{Action, AutomationPoint};
 
@@ -176,6 +177,131 @@ pub(crate) fn render_region(
         playback_start_sample(start),
         playback_end_sample(end),
     )
+}
+
+pub(crate) fn render_region_builtin(
+    project: &Project,
+    track_ids: &[u64],
+    start: f32,
+    end: f32,
+) -> Result<AudioRegion, String> {
+    if !start.is_finite()
+        || !end.is_finite()
+        || start < 0.0
+        || end <= start
+        || end > project.duration
+        || end - start > MAX_REGION_SECONDS
+    {
+        return Err(format!(
+            "analysis range must be inside the project and no longer than {MAX_REGION_SECONDS} seconds"
+        ));
+    }
+    render_builtin_samples(
+        project,
+        track_ids,
+        playback_start_sample(start),
+        playback_end_sample(end),
+    )
+}
+
+pub(crate) fn render_project_sample_range_builtin(
+    project: &Project,
+    start_sample: usize,
+    end_sample: usize,
+) -> Result<AudioRegion, String> {
+    let track_ids = project
+        .tracks
+        .iter()
+        .map(|track| track.id)
+        .collect::<Vec<_>>();
+    render_builtin_samples(project, &track_ids, start_sample, end_sample)
+}
+
+pub(crate) fn render_full_project(project: &Project, builtin: bool) -> Result<AudioRegion, String> {
+    let end = playback_end_sample(project.duration);
+    let track_ids = project
+        .tracks
+        .iter()
+        .map(|track| track.id)
+        .collect::<Vec<_>>();
+    if builtin {
+        render_builtin_samples(project, &track_ids, 0, end)
+    } else {
+        render_audio_samples(project, &track_ids, 0, end)
+    }
+}
+
+fn render_builtin_samples(
+    project: &Project,
+    track_ids: &[u64],
+    start_sample: usize,
+    end_sample: usize,
+) -> Result<AudioRegion, String> {
+    if end_sample <= start_sample {
+        return Err("audio range must contain at least one sample".to_owned());
+    }
+    let start = precise_sample_time(start_sample);
+    let end = precise_sample_time(end_sample);
+    let mut mix = vec![0.0_f32; end_sample - start_sample];
+    let mut event_onsets = Vec::new();
+    for track_id in track_ids {
+        let track = project
+            .tracks
+            .iter()
+            .find(|track| track.id == *track_id)
+            .ok_or_else(|| format!("track {track_id} does not exist"))?;
+        if track.muted {
+            continue;
+        }
+        let state = TrackRenderState::new(project, track, start, end);
+        let mut rendered = vec![0.0_f32; mix.len()];
+        let beat_duration = 60.0 / f64::from(project.bpm);
+        for occurrence in &state.occurrences {
+            let onset = occurrence.time;
+            let duration = (f64::from(occurrence.duration) * beat_duration).max(0.01);
+            if onset >= start && onset < end {
+                event_onsets.push(onset as f32);
+            }
+            let note_start = midi_event_sample(onset).max(start_sample);
+            let pitch = f32::from(occurrence.event.pitch) + (track.instrument.pitch - 0.5) * 24.0;
+            let frequency = 440.0 * 2.0_f32.powf((pitch - 69.0) / 12.0);
+            let attack = 0.002 + track.instrument.attack * 0.5;
+            let release = 0.02 + track.instrument.release * 1.5;
+            let note_end = midi_event_sample(onset + duration + f64::from(release)).min(end_sample);
+            for sample_index in note_start..note_end {
+                let local = sample_index - start_sample;
+                let time = precise_sample_time(sample_index) - onset;
+                let held = duration;
+                let envelope = if time < f64::from(attack) {
+                    (time / f64::from(attack)).clamp(0.0, 1.0) as f32
+                } else if time <= held {
+                    1.0
+                } else {
+                    (1.0 - ((time - held) / f64::from(release))).clamp(0.0, 1.0) as f32
+                };
+                let phase = std::f64::consts::TAU * f64::from(frequency) * time;
+                let sine = phase.sin() as f32;
+                let saw = ((phase / std::f64::consts::TAU).fract() as f32 * 2.0) - 1.0;
+                let color = track.instrument.cutoff.clamp(0.0, 1.0);
+                rendered[local] += (sine * (1.0 - color * 0.55) + saw * color * 0.35)
+                    * envelope
+                    * occurrence.velocity
+                    * 0.16;
+            }
+        }
+        process_track_audio(project, track, &state, start_sample, &mut rendered);
+        for (mixed, sample) in mix.iter_mut().zip(rendered) {
+            *mixed += sample;
+        }
+    }
+    for sample in &mut mix {
+        *sample = (*sample * 0.8).tanh();
+    }
+    Ok(AudioRegion {
+        samples: mix,
+        event_count: event_onsets.len(),
+        event_onsets,
+    })
 }
 
 pub(crate) fn render_project_region(
@@ -1194,7 +1320,7 @@ fn automation_at(
         let wet_cutoff = if effects.low_pass_cutoff > 0.0 {
             effects.low_pass_cutoff
         } else {
-            legacy_filter_cutoff_hz(track.role)
+            role_default_filter_cutoff_hz(track.role)
         }
         .clamp(FILTER_CUTOFF_MIN_HZ, FILTER_CUTOFF_MAX_HZ);
         20_000.0 * (wet_cutoff / 20_000.0).powf(effects.low_pass.clamp(0.0, 1.0))
@@ -1758,6 +1884,50 @@ mod tests {
         let time = f64::from(time);
         let render_state = TrackRenderState::new(project, track, time, time + 0.000_01);
         modulator_value(project, &render_state, &track.modulators[0], time)
+    }
+
+    #[test]
+    fn builtin_note_tail_uses_the_instrument_release_duration() {
+        let mut project = Project::demo();
+        project.bpm = 60;
+        project.duration = 2.0;
+        project.tracks.truncate(1);
+        let track = &mut project.tracks[0];
+        track.effects.clear();
+        track.modulators.clear();
+        track.routing.effect_order.clear();
+        track.instrument.release = 1.0;
+        track.clips = vec![Clip {
+            id: 9_500,
+            label: "Release test".to_owned(),
+            start: 0.0,
+            end: 2.0,
+            source_start: 0.0,
+            style: "test".to_owned(),
+            loop_beats: 2.0,
+            events: vec![ClipEvent {
+                id: 9_501,
+                kind: "note".to_owned(),
+                time: 0.0,
+                duration: 0.1,
+                pitch: 60,
+                velocity: 1.0,
+            }],
+        }];
+
+        let rendered = render_project_sample_range_builtin(
+            &project,
+            0,
+            playback_sample_count(0.0, project.duration),
+        )
+        .expect("built-in release render");
+        let tail_start = playback_sample_count(0.0, 0.6);
+        let tail_end = playback_sample_count(0.0, 0.7);
+        assert!(
+            rendered.samples[tail_start..tail_end]
+                .iter()
+                .any(|sample| sample.abs() > 0.001)
+        );
     }
 
     fn instrument_parameter_at(
@@ -2680,5 +2850,19 @@ mod tests {
             .map(|(left, right)| (left - right).abs())
             .sum::<f32>()
             / left.len().max(1) as f32
+    }
+
+    #[test]
+    fn builtin_backend_renders_notes_and_effect_changes() {
+        let project = Project::demo();
+        let track_id = project.tracks[1].id;
+        let dry = render_region_builtin(&project, &[track_id], 0.0, 2.0).expect("built-in render");
+        assert!(dry.samples.iter().any(|sample| sample.abs() > 0.000_1));
+
+        let mut wet_project = project.clone();
+        wet_project.tracks[1].effects[0].mix = 1.0;
+        let wet = render_region_builtin(&wet_project, &[track_id], 0.0, 2.0)
+            .expect("built-in effect render");
+        assert!(sample_difference(&dry.samples, &wet.samples) > 0.000_01);
     }
 }

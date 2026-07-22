@@ -56,6 +56,7 @@
             <h1 id="project-name">Loading studio...</h1>
           </div>
           <div class="heading-actions">
+            <a class="text-button" id="export-button" href="/api/export.wav" download="project.wav">Export WAV</a>
             <button class="text-button" id="undo-button" type="button">Undo</button>
             <button class="text-button" id="reset-button" type="button">Reset demo</button>
             <span class="saved-state" id="saved-state">Loading</span>
@@ -122,22 +123,22 @@
             </div>
             <div class="prompt-suggestions" aria-label="Prompt suggestions">
               <span>Try</span>
-              <button type="button" data-prompt="Increase the volume">Increase volume</button>
-              <button type="button" data-prompt="Turn this section into a dubstep drop">Dubstep drop</button>
-              <button type="button" data-prompt="Make the chords warm and spacious">Warm + spacious</button>
+              <button type="button" data-prompt="Turn this section into a waltz">Waltz</button>
+              <button type="button" data-prompt="Turn this section into a classic dubstep drop. It builds in speed and intensity for the first 80%, then the drop, and then the outro into the rest of the track">Drop</button>
+              <button type="button" data-prompt="Make the chords warm and spacious, and this section relaxing">warm</button>
             </div>
           </div>
         </section>
-
-        <section class="edit-log-panel" aria-labelledby="edit-log-title">
+        <section class="session-history" aria-labelledby="session-history-heading">
           <div class="section-heading">
             <div>
-              <p class="eyebrow">SESSION MEMORY</p>
-              <h2 id="edit-log-title">Gemini changes</h2>
+              <p class="eyebrow">PROJECT TIMELINE</p>
+              <h2 id="session-history-heading">History</h2>
             </div>
-            <span id="edit-count">0 edits</span>
+            <span id="history-count">0 changes</span>
           </div>
-          <div class="edit-log" id="edit-log"></div>
+          <p class="session-history-hint">Gemini and manual changes, most recent first. Jump to any earlier project state without losing what came after it.</p>
+          <div id="session-history-list" class="history-list" aria-live="polite"></div>
         </section>
       </section>
 
@@ -176,6 +177,10 @@
           </div>
         </div>
         <p class="debug-intro">Copy this report into a coding assistant when you need help. Backend warnings and errors are also written to the server's stderr.</p>
+        <section class="debug-settings" aria-labelledby="audio-backend-heading">
+          <div><strong id="audio-backend-heading">Instrument backend</strong><span>Surge XT is the production default; built-in is available for diagnosis.</span></div>
+          <select id="audio-backend"><option>Surge XT</option><option>built-in</option></select>
+        </section>
         <section class="debug-settings" aria-labelledby="gemini-session-heading">
           <div>
             <strong id="gemini-session-heading">Gemini sessions</strong>
