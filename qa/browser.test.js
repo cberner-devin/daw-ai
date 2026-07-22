@@ -368,7 +368,7 @@ async function run() {
         cdp,
         startupPage.sessionId,
         "!document.querySelector('#play-button').disabled && document.querySelectorAll('.track-row').length === 3",
-      ),
+        ),
       "playback readiness after initial project load",
     );
     await cdp.send("Target.closeTarget", { targetId: startupPage.targetId });
@@ -515,7 +515,7 @@ async function run() {
         appSession,
         `!document.querySelector('#compose-button').disabled &&
           document.querySelector('#edit-progress').hidden &&
-          document.querySelector('#toast').textContent === 'Simulated resumed edit stopped' &&
+          document.querySelector('#toast-message').textContent === 'Simulated resumed edit stopped' &&
           localStorage.getItem('daw-ai.pending-edit.v1') === null`,
       ),
       "resumed edit terminal cleanup",
@@ -866,7 +866,7 @@ async function run() {
           appSession,
           `!document.querySelector('#compose-button').disabled &&
           document.querySelector('#toast').classList.contains('is-error') &&
-          document.querySelector('#toast').textContent === 'Edit request refused'`,
+          document.querySelector('#toast-message').textContent === 'Edit request refused'`,
       ),
       "definitive edit-acceptance refusal",
     );
@@ -903,7 +903,7 @@ async function run() {
         const playback = await evaluate(cdp, appSession, `({
           state: document.documentElement.dataset.audioState,
           error: document.querySelector('#toast').classList.contains('is-error')
-            ? document.querySelector('#toast').textContent
+            ? document.querySelector('#toast-message').textContent
             : null,
         })`);
         if (playback.state === "idle" && playback.error) throw new Error(playback.error);
@@ -1128,7 +1128,7 @@ async function run() {
         savedState: document.querySelector('#saved-state').textContent,
         errorToast: !document.querySelector('#toast').hidden &&
           document.querySelector('#toast').classList.contains('is-error'),
-        toastText: document.querySelector('#toast').textContent,
+        toastText: document.querySelector('#toast-message').textContent,
       };
     })()`);
     assert.equal(reconciledPrompt.serverEdits, 1);
@@ -1310,7 +1310,7 @@ async function run() {
         cdp,
         appSession,
         `!document.querySelector('#compose-button').disabled &&
-          document.querySelector('#toast').textContent === 'the project changed; submit the edit again'`,
+          document.querySelector('#toast-message').textContent === 'the project changed; submit the edit again'`,
       ),
       "conflicted edit project reconciliation",
     );
@@ -1454,7 +1454,7 @@ async function run() {
         appSession,
         `!document.querySelector('#compose-button').disabled &&
           document.querySelector('#toast').classList.contains('is-error') &&
-          document.querySelector('#toast').textContent.startsWith('The edit status was lost')`,
+          document.querySelector('#toast-message').textContent.startsWith('The edit status was lost')`,
       ),
       "operation-bound status-loss reconciliation",
     );
@@ -1609,7 +1609,7 @@ async function run() {
         cdp,
         appSession,
         `!document.querySelector('#compose-button').disabled &&
-          document.querySelector('#toast').textContent ===
+          document.querySelector('#toast-message').textContent ===
             'Gemini stopped unexpectedly. 1 partial change was saved; review the project before retrying.' &&
           document.querySelector('#toast').classList.contains('is-error') &&
           document.querySelector('#prompt-input').value === '' &&
@@ -1693,7 +1693,7 @@ async function run() {
         appSession,
         `!document.querySelector('#compose-button').disabled &&
           window.__acceptanceLossPosts === 2 &&
-          document.querySelector('#toast').textContent ===
+          document.querySelector('#toast-message').textContent ===
             'Gemini stopped before completing the edit. 1 partial change was saved; review the project before retrying.' &&
           document.querySelector('#toast').classList.contains('is-error') &&
           document.querySelector('#prompt-input').value === '' &&
@@ -1764,7 +1764,7 @@ async function run() {
             project.channelOperations.some(
               (operation) => operation.operationId === window.__lostChannelOperationId
             )) return false;
-        return { id: unrelated.id, toast: document.querySelector('#toast').textContent };
+        return { id: unrelated.id, toast: document.querySelector('#toast-message').textContent };
       })()`),
       "unrelated concurrent channel must not confirm a lost add",
     );
@@ -2430,10 +2430,35 @@ async function run() {
         evaluate(
           cdp,
           appSession,
-          `document.querySelector('#toast').textContent === 'Rejected sound-tool regression' &&
+          `document.querySelector('#toast-message').textContent === 'Rejected sound-tool regression' &&
             document.querySelector('[data-sound-tool="event"][data-track-id="2"][data-tool-id="1201"][data-parameter="pitch"]').value === '33'`,
         ),
       "authoritative sound-tool value after rejection",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(() => {
+        const toast = document.querySelector('#toast');
+        const close = document.querySelector('#toast-close');
+        return {
+          autoDismissMs: toast.dataset.autoDismissMs,
+          closeLabel: close.getAttribute('aria-label'),
+          closeVisible: close.getClientRects().length > 0,
+          role: toast.getAttribute('role'),
+        };
+      })()`),
+      {
+        autoDismissMs: "60000",
+        closeLabel: "Dismiss notification",
+        closeVisible: true,
+        role: "alert",
+      },
+      "error notifications must remain for one minute and offer an accessible dismiss control",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#toast-close').click()");
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('#toast').hidden"),
+      true,
+      "the notification dismiss control must immediately hide the error",
     );
     assert.equal(
       await evaluate(

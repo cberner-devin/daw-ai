@@ -1887,14 +1887,56 @@ input[type="range"]::-moz-range-thumb {
   z-index: 30;
   right: 22px;
   bottom: 22px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
   max-width: min(390px, calc(100% - 44px));
-  padding: 12px 15px;
+  padding: 10px 10px 10px 15px;
   border: 1px solid rgba(189, 255, 93, 0.2);
   border-radius: 9px;
   color: #eafbd1;
   background: #252c1d;
   box-shadow: 0 16px 40px rgba(0, 0, 0, 0.32);
   font-size: 11px;
+}
+
+.toast[hidden] {
+  display: none;
+}
+
+.toast-message {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-block: 2px;
+  overflow-wrap: anywhere;
+}
+
+.toast-close {
+  flex: 0 0 24px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.toast-close::before {
+  content: "\00d7";
+  font-size: 20px;
+  line-height: 20px;
+}
+
+.toast-close:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.toast-close:focus-visible {
+  background: rgba(255, 255, 255, 0.1);
+  outline: 1px solid currentcolor;
+  outline-offset: 1px;
 }
 
 .toast.is-error {
