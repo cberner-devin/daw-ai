@@ -22,6 +22,8 @@ as simple as "increase volume" or as complex as "insert a sick drop here". The A
 
 After submitting a change request, the submit button becomes an interrupt button.
 
+Double-clicking (or long-pressing on mobile) on the track selects the entire track.
+
 There is a session history list of all the actions the agent took. Clicking on one moves the project back to that
 state, so that the user can play and inspect it. The session history does not rollback, allowing the user to navigate
 forward again.
