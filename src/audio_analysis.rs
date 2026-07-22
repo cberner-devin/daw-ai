@@ -300,7 +300,7 @@ fn render_audio_samples(
     end_sample: usize,
 ) -> Result<AudioRegion, String> {
     if track_ids.is_empty() {
-        return Err("at least one channel ID is required".to_owned());
+        return Err("at least one track ID is required".to_owned());
     }
     if end_sample <= start_sample {
         return Err("audio range must contain at least one sample".to_owned());
@@ -315,7 +315,7 @@ fn render_audio_samples(
             .tracks
             .iter()
             .find(|track| track.id == track_id)
-            .ok_or_else(|| format!("channel {track_id} does not exist"))?;
+            .ok_or_else(|| format!("track {track_id} does not exist"))?;
         if track.muted {
             continue;
         }

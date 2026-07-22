@@ -30,7 +30,7 @@ const AUDIO_REGION_SCHEMA: &str = r#"{
   "properties": {
     "trackIds": {
       "type": "array",
-      "description": "One or more stable channel IDs from sound-graph.json. Choose the full mix when judging an arrangement-level result and isolated channels when diagnosing a part.",
+      "description": "One or more stable track IDs from sound-graph.json. Choose the full mix when judging an arrangement-level result and isolated tracks when diagnosing a part.",
       "items": { "type": "integer", "minimum": 1 },
       "minItems": 1,
       "maxItems": 32,
@@ -79,7 +79,7 @@ impl EditSession {
                     "createdAt": unix_milliseconds(),
                     "updatedAt": unix_milliseconds(),
                     "status": "running",
-                    "model": "gemini-3.5-flash",
+                    "model": crate::gemini::GEMINI_MODEL,
                     "prompt": prompt,
                     "start": start,
                     "end": end,
@@ -248,7 +248,7 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         serde_json::json!({
             "type": "function",
             "name": READ_TOOL_NAME,
-            "description": "Read the latest DAW-AI sound graph with stable channel, clip, event, instrument, effect, modulator, automation-target, and routing IDs. Call this before editing and again whenever an edit creates IDs needed by a later batch.",
+            "description": "Read the latest DAW-AI sound graph with stable track, clip, event, instrument, effect, modulator, automation-target, and routing IDs. Call this before editing and again whenever an edit creates IDs needed by a later batch.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -264,7 +264,7 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         serde_json::json!({
             "type": "function",
             "name": AUDIO_TOOL_NAME,
-            "description": "Render model-chosen channels and absolute project start/end times from the latest sound graph as WAV audio for direct musical listening. The listening range is independent of the selected edit scope: include surrounding context when transition, contrast, or continuity matters. Listen before the first edit and after every successful edit.",
+            "description": "Render model-chosen tracks and absolute project start/end times from the latest sound graph as WAV audio for direct musical listening. The listening range is independent of the selected edit scope: include surrounding context when transition, contrast, or continuity matters. Listen before the first edit and after every successful edit.",
             "parameters": audio_schema
         }),
     ]
@@ -313,7 +313,7 @@ pub(crate) fn prepare_audio_render(
     let (track_ids, start, end) = audio_region_arguments(&project, arguments)?;
     let description = format!(
         "Rendered {} from {:.3} to {:.3} seconds through the same Surge XT-backed audio path used for DAW playback. Listen to the audio itself and describe the audible rhythm, subdivision, energy contour, timbre, transitions, and shortcomings before deciding what to do next.",
-        selected_channel_labels(&project, &track_ids),
+        selected_track_labels(&project, &track_ids),
         start,
         end,
     );
@@ -357,7 +357,7 @@ fn audio_region_arguments(
         .and_then(JsonValue::as_array)
         .ok_or_else(|| "trackIds must be an array".to_owned())?;
     if values.is_empty() || values.len() > 32 {
-        return Err("trackIds must contain between 1 and 32 channel IDs".to_owned());
+        return Err("trackIds must contain between 1 and 32 track IDs".to_owned());
     }
     let mut track_ids = Vec::with_capacity(values.len());
     for value in values {
@@ -366,7 +366,7 @@ fn audio_region_arguments(
             .filter(|track_id| *track_id > 0)
             .ok_or_else(|| "trackIds must contain positive integers".to_owned())?;
         if track_ids.contains(&track_id) {
-            return Err(format!("channel {track_id} was requested more than once"));
+            return Err(format!("track {track_id} was requested more than once"));
         }
         if !project.tracks.iter().any(|track| track.id == track_id) {
             let available = project
@@ -376,7 +376,7 @@ fn audio_region_arguments(
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(format!(
-                "channel {track_id} does not exist; available channel IDs: {available}"
+                "track {track_id} does not exist; available track IDs: {available}"
             ));
         }
         track_ids.push(track_id);
@@ -405,7 +405,7 @@ fn audio_region_arguments(
     Ok((track_ids, start, end))
 }
 
-fn selected_channel_labels(project: &Project, track_ids: &[u64]) -> String {
+fn selected_track_labels(project: &Project, track_ids: &[u64]) -> String {
     track_ids
         .iter()
         .filter_map(|track_id| project.tracks.iter().find(|track| track.id == *track_id))
@@ -474,7 +474,7 @@ fn apply_graph_edits(session_path: &Path, source: &str) -> Result<String, String
         ),
         "version": studio.project().version,
         "summary": summary,
-        "channels": sound_tool_inventory(studio.project())
+        "tracks": sound_tool_inventory(studio.project())
     })
     .to_string())
 }
@@ -609,7 +609,7 @@ fn studio_error_message(error: StudioError) -> String {
         )
         .to_owned(),
         StudioError::InvalidMix => "A mixer value is outside its published range.".to_owned(),
-        StudioError::InvalidChannel => "A channel change exceeds the sound graph limits.".to_owned(),
+        StudioError::InvalidChannel => "A track change exceeds the sound graph limits.".to_owned(),
         StudioError::UnknownSoundTool => concat!(
             "An action references a sound-tool, clip, or event ID that is not in sound-graph.json. ",
             "Read the graph again and use its stable IDs."
@@ -824,6 +824,7 @@ mod tests {
         assert_eq!(summary["audioListens"], 1);
         assert_eq!(summary["judgeReviews"], 1);
         assert_eq!(summary["judgeRejections"], 0);
+        assert_eq!(summary["model"], crate::gemini::GEMINI_MODEL);
     }
 
     #[test]
@@ -848,15 +849,15 @@ mod tests {
     }
 
     #[test]
-    fn audio_render_validates_stable_channel_ids() {
+    fn audio_render_validates_stable_track_ids() {
         let session =
             EditSession::create(&Project::demo(), "listen", 0.0, 2.0).expect("edit session");
         let error = render_audio(
             session.path(),
             &serde_json::json!({"trackIds": [999], "start": 0, "end": 1}),
         )
-        .expect_err("unknown channel");
-        assert!(error.contains("available channel IDs"));
+        .expect_err("unknown track");
+        assert!(error.contains("available track IDs"));
         assert!(error.contains("1 (Pulse Kit, drums)"));
     }
 

@@ -66,6 +66,7 @@
     activeView: "ai",
     clientIssues: [],
     geminiSessions: [],
+    graphNodeSelection: {},
   };
 
   let projectMutationQueue = Promise.resolve();
@@ -501,6 +502,7 @@
     const uiState = captureAdvancedUiState();
     elements.channelList.innerHTML = state.project.tracks
       .map((track) => {
+        const selectedNode = selectedGraphNode(track);
         const regionalEffects = regionalEffectsForTrack(track)
           .map((effect) => {
             return `<span class="effect-pill is-regional">${escapeHtml(effect.name)} <b>${escapeHtml(effect.detail)} &middot; ${effect.start.toFixed(1)}-${effect.end.toFixed(1)}s</b></span>`;
@@ -510,58 +512,58 @@
           .filter((node) => node.startsWith("effect:"))
           .map((node) => track.effects.find((effect) => effect.id === Number(node.slice(7))))
           .filter(Boolean);
-        const routeNodes = ["MIDI Clips", "Instrument", ...orderedEffects.map((effect) => effect.name), "Master"];
-        const route = routeNodes
-          .map((node, index) => {
-            const signal = index === 0 ? "MIDI" : "AUDIO";
-            const edge = index < routeNodes.length - 1
-              ? `<i aria-hidden="true"><b>${signal}</b>&rarr;</i>`
-              : "";
-            return `<span>${escapeHtml(node)}</span>${edge}`;
-          })
-          .join("");
         return `<section class="channel-card" data-channel-track="${track.id}" tabindex="-1" style="--track-color:${track.color}">
           <div class="channel-heading">
             <div class="channel-name"><i></i>${escapeHtml(track.name)}</div>
             <div class="channel-actions">
               <button class="mute-button ${track.muted ? "is-muted" : ""}" type="button" data-mute-track="${track.id}" data-muted="${track.muted}">${track.muted ? "MUTED" : "MUTE"}</button>
-              <button class="delete-channel-button" type="button" data-delete-track="${track.id}" data-track-name="${escapeHtml(track.name)}" aria-label="${escapeHtml(`Delete ${track.name} channel`)}" ${state.channelMutationPending ? "disabled" : ""}>Delete</button>
+              <button class="delete-channel-button" type="button" data-delete-track="${track.id}" data-track-name="${escapeHtml(track.name)}" aria-label="${escapeHtml(`Delete ${track.name} track`)}" ${state.channelMutationPending ? "disabled" : ""}>Delete</button>
             </div>
           </div>
           <label class="volume-control">LEVEL
             <input type="range" min="0" max="1.5" step="0.01" value="${track.volume}" data-volume-track="${track.id}" aria-label="${escapeHtml(track.name)} volume">
             <output>${Math.round(track.volume * 100)}%</output>
           </label>
-          <div class="sound-tool instrument-tool">
-            <div class="tool-heading"><div><span>Instrument</span><strong>${escapeHtml(track.instrument.engine)}</strong></div><code>#${track.instrument.id}</code></div>
-            <div class="tool-controls instrument-preset-controls">
-              <label class="tool-control">Preset
-                <select data-sound-tool="instrument" data-track-id="${track.id}" data-tool-id="${track.instrument.id}" data-parameter="preset" data-control-key="${track.id}-instrument-${track.instrument.id}-preset" aria-label="${escapeHtml(`${track.name} instrument #${track.instrument.id} Surge XT preset`)}">
-                  ${selectOptions(SURGE_PRESETS, track.instrument.preset)}
-                </select>
-              </label>
+          <div class="track-workspace">
+            <div class="track-editor-column">
+              <div class="sound-graph-panel">
+                <div class="tool-heading"><div><span>Sound graph</span><strong>Click a node to inspect it</strong></div></div>
+                ${renderSoundGraph(track, orderedEffects, selectedNode)}
+              </div>
+              <div class="sound-tool clips-tool">
+                <div class="tool-heading"><div><span>MIDI Clips</span><strong>Piano roll and event editor</strong></div></div>
+                ${track.clips.map((clip) => renderClipEvents(track, clip)).join("") || '<span class="effect-pill">No MIDI clips</span>'}
+              </div>
             </div>
-            <div class="tool-controls instrument-envelope-controls">
-              ${soundRange(track, "instrument", track.instrument.id, "instrument", "attack", track.instrument.parameters.attack, 0, 1, "%", "", "Amp EG attack")}
-              ${soundRange(track, "instrument", track.instrument.id, "instrument", "release", track.instrument.parameters.release, 0, 1, "%", "", "Amp EG release")}
-              ${soundRange(track, "instrument", track.instrument.id, "instrument", "cutoff", track.instrument.parameters.cutoff, 0, 1, "%", "", "Filter 1 cutoff")}
-              ${soundRange(track, "instrument", track.instrument.id, "instrument", "resonance", track.instrument.parameters.resonance, 0, 1, "%", "", "Filter 1 resonance")}
-              ${soundRange(track, "instrument", track.instrument.id, "instrument", "pitch", track.instrument.parameters.pitch, 0, 1, "%", "", "Scene pitch")}
-            </div>
-          </div>
-          <div class="sound-tool effects-tool">
-            <div class="tool-heading"><div><span>Effect chain</span><strong>Processed in this order</strong></div></div>
-            <div class="routing-chain" aria-label="${escapeHtml(track.name)} typed sound routing">${route}</div>
-            <div class="effect-stack">${orderedEffects.map((effect, index) => renderEffect(track, effect, index, orderedEffects.length)).join("")}</div>
-            <div class="effects-list">${regionalEffects || '<span class="effect-pill">No regional effects</span>'}</div>
-          </div>
-          <div class="sound-tool modulators-tool">
-            <div class="tool-heading"><div><span>Modulators</span><strong>Time-varying control signals</strong></div></div>
-            ${track.modulators.map((modulator) => renderModulator(track, modulator)).join("")}
-          </div>
-          <div class="sound-tool clips-tool">
-            <div class="tool-heading"><div><span>MIDI Clips</span><strong>Timed notes, pitches, and velocities</strong></div></div>
-            ${track.clips.map((clip) => renderClipEvents(track, clip)).join("") || '<span class="effect-pill">No MIDI clips</span>'}
+            <aside class="node-inspector-column" aria-label="${escapeHtml(`${track.name} selected node parameters`)}">
+              <div class="inspector-label">Selected node</div>
+              <div class="sound-tool instrument-tool node-inspector" data-node-pane="instrument:${track.instrument.id}" ${selectedNode === `instrument:${track.instrument.id}` ? "" : "hidden"}>
+                <div class="tool-heading"><div><span>Instrument</span><strong>${escapeHtml(track.instrument.engine)}</strong></div><code>#${track.instrument.id}</code></div>
+                <div class="tool-controls instrument-preset-controls">
+                  <label class="tool-control">Preset
+                    <select data-sound-tool="instrument" data-track-id="${track.id}" data-tool-id="${track.instrument.id}" data-parameter="preset" data-control-key="${track.id}-instrument-${track.instrument.id}-preset" aria-label="${escapeHtml(`${track.name} instrument #${track.instrument.id} Surge XT preset`)}">
+                      ${selectOptions(SURGE_PRESETS, track.instrument.preset)}
+                    </select>
+                  </label>
+                </div>
+                <div class="tool-controls instrument-envelope-controls">
+                  ${soundRange(track, "instrument", track.instrument.id, "instrument", "attack", track.instrument.parameters.attack, 0, 1, "%", "", "Amp EG attack")}
+                  ${soundRange(track, "instrument", track.instrument.id, "instrument", "release", track.instrument.parameters.release, 0, 1, "%", "", "Amp EG release")}
+                  ${soundRange(track, "instrument", track.instrument.id, "instrument", "cutoff", track.instrument.parameters.cutoff, 0, 1, "%", "", "Filter 1 cutoff")}
+                  ${soundRange(track, "instrument", track.instrument.id, "instrument", "resonance", track.instrument.parameters.resonance, 0, 1, "%", "", "Filter 1 resonance")}
+                  ${soundRange(track, "instrument", track.instrument.id, "instrument", "pitch", track.instrument.parameters.pitch, 0, 1, "%", "", "Scene pitch")}
+                </div>
+              </div>
+              <div class="sound-tool effects-tool node-inspector" data-node-pane="effects" ${selectedNode.startsWith("effect:") ? "" : "hidden"}>
+                <div class="tool-heading"><div><span>Effect</span><strong>Audio processor parameters</strong></div></div>
+                <div class="effect-stack">${orderedEffects.map((effect, index) => `<div data-effect-pane="effect:${effect.id}" ${selectedNode === `effect:${effect.id}` ? "" : "hidden"}>${renderEffect(track, effect, index, orderedEffects.length)}</div>`).join("")}</div>
+                <div class="effects-list">${regionalEffects || '<span class="effect-pill">No regional effects</span>'}</div>
+              </div>
+              <div class="sound-tool modulators-tool node-inspector" data-node-pane="modulators" ${selectedNode.startsWith("modulator:") ? "" : "hidden"}>
+                <div class="tool-heading"><div><span>Modulator</span><strong>Control signal parameters</strong></div></div>
+                ${track.modulators.map((modulator) => `<div data-modulator-pane="modulator:${modulator.id}" ${selectedNode === `modulator:${modulator.id}` ? "" : "hidden"}>${renderModulator(track, modulator)}</div>`).join("")}
+              </div>
+            </aside>
           </div>
         </section>`;
       })
@@ -583,8 +585,28 @@
     });
     elements.channelList.querySelectorAll("[data-delete-track]").forEach((button) => {
       button.addEventListener("click", () => {
-        if (!window.confirm(`Delete the ${button.dataset.trackName} channel and all of its sound tools?`)) return;
+        if (!window.confirm(`Delete the ${button.dataset.trackName} track and all of its sound tools?`)) return;
         void changeChannel("delete", { track_id: button.dataset.deleteTrack });
+      });
+    });
+    elements.channelList.querySelectorAll("[data-graph-node]").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.graphNodeSelection[button.dataset.trackId] = button.dataset.graphNode;
+        const trackId = button.dataset.trackId;
+        const node = button.dataset.graphNode;
+        renderAdvanced();
+        [...elements.channelList.querySelectorAll("[data-graph-node]")]
+          .find((candidate) => candidate.dataset.trackId === trackId && candidate.dataset.graphNode === node)
+          ?.focus({ preventScroll: true });
+      });
+    });
+    elements.channelList.querySelectorAll("[data-midi-event]").forEach((note) => {
+      note.addEventListener("click", () => {
+        const editor = note.closest(".clip-editor");
+        editor.open = true;
+        const pitch = editor.querySelector(`[data-tool-id="${note.dataset.midiEvent}"][data-parameter="pitch"]`);
+        pitch?.focus({ preventScroll: true });
+        pitch?.closest(".clip-event")?.scrollIntoView({ block: "nearest" });
       });
     });
     elements.channelList.querySelectorAll("[data-sound-tool]").forEach((control) => {
@@ -606,6 +628,46 @@
         void changeSoundTool(button, button.dataset.soundValue);
       });
     });
+  }
+
+  function selectedGraphNode(track) {
+    const available = [
+      `instrument:${track.instrument.id}`,
+      ...track.effects.map((effect) => `effect:${effect.id}`),
+      ...track.modulators.map((modulator) => `modulator:${modulator.id}`),
+    ];
+    const selected = state.graphNodeSelection[track.id];
+    if (available.includes(selected)) return selected;
+    state.graphNodeSelection[track.id] = available[0];
+    return available[0];
+  }
+
+  function renderSoundGraph(track, orderedEffects, selectedNode) {
+    const routeNodes = [
+      { label: "MIDI Clips", type: "clip" },
+      { label: track.instrument.engine, type: "instrument", key: `instrument:${track.instrument.id}` },
+      ...orderedEffects.map((effect) => ({ label: effect.name, type: "effect", key: `effect:${effect.id}` })),
+      { label: "Master", type: "output" },
+    ];
+    const route = routeNodes
+      .map((node, index) => {
+        const signal = index === 0 ? "MIDI" : "AUDIO";
+        const edge = index < routeNodes.length - 1
+          ? `<i aria-hidden="true"><b>${signal}</b>&rarr;</i>`
+          : "";
+        const content = node.key
+          ? `<button type="button" class="graph-node graph-node-${node.type} ${selectedNode === node.key ? "is-selected" : ""}" data-graph-node="${node.key}" data-track-id="${track.id}" aria-pressed="${selectedNode === node.key}"><span>${escapeHtml(node.label)}</span><small>${escapeHtml(node.type)}</small></button>`
+          : `<span class="graph-terminal graph-node-${node.type}">${escapeHtml(node.label)}</span>`;
+        return `${content}${edge}`;
+      })
+      .join("");
+    const modulators = track.modulators
+      .map((modulator) => `<button type="button" class="graph-node graph-node-modulator ${selectedNode === `modulator:${modulator.id}` ? "is-selected" : ""}" data-graph-node="modulator:${modulator.id}" data-track-id="${track.id}" aria-pressed="${selectedNode === `modulator:${modulator.id}`}"><span>${escapeHtml(modulator.name)}</span><small>CONTROL &rarr; ${escapeHtml(modulator.target)}</small></button>`)
+      .join("");
+    return `<div class="sound-graph" role="group" aria-label="${escapeHtml(`${track.name} sound graph`)}">
+      <div class="routing-chain" aria-label="${escapeHtml(`${track.name} typed sound routing`)}">${route}</div>
+      <div class="graph-control-nodes">${modulators}</div>
+    </div>`;
   }
 
   function captureAdvancedUiState() {
@@ -744,7 +806,42 @@
         </div>`;
       })
       .join("");
-    return `<details class="clip-editor" data-clip-key="${track.id}-${clip.id}" open><summary><span>${escapeHtml(clip.label)}</span><b>${clip.events.length} events &middot; ${clip.loopBeats} beat loop</b></summary><div class="clip-event-list">${rows}</div></details>`;
+    return `<details class="clip-editor" data-clip-key="${track.id}-${clip.id}" open><summary><span>${escapeHtml(clip.label)}</span><b>${clip.events.length} events &middot; ${clip.loopBeats} beat loop</b></summary>${renderPianoRoll(track, clip)}<div class="clip-event-list">${rows}</div></details>`;
+  }
+
+  function renderPianoRoll(track, clip) {
+    if (clip.events.length === 0) return '<div class="empty-piano-roll">No notes in this clip</div>';
+    const pitches = clip.events.map((event) => event.pitch);
+    const minimum = Math.max(0, Math.floor(Math.min(...pitches) / 12) * 12);
+    const maximum = Math.min(127, Math.max(minimum + 11, Math.ceil((Math.max(...pitches) + 1) / 12) * 12 - 1));
+    const pitchCount = maximum - minimum + 1;
+    const rowHeight = 100 / pitchCount;
+    const beatWidth = 100 / clip.loopBeats;
+    const keys = Array.from({ length: pitchCount }, (_, index) => maximum - index)
+      .map((pitch) => {
+        const pitchClass = pitch % 12;
+        const isBlack = [1, 3, 6, 8, 10].includes(pitchClass);
+        const label = pitchClass === 0 ? midiNoteName(pitch) : "";
+        return `<span class="piano-key ${isBlack ? "is-black" : ""}">${label}</span>`;
+      })
+      .join("");
+    const notes = clip.events
+      .map((event) => {
+        const left = (event.time / clip.loopBeats) * 100;
+        const width = Math.max(0.8, (event.duration / clip.loopBeats) * 100);
+        const top = (maximum - event.pitch) * rowHeight;
+        return `<button type="button" class="midi-note" data-midi-event="${event.id}" style="--note-left:${left}%;--note-width:${width}%;--note-top:${top}%;--note-height:${rowHeight}%;--note-velocity:${event.velocity}" aria-label="${escapeHtml(`${midiNoteName(event.pitch)} at beat ${event.time}, length ${event.duration}, velocity ${event.velocity}`)}"><span>${escapeHtml(midiNoteName(event.pitch))}</span></button>`;
+      })
+      .join("");
+    return `<div class="piano-roll" role="group" aria-label="${escapeHtml(`${track.name} ${clip.label} piano roll`)}">
+      <div class="piano-keyboard" aria-hidden="true">${keys}</div>
+      <div class="piano-grid" style="--pitch-row-height:${rowHeight}%;--beat-width:${beatWidth}%">${notes}</div>
+    </div>`;
+  }
+
+  function midiNoteName(pitch) {
+    const names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    return `${names[pitch % 12]}${Math.floor(pitch / 12) - 1}`;
   }
 
   function selectOptions(values, selected) {
@@ -878,11 +975,11 @@
             action,
             values,
           );
-          if (!confirmedOperation) throw new Error("The channel response did not identify this mutation.");
+          if (!confirmedOperation) throw new Error("The track response did not identify this mutation.");
           state.project = project;
           renderProject();
         });
-        showToast(action === "add" ? "Channel added" : "Channel deleted");
+        showToast(action === "add" ? "Track added" : "Track deleted");
       } catch (error) {
         if (isRetryableApiError(error)) {
           try {
@@ -897,21 +994,21 @@
               values,
             );
             if (confirmedOperation) {
-              showToast(action === "add" ? "Channel added" : "Channel deleted");
+              showToast(action === "add" ? "Track added" : "Track deleted");
             } else {
-              showError(error, action === "add" ? "adding a channel" : "deleting a channel");
+              showError(error, action === "add" ? "adding a track" : "deleting a track");
             }
           } catch (refreshError) {
             reconciled = false;
             showError(
               new Error(
-                `The channel result could not be confirmed. Reload before trying again. ${errorMessage(refreshError)}`,
+                `The track result could not be confirmed. Reload before trying again. ${errorMessage(refreshError)}`,
               ),
-              action === "add" ? "adding a channel" : "deleting a channel",
+              action === "add" ? "adding a track" : "deleting a track",
             );
           }
         } else {
-          showError(error, action === "add" ? "adding a channel" : "deleting a channel");
+          showError(error, action === "add" ? "adding a track" : "deleting a track");
         }
       } finally {
         if (reconciled) {
@@ -923,6 +1020,13 @@
   }
 
   function changeSoundTool(control, value) {
+    if (control.dataset.soundTool === "instrument") {
+      state.graphNodeSelection[control.dataset.trackId] = `instrument:${control.dataset.toolId}`;
+    } else if (control.dataset.soundTool === "effect" || control.dataset.soundTool === "routing") {
+      state.graphNodeSelection[control.dataset.trackId] = `effect:${control.dataset.toolId}`;
+    } else if (control.dataset.soundTool === "modulator") {
+      state.graphNodeSelection[control.dataset.trackId] = `modulator:${control.dataset.toolId}`;
+    }
     const request = {
       track_id: control.dataset.trackId,
       tool: control.dataset.soundTool,
