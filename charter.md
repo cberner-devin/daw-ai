@@ -94,6 +94,9 @@ The implementation MUST NOT use Web Audio. It must be a custom backend that runs
 
 ### Implementation
 
+The project is currently in alpha status. When implementing changes there is no need to maintain backward compatibility.
+DO NOT include extra code to support legacy project files
+
 The interface should be a local webserver with no authentication required. It should run on port 8888 by default.
 
 The backend is written in Rust. The client code should be responsive and the UI should work on mobile or a desktop
