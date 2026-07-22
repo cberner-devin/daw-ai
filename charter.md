@@ -41,7 +41,8 @@ Contains notes, including their timing, duration, pitch, and velocity.
 Produces sound from MIDI events.
 
 For the current MVP, this should be a basic implementation, which relying on [Surge XT](https://surge-synthesizer.github.io/) as the only synthesizer
-and exposes basic presets and parameters. Use the official surge-rs Rust bindings. They are alpha quality, so if there are critical bugs, it is ok to vendor it and patch the bugs.
+and exposes basic presets and parameters. Use the official [surge-rs](https://github.com/surge-synthesizer/surge-rs) Rust bindings.
+They are alpha quality, so if there are critical bugs, it is ok to vendor it and patch the bugs.
 
 #### Effect
 Processes sound produced by an instrument, such as a filter, distortion, compressor, delay, or reverb, and exposes configurable parameters. May be chained with previous Effect.
