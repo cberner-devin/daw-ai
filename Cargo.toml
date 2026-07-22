@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A local, prompt-driven music studio"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [workspace]
 exclude = ["vendor/surge-bridge", "vendor/surge-sys"]
