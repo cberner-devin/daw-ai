@@ -8,10 +8,23 @@ It should be simple to use and the interface should rely heavily on AI powered i
 
 ### UI
 
+There is an Export button that renders the whole track to a .wav file and initiates a download of it.
+
+#### Multi-user support
+
+There is no authentication. Users are identified with a cookie. Each user gets their own project. And
+multiple users working on their own projects concurrently is supported.
+
 #### AI Mode
 "AI Mode" is the primary UI and it is a timeline view of the track. The user can then select a portion of the track
 with their mouse and enter a prompt for the AI describing the change to be made. This might be something
 as simple as "increase volume" or as complex as "insert a sick drop here". The AI then makes those changes.
+
+After submitting a change request, the submit button becomes an interrupt button.
+
+There is a session history list of all the actions the agent took. Clicking on one moves the project back to that
+state, so that the user can play and inspect it. The session history does not rollback, allowing the user to navigate
+forward again.
 
 #### Advanced Mode
 There is also an advanced view which the user can open that shows the details of the instruments, effects,...etc
