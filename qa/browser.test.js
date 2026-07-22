@@ -176,10 +176,10 @@ async function evaluate(cdp, sessionId, expression) {
   return response.result.value;
 }
 
-async function mouse(cdp, sessionId, type, x, y, buttons = 0) {
+async function mouse(cdp, sessionId, type, x, y, buttons = 0, clickCount = 1) {
   await cdp.send(
     "Input.dispatchMouseEvent",
-    { type, x, y, button: "left", buttons, clickCount: 1 },
+    { type, x, y, button: "left", buttons, clickCount },
     sessionId,
   );
 }
@@ -770,11 +770,37 @@ async function run() {
       "false",
       "mobile selection mode must return gesture ownership to panning",
     );
+    const wholeTrackSelection = await evaluate(cdp, appSession, `(() => {
+      const duration = Number(document.querySelector('.track-lane').getAttribute('aria-valuemax'));
+      return \`0.0s - \${duration.toFixed(1)}s\`;
+    })()`);
+
+    await touch(cdp, appSession, "touchStart", [{ x: 240, y: mobileLane.y }]);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    await touch(cdp, appSession, "touchEnd", []);
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('#selection-readout').textContent"),
+      wholeTrackSelection,
+      "long-pressing a mobile timeline lane must select the whole track",
+    );
     await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: false }, appSession);
     await cdp.send(
       "Emulation.setDeviceMetricsOverride",
       { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false },
       appSession,
+    );
+    const doubleClickLane = await evaluate(cdp, appSession, `(() => {
+      const rect = document.querySelector('.track-lane').getBoundingClientRect();
+      return { x: rect.left + rect.width * 0.6, y: rect.top + rect.height / 2 };
+    })()`);
+    await mouse(cdp, appSession, "mousePressed", doubleClickLane.x, doubleClickLane.y, 1, 1);
+    await mouse(cdp, appSession, "mouseReleased", doubleClickLane.x, doubleClickLane.y, 0, 1);
+    await mouse(cdp, appSession, "mousePressed", doubleClickLane.x, doubleClickLane.y, 1, 2);
+    await mouse(cdp, appSession, "mouseReleased", doubleClickLane.x, doubleClickLane.y, 0, 2);
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('#selection-readout').textContent"),
+      wholeTrackSelection,
+      "double-clicking a desktop timeline lane must select the whole track",
     );
     await evaluate(cdp, appSession, "document.querySelector('#advanced-button').click()");
     await waitFor(
