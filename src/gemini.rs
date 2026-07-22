@@ -21,7 +21,7 @@ pub(crate) const EDIT_SCHEMA: &str = include_str!("../gemini/edit-plan.schema.js
 const STUDIO_CONTRACT: &str = include_str!("../gemini/STUDIO.md");
 pub(crate) const GEMINI_MODEL: &str = "gemini-3.6-flash";
 const DEFAULT_INTERACTIONS_ENDPOINT: &str =
-    "https://generativelanguage.googleapis.com/v1/interactions";
+    "https://generativelanguage.googleapis.com/v1beta/interactions";
 const SYSTEMD_CREDENTIAL_NAME: &str = "gemini-api-key";
 const JUDGE_TOOL_NAME: &str = "report_audio_verdict";
 pub(crate) const EDIT_TIMEOUT_SECONDS: u64 = 20 * 60;
@@ -191,17 +191,12 @@ fn run_session_with_transport(
 ) -> Result<GeminiEdit, PlannerError> {
     let (transport, judge_transport) = transports;
     let started = Instant::now();
-    let tools = {
-        let mut tools = tool_declarations();
-        tools.push(serde_json::json!({
-            "type": "google_search",
-            "search_types": ["web_search"]
-        }));
-        tools
-    };
-    let mut input = JsonValue::String(planner_task(prompt, start, end));
+    let tools = tool_declarations();
+    let research_tools = [serde_json::json!({"type": "google_search"})];
+    let mut input = JsonValue::String(research_task(prompt));
     let mut previous_interaction_id: Option<String> = None;
     let mut sequence = 0_usize;
+    let mut research_complete = false;
     let mut state = LoopState::default();
 
     loop {
@@ -212,7 +207,7 @@ fn run_session_with_transport(
         let mut request = serde_json::json!({
             "model": GEMINI_MODEL,
             "input": input,
-            "tools": tools,
+            "tools": if research_complete { &tools[..] } else { &research_tools[..] },
             "system_instruction": system_instruction(),
             "generation_config": {"thinking_level": "high"},
             "store": true
@@ -237,6 +232,11 @@ fn run_session_with_transport(
                 .to_owned(),
         );
         let calls = function_calls(&response)?;
+        if !research_complete {
+            research_complete = true;
+            input = JsonValue::String(planner_task(prompt, start, end));
+            continue;
+        }
         if calls.is_empty() {
             if state.plans.is_empty() {
                 input = JsonValue::String(format!(
@@ -841,6 +841,12 @@ fn planner_task(prompt: &str, start: f32, end: f32) -> String {
     )
 }
 
+fn research_task(prompt: &str) -> String {
+    format!(
+        "Use Google Search to research how producers create the requested musical effect or style and what listeners perceive as its signature. Focus on arrangement, tension and release, rhythm, orchestration, and sound design. Return concise findings for a subsequent DAW editing turn; do not attempt to edit the graph yet. User request: {prompt}"
+    )
+}
+
 fn system_instruction() -> String {
     format!(
         concat!(
@@ -1370,6 +1376,15 @@ fn invalid(message: &str) -> PlannerError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn uses_the_gemini_3_6_interactions_endpoint() {
+        assert_eq!(GEMINI_MODEL, "gemini-3.6-flash");
+        assert_eq!(
+            DEFAULT_INTERACTIONS_ENDPOINT,
+            "https://generativelanguage.googleapis.com/v1beta/interactions"
+        );
+    }
+
     fn call(name: &str, arguments: JsonValue) -> FunctionCall {
         FunctionCall {
             id: format!("call-{name}"),
@@ -1614,6 +1629,13 @@ mod tests {
         let revision = preset_edit("Surge Bass");
         let responses = [
             serde_json::json!({
+                "id": "research", "status": "completed", "steps": [
+                    {"type": "google_search_call", "queries": ["dubstep drop production techniques"]},
+                    {"type": "google_search_result"},
+                    {"type": "model_output", "content": [{"type": "text", "text": "Use half-time contrast, rapid subdivisions, and aggressive bass movement."}]}
+                ]
+            }),
+            serde_json::json!({
                 "id": "i1", "status": "requires_action", "steps": [
                     {"type": "function_call", "id": "read", "name": READ_TOOL_NAME, "arguments": {}},
                     {"type": "function_call", "id": "baseline", "name": AUDIO_TOOL_NAME, "arguments": audio_arguments}
@@ -1695,7 +1717,23 @@ mod tests {
             },
             (
                 &mut |sequence, request, _| {
-                    if sequence == 2 {
+                    let request_tools = request["tools"].as_array().unwrap();
+                    if sequence == 1 {
+                        assert_eq!(request_tools.len(), 1);
+                        assert_eq!(request_tools[0]["type"], "google_search");
+                        assert!(
+                            request["input"]
+                                .as_str()
+                                .unwrap()
+                                .contains("Use Google Search")
+                        );
+                        assert!(request.get("previous_interaction_id").is_none());
+                    } else {
+                        assert_eq!(request_tools.len(), 3);
+                        assert!(request_tools.iter().all(|tool| tool["type"] == "function"));
+                        assert!(request.get("previous_interaction_id").is_some());
+                    }
+                    if sequence == 3 {
                         let input = request["input"].as_array().unwrap();
                         assert!(
                             input
@@ -1715,7 +1753,7 @@ mod tests {
                                 part["type"] == "audio" && part["mime_type"] == "audio/wav"
                             });
                     }
-                    if sequence == 5 {
+                    if sequence == 6 {
                         let feedback = request["input"].as_str().unwrap();
                         saw_judge_feedback = feedback.contains("fresh interaction")
                             && feedback.contains("harmonically aggressive waveform");
@@ -1745,7 +1783,7 @@ mod tests {
         )
         .expect("scripted Gemini session");
 
-        assert_eq!(response_index, 7);
+        assert_eq!(response_index, 8);
         assert_eq!(judge_index, 2);
         assert!(saw_separate_audio_input);
         assert!(saw_judge_feedback);
