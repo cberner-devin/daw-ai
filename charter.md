@@ -94,7 +94,7 @@ The interface should be a local webserver with no authentication required. It sh
 The backend is written in Rust. The client code should be responsive and the UI should work on mobile or a desktop
 browser.
 
-The AI used is Gemini 3.5 Flash. The user must provide an API key in ~/gemini_creds.txt or a similar file.
+The AI used is Gemini 3.6 Flash. The user must provide an API key in ~/gemini_creds.txt or a similar file.
 It can also be specified as an environment variable.
 
 Since Gemini is best at writing code and config files, the internal synth and other tools that DAW-AI uses should
