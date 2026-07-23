@@ -625,7 +625,7 @@
               </div>
               <div class="sound-tool clips-tool">
                 <div class="tool-heading"><div><span>MIDI Clips</span><strong>Piano roll and event editor</strong></div></div>
-                ${track.clips.map((clip) => renderClipEvents(track, clip)).join("") || '<span class="effect-pill">No MIDI clips</span>'}
+                ${track.clips.map((clip) => renderClipTimeline(track, clip)).join("") || '<span class="effect-pill">No MIDI clips</span>'}
               </div>
             </div>
             <aside class="node-inspector-column" aria-label="${escapeHtml(`${track.name} selected node parameters`)}">
@@ -693,15 +693,6 @@
           ?.focus({ preventScroll: true });
       });
     });
-    elements.channelList.querySelectorAll("[data-midi-event]").forEach((note) => {
-      note.addEventListener("click", () => {
-        const editor = note.closest(".clip-editor");
-        editor.open = true;
-        const pitch = editor.querySelector(`[data-tool-id="${note.dataset.midiEvent}"][data-parameter="pitch"]`);
-        pitch?.focus({ preventScroll: true });
-        pitch?.closest(".clip-event")?.scrollIntoView({ block: "nearest" });
-      });
-    });
     elements.channelList.querySelectorAll("[data-sound-tool]").forEach((control) => {
       validateSoundToolControl(control);
       if (control.matches('input[type="range"]')) {
@@ -766,12 +757,7 @@
   function captureAdvancedUiState() {
     const clips = new Map();
     for (const editor of elements.channelList.querySelectorAll("[data-clip-key]")) {
-      const events = editor.querySelector(".clip-event-list");
-      clips.set(editor.dataset.clipKey, {
-        open: editor.open,
-        scrollTop: events?.scrollTop ?? 0,
-        scrollLeft: events?.scrollLeft ?? 0,
-      });
+      clips.set(editor.dataset.clipKey, { open: editor.open });
     }
     return { drawerScrollTop: elements.advancedDrawer.scrollTop, clips };
   }
@@ -782,10 +768,6 @@
       const clipState = uiState.clips.get(editor.dataset.clipKey);
       if (!clipState) continue;
       editor.open = clipState.open;
-      const events = editor.querySelector(".clip-event-list");
-      if (!events) continue;
-      events.scrollTop = clipState.scrollTop;
-      events.scrollLeft = clipState.scrollLeft;
     }
   }
 
@@ -885,21 +867,8 @@
     </div>`;
   }
 
-  function renderClipEvents(track, clip) {
-    const rows = clip.events
-      .map((event) => {
-        const key = `${track.id}-clip-${clip.id}-event-${event.id}`;
-        const accessibleName = `${track.name} ${clip.label} clip #${clip.id} ${event.type} event #${event.id}`;
-        return `<div class="clip-event" data-event-id="${event.id}">
-          <strong>${escapeHtml(event.type)}</strong>
-          <label>Beat<input type="number" min="0" max="${clip.loopBeats}" step="any" value="${event.time}" data-maximum-exclusive="${clip.loopBeats}" data-sound-tool="event" data-track-id="${track.id}" data-tool-id="${event.id}" data-clip-id="${clip.id}" data-parameter="time" data-control-key="${key}-time" aria-label="${escapeHtml(`${accessibleName} beat`)}"></label>
-          <label>Length<input type="number" min="0.0625" max="${clip.loopBeats}" step="any" value="${event.duration}" data-sound-tool="event" data-track-id="${track.id}" data-tool-id="${event.id}" data-clip-id="${clip.id}" data-parameter="duration" data-control-key="${key}-duration" aria-label="${escapeHtml(`${accessibleName} length`)}"></label>
-          <label>Pitch<input type="number" min="0" max="127" step="1" value="${event.pitch}" data-sound-tool="event" data-track-id="${track.id}" data-tool-id="${event.id}" data-clip-id="${clip.id}" data-parameter="pitch" data-control-key="${key}-pitch" aria-label="${escapeHtml(`${accessibleName} pitch`)}"></label>
-          <label>Velocity<input type="number" min="0.01" max="1" step="any" value="${event.velocity}" data-sound-tool="event" data-track-id="${track.id}" data-tool-id="${event.id}" data-clip-id="${clip.id}" data-parameter="velocity" data-control-key="${key}-velocity" aria-label="${escapeHtml(`${accessibleName} velocity`)}"></label>
-        </div>`;
-      })
-      .join("");
-    return `<details class="clip-editor" data-clip-key="${track.id}-${clip.id}" open><summary><span>${escapeHtml(clip.label)}</span><b>${clip.events.length} events &middot; ${clip.loopBeats} beat loop</b></summary>${renderPianoRoll(track, clip)}<div class="clip-event-list">${rows}</div></details>`;
+  function renderClipTimeline(track, clip) {
+    return `<details class="clip-editor" data-clip-key="${track.id}-${clip.id}" open><summary><span>${escapeHtml(clip.label)}</span><b>${clip.events.length} events &middot; ${clip.loopBeats} beat loop</b></summary>${renderPianoRoll(track, clip)}</details>`;
   }
 
   function renderPianoRoll(track, clip) {
@@ -923,7 +892,7 @@
         const left = (event.time / clip.loopBeats) * 100;
         const width = Math.max(0.8, (event.duration / clip.loopBeats) * 100);
         const top = (maximum - event.pitch) * rowHeight;
-        return `<button type="button" class="midi-note" data-midi-event="${event.id}" style="--note-left:${left}%;--note-width:${width}%;--note-top:${top}%;--note-height:${rowHeight}%;--note-velocity:${event.velocity}" aria-label="${escapeHtml(`${midiNoteName(event.pitch)} at beat ${event.time}, length ${event.duration}, velocity ${event.velocity}`)}"><span>${escapeHtml(midiNoteName(event.pitch))}</span></button>`;
+        return `<span class="midi-note" role="img" style="--note-left:${left}%;--note-width:${width}%;--note-top:${top}%;--note-height:${rowHeight}%;--note-velocity:${event.velocity}" aria-label="${escapeHtml(`${midiNoteName(event.pitch)} at beat ${event.time}, length ${event.duration}, velocity ${event.velocity}`)}"><span>${escapeHtml(midiNoteName(event.pitch))}</span></span>`;
       })
       .join("");
     return `<div class="piano-roll" role="group" aria-label="${escapeHtml(`${track.name} ${clip.label} piano roll`)}">
@@ -1151,24 +1120,6 @@
     const focusControl = exactControl && !exactControl.disabled ? exactControl : fallbackControl;
     if (!focusControl) return;
     focusControl.focus({ preventScroll: true });
-    revealEventControl(focusControl);
-  }
-
-  function revealEventControl(control) {
-    const eventList = control.closest(".clip-event-list");
-    if (!eventList) return;
-    const listRect = eventList.getBoundingClientRect();
-    const controlRect = control.getBoundingClientRect();
-    if (controlRect.top < listRect.top) {
-      eventList.scrollTop -= listRect.top - controlRect.top;
-    } else if (controlRect.bottom > listRect.bottom) {
-      eventList.scrollTop += controlRect.bottom - listRect.bottom;
-    }
-    if (controlRect.left < listRect.left) {
-      eventList.scrollLeft -= listRect.left - controlRect.left;
-    } else if (controlRect.right > listRect.right) {
-      eventList.scrollLeft += controlRect.right - listRect.right;
-    }
   }
 
   async function applySoundToolChange(request, focusKey) {
