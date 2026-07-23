@@ -15,9 +15,9 @@ use serde_json::Value as JsonValue;
 #[cfg(test)]
 use crate::gemini_tools::render_audio_request;
 use crate::gemini_tools::{
-    AUDIO_TOOL_NAME, AudioRender, AudioRenderRequest, EditSession, READ_TOOL_NAME,
-    apply_agent_mutation, base64_audio, is_mutation_tool, prepare_audio_render, read_sound_graph,
-    tool_declarations,
+    AUDIO_TOOL_NAME, AudioRender, AudioRenderRequest, EditSession, PRESET_TOOL_NAME,
+    READ_TOOL_NAME, apply_agent_mutation, base64_audio, is_mutation_tool, list_surge_presets,
+    prepare_audio_render, read_sound_graph, tool_declarations,
 };
 use crate::model::Project;
 #[cfg(test)]
@@ -340,6 +340,10 @@ fn execute_tool(
             Ok(graph) => graph,
             Err(error) => format!("Tool error: {error}"),
         })),
+        PRESET_TOOL_NAME => Ok(ToolOutput::text(
+            list_surge_presets(&call.arguments)
+                .unwrap_or_else(|error| format!("Tool error: {error}")),
+        )),
         name if is_mutation_tool(name) => {
             match apply_agent_mutation(session.path(), name, &call.arguments) {
                 Ok(message) => {
@@ -1209,7 +1213,7 @@ mod tests {
 
         let audio = call(
             AUDIO_TOOL_NAME,
-            serde_json::json!({"trackIds": [1, 2, 3], "start": 4, "end": 8}),
+            serde_json::json!({"tracks": [1, 2, 3], "start": 4, "end": 8}),
         );
         let baseline = execute_tool(
             &session,
@@ -1298,7 +1302,7 @@ mod tests {
             serde_json::json!({
                 "id": "listen", "status": "requires_action", "steps": [{
                     "type": "function_call", "id": "listen-bass", "name": AUDIO_TOOL_NAME,
-                    "arguments": {"trackIds": [2], "start": 0, "end": 4}
+                    "arguments": {"tracks": [2], "start": 0, "end": 4}
                 }]
             }),
             serde_json::json!({

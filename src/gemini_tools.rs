@@ -14,6 +14,7 @@ use crate::storage::ProjectStore;
 
 pub(crate) const READ_TOOL_NAME: &str = "read_sound_graph";
 pub(crate) const AUDIO_TOOL_NAME: &str = "render_audio_region";
+pub(crate) const PRESET_TOOL_NAME: &str = "list_surge_presets";
 const GRAPH_FILE: &str = "sound-graph.json";
 const REQUEST_FILE: &str = "request.json";
 const SESSION_FILE: &str = "session.json";
@@ -25,6 +26,7 @@ const UNDO_GRAPH_FILE: &str = "undo-sound-graph.json";
 pub(crate) const MUTATION_TOOL_NAMES: &[&str] = &[
     "new_track",
     "delete_track",
+    "set_surge_preset",
     "add_midi_clip",
     "update_midi_clip",
     "delete_midi_clip",
@@ -42,15 +44,20 @@ pub(crate) const MUTATION_TOOL_NAMES: &[&str] = &[
 const AUDIO_REGION_SCHEMA: &str = r#"{
   "type": "object",
   "additionalProperties": false,
-  "required": ["trackIds", "start", "end"],
+  "required": ["start", "end"],
   "properties": {
-    "trackIds": {
-      "type": "array",
-      "description": "One or more stable channel IDs from sound-graph.json. Choose the full mix when judging an arrangement-level result and isolated channels when diagnosing a part.",
-      "items": { "type": "integer", "minimum": 1 },
-      "minItems": 1,
-      "maxItems": 32,
-      "uniqueItems": true
+    "tracks": {
+      "description": "Tracks to render. Omit or use \"all\" for the full mix, or provide stable track IDs from sound-graph.json to isolate selected tracks.",
+      "oneOf": [
+        { "type": "string", "enum": ["all"] },
+        {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 },
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true
+        }
+      ]
     },
     "start": {
       "type": "number",
@@ -286,9 +293,21 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         serde_json::json!({
             "type": "function",
             "name": AUDIO_TOOL_NAME,
-            "description": "Optionally render model-chosen channels and absolute project start/end times from the latest sound graph as WAV audio. Use it whenever hearing the original or an edited result would improve your decision; you decide whether and when to listen. The listening range is independent of the selected edit scope.",
+            "description": "Optionally render all tracks (the default) or a list of model-chosen track IDs and absolute project start/end times from the latest sound graph as WAV audio. Use it whenever hearing the original or an edited result would improve your decision; you decide whether and when to listen. The listening range is independent of the selected edit scope.",
             "parameters": audio_schema
         }),
+        function(
+            PRESET_TOOL_NAME,
+            "Search the installed Surge XT factory preset catalog. Returns stable preset IDs, names, categories, and all available categories. Use a returned ID with set_surge_preset.",
+            object_schema(
+                serde_json::json!({
+                    "query":{"type":"string","maxLength":80,"description":"Optional case-insensitive text matched against preset ID, category, and name."},
+                    "category":{"type":"string","maxLength":80,"description":"Optional exact category returned by this tool."},
+                    "limit":{"type":"integer","minimum":1,"maximum":100,"description":"Maximum matching presets to return; defaults to 40."}
+                }),
+                &[],
+            ),
+        ),
     ];
     tools.extend(mutation_tool_declarations());
     tools
@@ -336,13 +355,24 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
     vec![
         function(
             "new_track",
-            "Create one track and its required instrument. Returns stable IDs for subsequent calls.",
+            "Create one empty track with its required instrument and no MIDI clips. Returns stable IDs for subsequent calls.",
             object_schema(serde_json::json!({"role":role()}), &["role"]),
         ),
         function(
             "delete_track",
             "Delete one track by stable ID. Use undo if this was a mistake.",
             object_schema(serde_json::json!({"trackId":id()}), &["trackId"]),
+        ),
+        function(
+            "set_surge_preset",
+            "Load one installed Surge XT factory preset onto a track using a stable preset ID returned by list_surge_presets.",
+            object_schema(
+                serde_json::json!({
+                    "trackId":id(),
+                    "presetId":{"type":"string","minLength":1,"maxLength":200}
+                }),
+                &["trackId", "presetId"],
+            ),
         ),
         function(
             "add_midi_clip",
@@ -486,6 +516,81 @@ pub(crate) fn read_sound_graph(session_path: &Path) -> Result<String, String> {
         .map_err(|error| format!("could not read current sound graph: {error}"))
 }
 
+pub(crate) fn list_surge_presets(arguments: &JsonValue) -> Result<String, String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "preset catalog arguments must be an object".to_owned())?;
+    let query = object
+        .get("query")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_lowercase)
+                .ok_or_else(|| "query must be a string".to_owned())
+        })
+        .transpose()?;
+    let category = object
+        .get("category")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "category must be a string".to_owned())
+        })
+        .transpose()?;
+    let limit = object
+        .get("limit")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|value| (1..=100).contains(value))
+                .map(|value| value as usize)
+                .ok_or_else(|| "limit must be an integer from 1 through 100".to_owned())
+        })
+        .transpose()?
+        .unwrap_or(40);
+    let catalog = crate::surge_presets::catalog();
+    let mut categories = catalog
+        .iter()
+        .map(|preset| preset.category.clone())
+        .collect::<Vec<_>>();
+    categories.sort();
+    categories.dedup();
+    let matches = catalog
+        .iter()
+        .filter(|preset| {
+            category
+                .as_ref()
+                .is_none_or(|category| preset.category == *category)
+                && query.as_ref().is_none_or(|query| {
+                    preset.id.to_lowercase().contains(query)
+                        || preset.category.to_lowercase().contains(query)
+                        || preset.name.to_lowercase().contains(query)
+                })
+        })
+        .collect::<Vec<_>>();
+    let presets = matches
+        .iter()
+        .take(limit)
+        .map(|preset| {
+            serde_json::json!({
+                "id":preset.id,
+                "category":preset.category,
+                "name":preset.name
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "installed":!catalog.is_empty(),
+        "total":catalog.len(),
+        "matched":matches.len(),
+        "returned":presets.len(),
+        "categories":categories,
+        "presets":presets
+    })
+    .to_string())
+}
+
 pub(crate) fn is_mutation_tool(name: &str) -> bool {
     MUTATION_TOOL_NAMES.contains(&name)
 }
@@ -508,7 +613,9 @@ pub(crate) fn apply_agent_mutation(
     let summary = match name {
         "new_track" => {
             let role = required_role(object, "role")?;
-            let id = studio.add_channel(role).map_err(studio_error_message)?;
+            let id = studio
+                .add_empty_channel(role)
+                .map_err(studio_error_message)?;
             result_id = Some(id);
             format!("Created {} track {id}", role.as_str())
         }
@@ -516,6 +623,33 @@ pub(crate) fn apply_agent_mutation(
             let id = required_id(object, "trackId")?;
             studio.delete_channel(id).map_err(studio_error_message)?;
             format!("Deleted track {id}")
+        }
+        "set_surge_preset" => {
+            let track_id = required_id(object, "trackId")?;
+            let preset_id = required_string(object, "presetId")?;
+            if crate::surge_presets::find(preset_id).is_none() {
+                return Err(format!(
+                    "Surge XT factory preset is not installed: {preset_id}; use {PRESET_TOOL_NAME} to discover available preset IDs"
+                ));
+            }
+            let instrument_id = studio
+                .project()
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .map(|track| track.instrument.id)
+                .ok_or_else(|| format!("track {track_id} does not exist"))?;
+            studio
+                .configure_sound_tool(
+                    track_id,
+                    "instrument",
+                    instrument_id,
+                    None,
+                    "preset",
+                    preset_id,
+                )
+                .map_err(studio_error_message)?;
+            format!("Loaded Surge XT preset {preset_id} on track {track_id}")
         }
         "add_midi_clip" => {
             let (track_id, spec) = clip_arguments(object)?;
@@ -901,35 +1035,43 @@ fn audio_region_arguments(
     let arguments = arguments
         .as_object()
         .ok_or_else(|| "audio analysis arguments must be an object".to_owned())?;
-    let values = arguments
-        .get("trackIds")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| "trackIds must be an array".to_owned())?;
-    if values.is_empty() || values.len() > 32 {
-        return Err("trackIds must contain between 1 and 32 channel IDs".to_owned());
-    }
-    let mut track_ids = Vec::with_capacity(values.len());
-    for value in values {
-        let track_id = value
-            .as_u64()
-            .filter(|track_id| *track_id > 0)
-            .ok_or_else(|| "trackIds must contain positive integers".to_owned())?;
-        if track_ids.contains(&track_id) {
-            return Err(format!("channel {track_id} was requested more than once"));
+    let track_ids = match arguments.get("tracks") {
+        None => project.tracks.iter().map(|track| track.id).collect(),
+        Some(JsonValue::String(value)) if value == "all" => {
+            project.tracks.iter().map(|track| track.id).collect()
         }
-        if !project.tracks.iter().any(|track| track.id == track_id) {
-            let available = project
-                .tracks
-                .iter()
-                .map(|track| format!("{} ({}, {})", track.id, track.name, track.role.as_str()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "channel {track_id} does not exist; available channel IDs: {available}"
-            ));
+        Some(JsonValue::Array(values)) => {
+            if values.is_empty() || values.len() > 32 {
+                return Err("tracks must contain between 1 and 32 track IDs".to_owned());
+            }
+            let mut track_ids = Vec::with_capacity(values.len());
+            for value in values {
+                let track_id = value
+                    .as_u64()
+                    .filter(|track_id| *track_id > 0)
+                    .ok_or_else(|| "tracks must contain positive integers".to_owned())?;
+                if track_ids.contains(&track_id) {
+                    return Err(format!("track {track_id} was requested more than once"));
+                }
+                if !project.tracks.iter().any(|track| track.id == track_id) {
+                    let available = project
+                        .tracks
+                        .iter()
+                        .map(|track| {
+                            format!("{} ({}, {})", track.id, track.name, track.role.as_str())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(format!(
+                        "track {track_id} does not exist; available track IDs: {available}"
+                    ));
+                }
+                track_ids.push(track_id);
+            }
+            track_ids
         }
-        track_ids.push(track_id);
-    }
+        Some(_) => return Err("tracks must be \"all\" or an array of track IDs".to_owned()),
+    };
     let number = |name: &str| {
         arguments
             .get(name)
@@ -1257,8 +1399,11 @@ mod tests {
             .iter()
             .filter_map(|tool| tool.get("name").and_then(JsonValue::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(names[0..2], [READ_TOOL_NAME, AUDIO_TOOL_NAME]);
-        assert_eq!(&names[2..], MUTATION_TOOL_NAMES);
+        assert_eq!(
+            names[0..3],
+            [READ_TOOL_NAME, AUDIO_TOOL_NAME, PRESET_TOOL_NAME]
+        );
+        assert_eq!(&names[3..], MUTATION_TOOL_NAMES);
         assert!(
             declarations[1]["description"]
                 .as_str()
@@ -1273,7 +1418,7 @@ mod tests {
             EditSession::create(&Project::demo(), "test the drop", 0.0, 2.0).expect("edit session");
         let rendered = render_audio(
             session.path(),
-            &serde_json::json!({"trackIds": [1, 2], "start": 0, "end": 1}),
+            &serde_json::json!({"tracks": [1, 2], "start": 0, "end": 1}),
         )
         .expect("audio render");
         assert_eq!(&rendered.wav[..4], b"RIFF");
@@ -1311,12 +1456,49 @@ mod tests {
         let track_id = response["id"].as_u64().expect("created track ID");
         let (plan, project) = session.take_update().unwrap().expect("published update");
         assert_eq!(plan.action, Action::GraphMutation);
-        assert!(project.tracks.iter().any(|track| track.id == track_id));
+        let track = project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .expect("created track");
+        assert!(track.clips.is_empty());
 
         apply_agent_mutation(session.path(), "undo", &serde_json::json!({})).expect("undo");
         let (_, project) = session.take_update().unwrap().expect("published undo");
         assert_eq!(project.tracks.len(), original.tracks.len());
         assert!(!project.tracks.iter().any(|track| track.id == track_id));
+    }
+
+    #[test]
+    fn factory_presets_can_be_searched_and_loaded_by_stable_id() {
+        let catalog: JsonValue = serde_json::from_str(
+            &list_surge_presets(&serde_json::json!({
+                "query":"Flux Capacitor",
+                "category":"Pads"
+            }))
+            .expect("preset catalog"),
+        )
+        .expect("catalog JSON");
+        assert!(catalog["total"].as_u64().unwrap() > 100);
+        assert_eq!(catalog["matched"], 1);
+        assert_eq!(catalog["presets"][0]["id"], "Factory/Pads/Flux Capacitor");
+
+        let session =
+            EditSession::create(&Project::demo(), "change the patch", 0.0, 2.0).expect("session");
+        apply_agent_mutation(
+            session.path(),
+            "set_surge_preset",
+            &serde_json::json!({
+                "trackId":3,
+                "presetId":"Factory/Pads/Flux Capacitor"
+            }),
+        )
+        .expect("factory preset mutation");
+        let (_, project) = session.take_update().unwrap().expect("published update");
+        assert_eq!(
+            project.tracks[2].instrument.preset,
+            "Factory/Pads/Flux Capacitor"
+        );
     }
 
     #[test]
@@ -1481,11 +1663,33 @@ mod tests {
             EditSession::create(&Project::demo(), "listen", 0.0, 2.0).expect("edit session");
         let error = render_audio(
             session.path(),
-            &serde_json::json!({"trackIds": [999], "start": 0, "end": 1}),
+            &serde_json::json!({"tracks": [999], "start": 0, "end": 1}),
         )
         .expect_err("unknown channel");
-        assert!(error.contains("available channel IDs"));
+        assert!(error.contains("available track IDs"));
         assert!(error.contains("1 (Pulse Kit, drums)"));
+    }
+
+    #[test]
+    fn audio_render_defaults_to_all_tracks_and_accepts_explicit_all() {
+        let session =
+            EditSession::create(&Project::demo(), "listen", 0.0, 2.0).expect("edit session");
+        let omitted =
+            prepare_audio_render(session.path(), &serde_json::json!({"start": 0, "end": 1}))
+                .expect("default all-track render");
+        let explicit = prepare_audio_render(
+            session.path(),
+            &serde_json::json!({"tracks": "all", "start": 0, "end": 1}),
+        )
+        .expect("explicit all-track render");
+        let expected = Project::demo()
+            .tracks
+            .iter()
+            .map(|track| track.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(omitted.track_ids, expected);
+        assert_eq!(explicit.track_ids, expected);
     }
 
     #[test]
@@ -1494,7 +1698,7 @@ mod tests {
             .expect("edit session");
         let request = prepare_audio_render(
             session.path(),
-            &serde_json::json!({"trackIds": [1, 2, 3], "start": 2, "end": 7}),
+            &serde_json::json!({"tracks": [1, 2, 3], "start": 2, "end": 7}),
         )
         .expect("context render outside selection");
 

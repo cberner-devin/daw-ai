@@ -113,10 +113,16 @@ impl Engine {
     }
 
     fn apply_preset(&mut self, preset: &str) -> Result<(), String> {
-        let preset = preset_parameters(preset)
-            .ok_or_else(|| format!("unsupported Surge XT preset: {preset}"))?;
-        for &(parameter, value) in STARTER_PATCH_BASE.iter().chain(preset) {
-            self.set_parameter(parameter, value)?;
+        if let Some(factory) = crate::surge_presets::find(preset) {
+            let mut data = std::fs::read(&factory.path)
+                .map_err(|error| format!("could not read Surge XT preset {preset}: {error}"))?;
+            self.synth.load_raw(&mut data, Some(true));
+        } else {
+            let preset = preset_parameters(preset)
+                .ok_or_else(|| format!("unsupported Surge XT preset: {preset}"))?;
+            for &(parameter, value) in STARTER_PATCH_BASE.iter().chain(preset) {
+                self.set_parameter(parameter, value)?;
+            }
         }
         // Oscillator types can change the names of their mode parameters.
         self.synth.process();
@@ -199,5 +205,19 @@ mod tests {
             let mut engine = Engine::new(&instrument, 16_000.0).expect("Surge XT engine");
             engine.process();
         }
+    }
+
+    #[test]
+    fn factory_patch_loads_into_the_headless_engine() {
+        let mut instrument = crate::model::Project::demo().tracks[2].instrument.clone();
+        instrument.preset = "Factory/Pads/Flux Capacitor".to_owned();
+        let mut engine = Engine::new(&instrument, 16_000.0).expect("factory Surge XT patch");
+        engine.play_note(60, 0.8, 1);
+        let energy = (0..32)
+            .map(|_| engine.process())
+            .flat_map(|block| block[0])
+            .map(f32::abs)
+            .sum::<f32>();
+        assert!(energy > 0.001, "factory patch rendered silence");
     }
 }

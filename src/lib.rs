@@ -8,6 +8,7 @@ pub mod prompt;
 pub mod server;
 mod storage;
 mod surge;
+mod surge_presets;
 
 pub const DEFAULT_PORT: u16 = 8888;
 

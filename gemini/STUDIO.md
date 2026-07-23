@@ -7,7 +7,7 @@ DAW-AI is a backend-rendered studio powered by Surge XT. Read the graph with `re
 `read_sound_graph` always returns the latest graph for this edit session. Re-read it after a batch when follow-up configuration needs newly created stable IDs. Each track is represented as explicit sound tools:
 
 - `clips` are MIDI clips with beat-relative note events. Every event has `time`, `duration`, MIDI `pitch`, and normalized `velocity`; drum-track pitches use General MIDI conventions. The synthesized groups cover kicks 35–36, snares and claps 37–40, toms 41/43/45/47/48/50, hats 42/44/46, cymbals 49/51/52/53/55/57/59, and auxiliary percussion 54/56/58/60–81. `loopBeats` controls repetition inside the clip's second-based `start`/`end` range. `sourceStart` is the read-only loop-phase anchor and can precede `start` when an edit retains the right side of a clip.
-- `instrument` is the full Surge XT synthesizer through its official Rust bindings. It exposes the `Init`, `Surge Percussion`, `Surge Bass`, `Surge Pad`, `Surge Lead`, and `Surge Atmosphere` starter patches. Its normalized `attack`, `release`, `cutoff`, `resonance`, and `pitch` controls map directly to Surge XT parameters. Surge XT owns oscillators, voices, envelopes, filters, MIDI note handling, and audio generation.
+- `instrument` is the full Surge XT synthesizer through its official Rust bindings. It exposes the `Init`, `Surge Percussion`, `Surge Bass`, `Surge Pad`, `Surge Lead`, and `Surge Atmosphere` starter patches plus the installed Surge XT factory library. Use `list_surge_presets` to search factory patches by category or text, then `set_surge_preset` with the returned stable ID. Its normalized `attack`, `release`, `cutoff`, `resonance`, and `pitch` controls map directly to Surge XT parameters. Surge XT owns oscillators, voices, envelopes, filters, internal patch effects, MIDI note handling, and audio generation.
 - `effects` contain an enabled state and numeric parameters. Every effect has `mix`; filters also expose cutoff in Hz and resonance. The `routing.audio` list gives their serial order between the instrument and `master`.
 - `modulators` contain a shape, rate, `rateMode` (`hz` or tempo-synced `tempo` cycles per beat), `trigger` (`free` or MIDI-note-triggered `midi`), depth, enabled state, and parameter target. `modulationTargets` is the authoritative list of routable numeric parameter IDs and their ranges; `routing.control` mirrors the active control connections.
 - `automationTargets` lists every numeric parameter that can follow a time envelope, including instrument, effect, track-volume, and modulator rate/depth targets. Values are expressed in the target's published units and range.
@@ -19,7 +19,7 @@ The current tracks, clips, instruments, effects, modulators, routing, levels, an
 
 ## Listening tools
 
-Use `render_audio_region` whenever hearing the project would improve your decision. You choose whether and when to listen. It accepts stable `trackIds` and absolute project `start` and `end` times spanning at most 16 seconds. The range is independent of the selected edit region. Use the full mix for arrangement judgments and isolated channels for diagnosis. The tool is read-only and always renders the latest graph.
+Use `render_audio_region` whenever hearing the project would improve your decision. You choose whether and when to listen. It accepts optional `tracks` as either `"all"` or a list of stable track IDs, plus absolute project `start` and `end` times spanning at most 16 seconds. Omitted `tracks` defaults to all tracks. The range is independent of the selected edit region. Use the full mix for arrangement judgments and isolated tracks for diagnosis. The tool is read-only and always renders the latest graph.
 
 ## Track roles
 
@@ -54,10 +54,11 @@ Use your judgment about whether audio evaluation is needed before completion. Li
 
 Every mutation is one atomic function call with a narrow typed schema. Use stable IDs from `read_sound_graph`; never target a role when changing or deleting an existing object. Successful create calls return the new stable ID. A validation error leaves the graph unchanged.
 
-- Tracks: `new_track`, `delete_track`.
+- Tracks: `new_track`, `delete_track`. A new track has its required instrument and routing but starts with no MIDI clips.
 - MIDI clips: `add_midi_clip`, `update_midi_clip`, `delete_midi_clip`. Add does not replace neighboring clips. Update replaces the named clip's fields and note events. Clip start/end are absolute project seconds; event times and durations are beats relative to the clip loop.
 - Effects: `add_effect`, `update_effect`, `delete_effect`. Effects are addressed by stable ID after creation, and delete removes the graph object and its routing entry.
 - Modulators: `add_modulator`, `update_modulator`, `delete_modulator`.
+- `set_surge_preset` loads an installed factory patch discovered through `list_surge_presets`. Prefer a factory patch when timbral character matters; use a starter patch when a simple predictable role sound is sufficient.
 - `set_parameter` changes one instrument, effect, modulator, MIDI event, or routing parameter by stable IDs. Values are strings because parameters may be numeric, Boolean, or enumerated; use the exact ranges and names published in the graph.
 - `set_track_mute` is the only mute operation. It writes the track's authoritative Boolean mute state and can explicitly mute or unmute.
 - `set_tempo` sets 60 through 180 BPM.
@@ -73,4 +74,4 @@ For "insert a dubstep drop," do not merely add a lead or rely on changing BPM. C
 
 For "make the chords warm and spacious," add or enable Reverb and lower the instrument tone or low-pass cutoff with `set_parameter`. For "increase volume," set or automate the track's published volume parameter. Prefer updating existing clips and tools when the request is a refinement so repeated prompts improve the graph instead of creating duplicate tracks.
 
-Use the Surge XT starter patch closest to the musical role, then shape it with the published native controls. Keep normalized values conservative to preserve headroom. Use `rateMode: "tempo"` for movement that should follow the beat, and `trigger: "midi"` for an envelope or LFO that should restart on each note.
+Search the Surge XT factory library when the request calls for a distinctive, acoustic, unusual, genre-specific, or heavily designed timbre. Choose by musical role and character rather than preset name alone, render the isolated track, and try another patch if it does not fit. Use the closest starter patch when predictability matters more than character, then shape it with the published native controls. Keep normalized values conservative to preserve headroom. Use `rateMode: "tempo"` for movement that should follow the beat, and `trigger: "midi"` for an envelope or LFO that should restart on each note.

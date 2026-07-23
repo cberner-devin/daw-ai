@@ -1335,6 +1335,26 @@ impl Studio {
         Ok(track_id)
     }
 
+    pub(crate) fn add_empty_channel(&mut self, role: TrackRole) -> Result<u64, StudioError> {
+        if self.project.tracks.len() >= TRACK_LIMIT {
+            return Err(StudioError::InvalidChannel);
+        }
+        self.remember();
+        let track_id = self.take_id();
+        let mut track = generated_track(track_id, role);
+        track.instrument.id = self.take_id();
+        for effect in &mut track.effects {
+            effect.id = self.take_id();
+        }
+        track.routing.effect_order = track.effects.iter().map(|effect| effect.id).collect();
+        for modulator in &mut track.modulators {
+            modulator.id = self.take_id();
+        }
+        self.project.tracks.push(track);
+        self.project.version += 1;
+        Ok(track_id)
+    }
+
     pub fn delete_channel(&mut self, track_id: u64) -> Result<(), StudioError> {
         let Some(index) = self
             .project
@@ -2123,7 +2143,7 @@ fn configure_instrument(
 }
 
 pub(crate) fn valid_surge_preset(value: &str) -> bool {
-    SURGE_PRESETS.contains(&value)
+    SURGE_PRESETS.contains(&value) || crate::surge_presets::is_factory_id(value)
 }
 
 fn parse_range(value: &str, minimum: f32, maximum: f32) -> Result<f32, StudioError> {
