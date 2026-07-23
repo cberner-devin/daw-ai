@@ -1974,7 +1974,7 @@ impl Router {
         let builtin = match backend.as_str() {
             "Surge XT" => false,
             "built-in" => true,
-            _ => return Response::json(422, error_json("unknown instrument backend")),
+            _ => return Response::json(422, error_json("unknown sound engine")),
         };
         self.builtin_backend.store(builtin, Ordering::SeqCst);
         self.backend_response()

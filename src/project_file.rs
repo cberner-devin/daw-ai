@@ -245,9 +245,6 @@ fn parse_effect(value: &JsonValue, ids: &mut HashSet<u64>) -> Result<Effect, Pro
     let effect = object(value, "effect")?;
     let id = unique_id(effect, "id", ids, "effect")?;
     expect_type(effect, "effect")?;
-    if string(effect, "engine")? != SURGE_ENGINE {
-        return Err(invalid("effect engine must be Surge XT"));
-    }
     let name = limited_string(effect, "name", 1, 64)?;
     if !is_effect_name(&name) {
         return Err(invalid(format!("unsupported effect: {name}")));
