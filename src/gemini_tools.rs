@@ -298,10 +298,10 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         }),
         function(
             PRESET_TOOL_NAME,
-            "Search the installed Surge XT factory preset catalog. Returns stable preset IDs, names, categories, and all available categories. Use a returned ID with set_surge_preset.",
+            "Search the installed Surge XT factory preset catalog by name, category, typo-tolerant text, or musical character. Results are ranked by relevance and include stable IDs for set_surge_preset.",
             object_schema(
                 serde_json::json!({
-                    "query":{"type":"string","maxLength":80,"description":"Optional case-insensitive text matched against preset ID, category, and name."},
+                    "query":{"type":"string","maxLength":80,"description":"Optional name, category, approximate text, or musical descriptor such as wobble, growl, warm, ambient, pluck, acid, or riser."},
                     "category":{"type":"string","maxLength":80,"description":"Optional exact category returned by this tool."},
                     "limit":{"type":"integer","minimum":1,"maximum":100,"description":"Maximum matching presets to return; defaults to 40."}
                 }),
@@ -525,7 +525,7 @@ pub(crate) fn list_surge_presets(arguments: &JsonValue) -> Result<String, String
         .map(|value| {
             value
                 .as_str()
-                .map(str::to_lowercase)
+                .map(str::to_owned)
                 .ok_or_else(|| "query must be a string".to_owned())
         })
         .transpose()?;
@@ -556,19 +556,7 @@ pub(crate) fn list_surge_presets(arguments: &JsonValue) -> Result<String, String
         .collect::<Vec<_>>();
     categories.sort();
     categories.dedup();
-    let matches = catalog
-        .iter()
-        .filter(|preset| {
-            category
-                .as_ref()
-                .is_none_or(|category| preset.category == *category)
-                && query.as_ref().is_none_or(|query| {
-                    preset.id.to_lowercase().contains(query)
-                        || preset.category.to_lowercase().contains(query)
-                        || preset.name.to_lowercase().contains(query)
-                })
-        })
-        .collect::<Vec<_>>();
+    let matches = crate::surge_presets::search(&catalog, query.as_deref(), category.as_deref());
     let presets = matches
         .iter()
         .take(limit)
@@ -1413,6 +1401,20 @@ mod tests {
     }
 
     #[test]
+    fn studio_contract_documents_every_registered_tool() {
+        let contract = include_str!("../gemini/STUDIO.md");
+        for name in [READ_TOOL_NAME, AUDIO_TOOL_NAME, PRESET_TOOL_NAME]
+            .into_iter()
+            .chain(MUTATION_TOOL_NAMES.iter().copied())
+        {
+            assert!(
+                contract.contains(&format!("`{name}`")),
+                "gemini/STUDIO.md does not document {name}"
+            );
+        }
+    }
+
+    #[test]
     fn persists_session_metadata_and_wav_artifacts() {
         let session =
             EditSession::create(&Project::demo(), "test the drop", 0.0, 2.0).expect("edit session");
@@ -1482,6 +1484,20 @@ mod tests {
         assert!(catalog["total"].as_u64().unwrap() > 100);
         assert_eq!(catalog["matched"], 1);
         assert_eq!(catalog["presets"][0]["id"], "Factory/Pads/Flux Capacitor");
+
+        let character_search: JsonValue = serde_json::from_str(
+            &list_surge_presets(&serde_json::json!({"query":"dubstep growl","limit":10}))
+                .expect("character preset search"),
+        )
+        .expect("character search JSON");
+        assert!(character_search["matched"].as_u64().unwrap() > 10);
+        assert!(
+            character_search["presets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|preset| preset["category"] == "Basses")
+        );
 
         let session =
             EditSession::create(&Project::demo(), "change the patch", 0.0, 2.0).expect("session");
