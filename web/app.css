@@ -652,25 +652,31 @@ main {
   white-space: nowrap;
 }
 
-.waveform {
+.timeline-midi {
   position: absolute;
   right: 7px;
-  bottom: 8px;
+  bottom: 6px;
   left: 7px;
-  display: flex;
-  align-items: flex-end;
-  gap: 2px;
-  height: 27px;
-  opacity: 0.48;
+  height: 25px;
 }
 
-.waveform i {
-  width: 2px;
-  height: var(--bar-height);
-  min-height: 3px;
-  flex: 1;
-  border-radius: 2px;
+.timeline-midi i {
+  position: absolute;
+  top: calc(var(--timeline-note-pitch) * 20px);
+  left: var(--timeline-note-left);
+  width: var(--timeline-note-width);
+  height: 4px;
+  min-width: 1px;
+  border-radius: 1px;
   background: var(--track-color);
+  box-shadow: 0 0 calc(1px + var(--timeline-note-level) * 4px)
+    color-mix(in srgb, var(--track-color), transparent 42%);
+  filter: brightness(calc(0.5 + var(--timeline-note-level) * 0.85));
+  opacity: calc(0.2 + var(--timeline-note-level) * 0.8);
+}
+
+.clip.is-muted .timeline-midi i {
+  box-shadow: none;
 }
 
 .edit-marker {

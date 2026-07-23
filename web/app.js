@@ -492,9 +492,9 @@
           .map((clip) => {
             const left = (clip.start / duration) * 100;
             const width = ((clip.end - clip.start) / duration) * 100;
-            return `<div class="clip ${clip.style === "generated" ? "is-generated" : ""}" style="left:${left}%;width:${width}%;--track-color:${track.color}">
+            return `<div class="clip ${clip.style === "generated" ? "is-generated" : ""} ${track.muted ? "is-muted" : ""}" style="left:${left}%;width:${width}%;--track-color:${track.color}">
               <span class="clip-name">${escapeHtml(clip.label)}</span>
-              <span class="waveform" aria-hidden="true">${waveformBars(track.id + clip.id)}</span>
+              <span class="timeline-midi" aria-hidden="true">${renderTimelineNotes(track, clip)}</span>
             </div>`;
           })
           .join("");
@@ -515,6 +515,44 @@
         </div>`;
       })
       .join("");
+  }
+
+  function renderTimelineNotes(track, clip) {
+    if (clip.events.length === 0 || clip.end <= clip.start || clip.loopBeats <= 0) return "";
+    const clipDuration = clip.end - clip.start;
+    const beatDuration = 60 / state.project.bpm;
+    const loopDuration = clip.loopBeats * beatDuration;
+    const loopCount = Math.ceil(clipDuration / loopDuration);
+    const occurrenceCount = loopCount * clip.events.length;
+    const stride = Math.max(1, Math.ceil(occurrenceCount / 512));
+    const pitches = clip.events.map((event) => event.pitch);
+    const minimumPitch = Math.min(...pitches);
+    const maximumPitch = Math.max(...pitches);
+    const pitchSpan = Math.max(1, maximumPitch - minimumPitch);
+    const notes = [];
+    let occurrenceIndex = 0;
+    for (let loop = 0; loop < loopCount; loop += 1) {
+      const loopStart = loop * loopDuration;
+      for (const event of clip.events) {
+        const noteStart = loopStart + event.time * beatDuration;
+        if (noteStart >= clipDuration) {
+          occurrenceIndex += 1;
+          continue;
+        }
+        if (occurrenceIndex % stride === 0) {
+          const noteDuration = Math.min(event.duration * beatDuration, clipDuration - noteStart);
+          const left = (noteStart / clipDuration) * 100;
+          const width = Math.max(0.35, (noteDuration / clipDuration) * 100);
+          const pitch = (maximumPitch - event.pitch) / pitchSpan;
+          const level = track.muted ? 0.06 : clamp(event.velocity * track.volume, 0.08, 1);
+          notes.push(
+            `<i style="--timeline-note-left:${left}%;--timeline-note-width:${width}%;--timeline-note-pitch:${pitch};--timeline-note-level:${level}"></i>`,
+          );
+        }
+        occurrenceIndex += 1;
+      }
+    }
+    return notes.join("");
   }
 
   function renderSelection() {
@@ -1179,17 +1217,6 @@
     if (action.type === "timed") return actionAppliesToTrack(action.action, track);
     if (action.type === "automation") return action.trackId === track.id;
     return action.target === "all" || action.target === track.role;
-  }
-
-  function waveformBars(seed) {
-    let value = seed * 71 + 19;
-    const bars = [];
-    for (let index = 0; index < 44; index += 1) {
-      value = (value * 16807) % 2147483647;
-      const height = 12 + (value % 80);
-      bars.push(`<i style="--bar-height:${height}%"></i>`);
-    }
-    return bars.join("");
   }
 
   function timelineTimeFromPointer(event) {
