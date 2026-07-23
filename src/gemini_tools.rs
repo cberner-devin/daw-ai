@@ -1092,7 +1092,7 @@ pub(crate) fn prepare_audio_render(
     let project = current_project(session_path)?;
     let (track_ids, start, end) = audio_region_arguments(&project, arguments)?;
     let description = format!(
-        "Rendered {} from {:.3} to {:.3} seconds through the same custom Rust audio engine used for DAW playback. Listen to the audio itself and describe the audible rhythm, subdivision, energy contour, timbre, transitions, and shortcomings before deciding what to do next.",
+        "Rendered {} from {:.3} to {:.3} seconds",
         selected_channel_labels(&project, &track_ids),
         start,
         end,
@@ -1130,8 +1130,12 @@ pub(crate) fn render_audio_request_with_backend(
             request.end,
         )
     }?;
+    let backend = if builtin { "built-in" } else { "Surge XT" };
     Ok(AudioRender {
-        description: request.description,
+        description: format!(
+            "{} using the {backend} rendering engine selected for DAW playback. Listen to the audio itself and describe the audible rhythm, subdivision, energy contour, timbre, transitions, and shortcomings before deciding what to do next.",
+            request.description
+        ),
         wav: audio_analysis::wav_bytes(&region.samples),
     })
 }
@@ -1895,6 +1899,27 @@ mod tests {
 
         assert_eq!(omitted.track_ids, expected);
         assert_eq!(explicit.track_ids, expected);
+    }
+
+    #[test]
+    fn audio_render_description_names_the_selected_backend() {
+        let session =
+            EditSession::create(&Project::demo(), "listen", 0.0, 2.0).expect("edit session");
+        let arguments = serde_json::json!({"tracks":[2],"start":0,"end":0.1});
+        let surge = render_audio_request_with_backend(
+            prepare_audio_render(session.path(), &arguments).expect("Surge request"),
+            false,
+        )
+        .expect("Surge render");
+        let builtin = render_audio_request_with_backend(
+            prepare_audio_render(session.path(), &arguments).expect("built-in request"),
+            true,
+        )
+        .expect("built-in render");
+
+        assert!(surge.description.contains("Surge XT rendering engine"));
+        assert!(builtin.description.contains("built-in rendering engine"));
+        assert!(!surge.description.contains("custom Rust audio engine"));
     }
 
     #[test]
