@@ -337,9 +337,9 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         || serde_json::json!({"type":"string","enum":["drums","bass","chords","lead","texture"]});
     let notes = || {
         serde_json::json!({
-            "type":"array","maxItems":32,"items":{"type":"object","properties":{
-                "time":{"type":"number","minimum":0,"maximum":16},
-                "duration":{"type":"number","minimum":0.0625,"maximum":16},
+            "type":"array","maxItems":128,"description":"Loop mode supports at most 32 events; once mode supports at most 128.","items":{"type":"object","properties":{
+                "time":{"type":"number","minimum":0,"maximum":64,"description":"Beat offset from the clip start."},
+                "duration":{"type":"number","minimum":0.0625,"maximum":64},
                 "pitch":{"type":"integer","minimum":0,"maximum":127},
                 "velocity":{"type":"number","minimum":0.01,"maximum":1}
             },"required":["time","duration","pitch","velocity"],"additionalProperties":false}
@@ -348,8 +348,13 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
     let clip_properties = || {
         serde_json::json!({
             "trackId":id(), "label":{"type":"string","minLength":1,"maxLength":64},
-            "start":{"type":"number","minimum":0}, "end":{"type":"number","minimum":0},
-            "loopBeats":{"type":"number","minimum":0.25,"maximum":16}, "events":notes()
+            "startBeat":{"type":"number","minimum":0,"description":"Absolute beat from the start of the project."},
+            "durationBeats":{"type":"number","minimum":0.25,"maximum":64},
+            "playback":{"description":"Use loop for deliberately repeating patterns and once for an evolving phrase.","oneOf":[
+                {"type":"object","properties":{"mode":{"type":"string","enum":["loop"]},"lengthBeats":{"type":"number","minimum":0.25,"maximum":16}},"required":["mode","lengthBeats"],"additionalProperties":false},
+                {"type":"object","properties":{"mode":{"type":"string","enum":["once"]}},"required":["mode"],"additionalProperties":false}
+            ]},
+            "events":notes()
         })
     };
     vec![
@@ -376,10 +381,17 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "add_midi_clip",
-            "Add a MIDI clip to one track without changing other clips.",
+            "Add a beat-positioned MIDI clip without changing other clips. Use loop for a repeating groove or riff and once for a melody, progression, fill, build, transition, or other evolving phrase.",
             object_schema(
                 clip_properties(),
-                &["trackId", "label", "start", "end", "loopBeats", "events"],
+                &[
+                    "trackId",
+                    "label",
+                    "startBeat",
+                    "durationBeats",
+                    "playback",
+                    "events",
+                ],
             ),
         ),
         function(
@@ -395,9 +407,9 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
                     "trackId",
                     "clipId",
                     "label",
-                    "start",
-                    "end",
-                    "loopBeats",
+                    "startBeat",
+                    "durationBeats",
+                    "playback",
                     "events",
                 ],
             ),
@@ -640,7 +652,7 @@ pub(crate) fn apply_agent_mutation(
             format!("Loaded Surge XT preset {preset_id} on track {track_id}")
         }
         "add_midi_clip" => {
-            let (track_id, spec) = clip_arguments(object)?;
+            let (track_id, spec) = clip_arguments(object, studio.project().bpm)?;
             validate_clip_selection(&spec, selection_start, selection_end)?;
             let id = studio
                 .create_midi_clip(track_id, &spec)
@@ -650,7 +662,7 @@ pub(crate) fn apply_agent_mutation(
         }
         "update_midi_clip" => {
             let clip_id = required_id(object, "clipId")?;
-            let (track_id, spec) = clip_arguments(object)?;
+            let (track_id, spec) = clip_arguments(object, studio.project().bpm)?;
             studio
                 .replace_midi_clip(track_id, clip_id, &spec, selection_start, selection_end)
                 .map_err(studio_error_message)?;
@@ -841,7 +853,10 @@ fn required_role(object: &Map<String, JsonValue>, name: &str) -> Result<TrackRol
         .ok_or_else(|| format!("{name} is not a supported track role"))
 }
 
-fn clip_arguments(object: &Map<String, JsonValue>) -> Result<(u64, MidiClipSpec), String> {
+fn clip_arguments(
+    object: &Map<String, JsonValue>,
+    bpm: u16,
+) -> Result<(u64, MidiClipSpec), String> {
     let events = object
         .get("events")
         .and_then(JsonValue::as_array)
@@ -863,13 +878,27 @@ fn clip_arguments(object: &Map<String, JsonValue>) -> Result<(u64, MidiClipSpec)
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let start_beat = required_number(object, "startBeat")? as f32;
+    let duration_beats = required_number(object, "durationBeats")? as f32;
+    let playback = object
+        .get("playback")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| "playback must be an object".to_owned())?;
+    let playback_mode = required_string(playback, "mode")?;
+    let loop_beats = match playback_mode {
+        "loop" => required_number(playback, "lengthBeats")? as f32,
+        "once" => duration_beats,
+        _ => return Err("playback mode must be loop or once".to_owned()),
+    };
+    let seconds_per_beat = 60.0 / f32::from(bpm);
     Ok((
         required_id(object, "trackId")?,
         MidiClipSpec {
             label: required_string(object, "label")?.to_owned(),
-            start: required_number(object, "start")? as f32,
-            end: required_number(object, "end")? as f32,
-            loop_beats: required_number(object, "loopBeats")? as f32,
+            start: start_beat * seconds_per_beat,
+            end: (start_beat + duration_beats) * seconds_per_beat,
+            playback_mode: playback_mode.to_owned(),
+            loop_beats,
             notes,
         },
     ))
@@ -1518,6 +1547,68 @@ mod tests {
     }
 
     #[test]
+    fn midi_tools_support_repeating_patterns_and_long_once_phrases() {
+        let mut studio = Studio::from_project(Project::demo());
+        studio.set_tempo(120).expect("tempo");
+        let session =
+            EditSession::create(studio.project(), "write a melody", 0.0, 16.0).expect("session");
+        let events = (0..64)
+            .map(|index| {
+                serde_json::json!({
+                    "time":index as f32 / 2.0,
+                    "duration":0.25,
+                    "pitch":60 + index % 12,
+                    "velocity":0.8
+                })
+            })
+            .collect::<Vec<_>>();
+        apply_agent_mutation(
+            session.path(),
+            "add_midi_clip",
+            &serde_json::json!({
+                "trackId":3,
+                "label":"Sixteen-bar melody",
+                "startBeat":0,
+                "durationBeats":32,
+                "playback":{"mode":"once"},
+                "events":events
+            }),
+        )
+        .expect("once phrase");
+        let (_, project) = session.take_update().unwrap().expect("phrase update");
+        let phrase = project.tracks[2].clips.last().expect("phrase clip");
+        assert_eq!(phrase.playback_mode, "once");
+        assert_eq!(phrase.loop_beats, 32.0);
+        assert_eq!((phrase.start, phrase.end), (0.0, 16.0));
+        assert_eq!(phrase.events.len(), 64);
+
+        let loop_events = (0..33)
+            .map(|index| {
+                serde_json::json!({
+                    "time":index as f32 / 16.0,
+                    "duration":0.0625,
+                    "pitch":42,
+                    "velocity":0.7
+                })
+            })
+            .collect::<Vec<_>>();
+        let error = apply_agent_mutation(
+            session.path(),
+            "add_midi_clip",
+            &serde_json::json!({
+                "trackId":1,
+                "label":"Oversized loop",
+                "startBeat":0,
+                "durationBeats":4,
+                "playback":{"mode":"loop","lengthBeats":4},
+                "events":loop_events
+            }),
+        )
+        .expect_err("loop event budget");
+        assert!(error.contains("outside its published range"), "{error}");
+    }
+
+    #[test]
     fn failed_progress_publication_rolls_back_graph_and_undo_snapshot() {
         let original = Project::demo();
         let session = EditSession::create(&original, "change tempo", 0.0, 4.0).expect("session");
@@ -1580,8 +1671,8 @@ mod tests {
             session.path(),
             "update_midi_clip",
             &serde_json::json!({
-                "trackId":1,"clipId":11,"label":"Updated drums","start":0,"end":8,
-                "loopBeats":4,"events":[
+                "trackId":1,"clipId":11,"label":"Updated drums","startBeat":0,
+                "durationBeats":16,"playback":{"mode":"loop","lengthBeats":4},"events":[
                     {"time":0,"duration":0.25,"pitch":36,"velocity":0.9}
                 ]
             }),
@@ -1608,8 +1699,8 @@ mod tests {
             session.path(),
             "add_midi_clip",
             &serde_json::json!({
-                "trackId":1,"label":"Outside selection","start":8,"end":12,
-                "loopBeats":4,"events":[]
+                "trackId":1,"label":"Outside selection","startBeat":16,
+                "durationBeats":8,"playback":{"mode":"loop","lengthBeats":4},"events":[]
             }),
         )
         .expect_err("MIDI outside the selected region");

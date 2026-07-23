@@ -518,11 +518,12 @@
   }
 
   function renderTimelineNotes(track, clip) {
-    if (clip.events.length === 0 || clip.end <= clip.start || clip.loopBeats <= 0) return "";
+    const playbackBeats = clip.playback?.lengthBeats ?? clip.loopBeats;
+    if (clip.events.length === 0 || clip.end <= clip.start || playbackBeats <= 0) return "";
     const clipDuration = clip.end - clip.start;
     const beatDuration = 60 / state.project.bpm;
-    const loopDuration = clip.loopBeats * beatDuration;
-    const loopCount = Math.ceil(clipDuration / loopDuration);
+    const loopDuration = playbackBeats * beatDuration;
+    const loopCount = clip.playback?.mode === "once" ? 1 : Math.ceil(clipDuration / loopDuration);
     const occurrenceCount = loopCount * clip.events.length;
     const stride = Math.max(1, Math.ceil(occurrenceCount / 512));
     const pitches = clip.events.map((event) => event.pitch);
@@ -868,7 +869,10 @@
   }
 
   function renderClipTimeline(track, clip) {
-    return `<details class="clip-editor" data-clip-key="${track.id}-${clip.id}" open><summary><span>${escapeHtml(clip.label)}</span><b>${clip.events.length} events &middot; ${clip.loopBeats} beat loop</b></summary>${renderPianoRoll(track, clip)}</details>`;
+    const playback = clip.playback?.mode === "once"
+      ? `${clip.playback.lengthBeats} beat phrase`
+      : `${clip.playback?.lengthBeats ?? clip.loopBeats} beat loop`;
+    return `<details class="clip-editor" data-clip-key="${track.id}-${clip.id}" open><summary><span>${escapeHtml(clip.label)}</span><b>${clip.events.length} events &middot; ${playback}</b></summary>${renderPianoRoll(track, clip)}</details>`;
   }
 
   function renderPianoRoll(track, clip) {
@@ -878,7 +882,8 @@
     const maximum = Math.min(127, Math.max(minimum + 11, Math.ceil((Math.max(...pitches) + 1) / 12) * 12 - 1));
     const pitchCount = maximum - minimum + 1;
     const rowHeight = 100 / pitchCount;
-    const beatWidth = 100 / clip.loopBeats;
+    const playbackBeats = clip.playback?.lengthBeats ?? clip.loopBeats;
+    const beatWidth = 100 / playbackBeats;
     const keys = Array.from({ length: pitchCount }, (_, index) => maximum - index)
       .map((pitch) => {
         const pitchClass = pitch % 12;
@@ -889,8 +894,8 @@
       .join("");
     const notes = clip.events
       .map((event) => {
-        const left = (event.time / clip.loopBeats) * 100;
-        const width = Math.max(0.8, (event.duration / clip.loopBeats) * 100);
+        const left = (event.time / playbackBeats) * 100;
+        const width = Math.max(0.8, (event.duration / playbackBeats) * 100);
         const top = (maximum - event.pitch) * rowHeight;
         return `<span class="midi-note" role="img" style="--note-left:${left}%;--note-width:${width}%;--note-top:${top}%;--note-height:${rowHeight}%;--note-velocity:${event.velocity}" aria-label="${escapeHtml(`${midiNoteName(event.pitch)} at beat ${event.time}, length ${event.duration}, velocity ${event.velocity}`)}"><span>${escapeHtml(midiNoteName(event.pitch))}</span></span>`;
       })
