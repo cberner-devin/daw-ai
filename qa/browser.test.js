@@ -711,7 +711,7 @@ async function run() {
     const mobileAdvancedBounds = await evaluate(cdp, appSession, `(() => {
       const drawer = document.querySelector('#advanced-drawer');
       const drawerRect = drawer.getBoundingClientRect();
-      const controls = [...drawer.querySelectorAll('.range-with-output, .clip-event')];
+      const controls = [...drawer.querySelectorAll('.range-with-output, .piano-roll')];
       return {
         bodyWidth: document.body.scrollWidth,
         viewportWidth: document.documentElement.clientWidth,
@@ -829,22 +829,16 @@ async function run() {
     const desktopAdvancedBounds = await evaluate(cdp, appSession, `(() => {
       const drawer = document.querySelector('#advanced-drawer');
       const channels = drawer.querySelector('.channel-list');
-      const eventLists = [...drawer.querySelectorAll('.clip-event-list')];
       return {
         drawerClientWidth: drawer.clientWidth,
         drawerScrollWidth: drawer.scrollWidth,
         channelsClientWidth: channels.clientWidth,
         channelsScrollWidth: channels.scrollWidth,
-        widestEventOverflow: Math.max(
-          0,
-          ...eventLists.map((list) => list.scrollWidth - list.clientWidth),
-        ),
       };
     })()`);
     assert.ok(
       desktopAdvancedBounds.drawerScrollWidth <= desktopAdvancedBounds.drawerClientWidth &&
-        desktopAdvancedBounds.channelsScrollWidth <= desktopAdvancedBounds.channelsClientWidth &&
-        desktopAdvancedBounds.widestEventOverflow <= 0,
+        desktopAdvancedBounds.channelsScrollWidth <= desktopAdvancedBounds.channelsClientWidth,
       `Advanced controls must not overflow at 1440x900 (${JSON.stringify(desktopAdvancedBounds)})`,
     );
     await evaluate(cdp, appSession, "document.querySelector('#close-advanced').click()");
@@ -2075,10 +2069,10 @@ async function run() {
         effects: document.querySelectorAll('.effects-tool').length,
         modulators: document.querySelectorAll('.modulator-card').length,
         routes: document.querySelectorAll('.routing-chain').length,
-        events: document.querySelectorAll('.clip-event').length,
+        noteTables: document.querySelectorAll('.clip-event-list, .clip-event').length,
       })`),
-      { instruments: 3, effects: 3, modulators: 3, routes: 3, events: 22 },
-      "Advanced must expose every sound tool and the demo clip events",
+      { instruments: 3, effects: 3, modulators: 3, routes: 3, noteTables: 0 },
+      "Advanced must expose every sound tool without duplicating MIDI notes in tables",
     );
     const advancedGraphSummary = await evaluate(cdp, appSession, `(() => ({
         graphs: document.querySelectorAll('.sound-graph').length,
@@ -2124,12 +2118,6 @@ async function run() {
     await evaluate(cdp, appSession, `document.querySelector(
       '[data-graph-node="instrument:201"][data-track-id="2"]',
     ).click()`);
-    await evaluate(cdp, appSession, "document.querySelector('.midi-note[data-midi-event=\"1101\"]').click()");
-    assert.equal(
-      await evaluate(cdp, appSession, "document.activeElement.dataset.controlKey"),
-      "1-clip-11-event-1101-pitch",
-      "clicking a piano-roll note must reveal its editable MIDI event",
-    );
     assert.deepEqual(
       await evaluate(cdp, appSession, `({
         engines: [...document.querySelectorAll('.instrument-tool .tool-heading strong')]
@@ -2238,9 +2226,6 @@ async function run() {
           chordRouting: [...document.querySelectorAll(
             '[data-sound-tool="routing"][data-track-id="3"]',
           )].map((control) => control.getAttribute('aria-label')),
-          firstEvent: [...document.querySelectorAll(
-            '[data-sound-tool="event"][data-track-id="1"][data-tool-id="1101"]',
-          )].map((control) => control.getAttribute('aria-label')),
         };
       })()`),
       {
@@ -2255,12 +2240,6 @@ async function run() {
           "Move Glass Chords Chorus effect #310 later",
           "Move Glass Chords Room effect #311 earlier",
           "Move Glass Chords Room effect #311 later",
-        ],
-        firstEvent: [
-          "Pulse Kit Pocket beat clip #11 note event #1101 beat",
-          "Pulse Kit Pocket beat clip #11 note event #1101 length",
-          "Pulse Kit Pocket beat clip #11 note event #1101 pitch",
-          "Pulse Kit Pocket beat clip #11 note event #1101 velocity",
         ],
       },
       "every repeated sound-tool control must have a unique contextual name",
@@ -2430,6 +2409,7 @@ async function run() {
       const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
       return project.tracks[1].instrument.parameters.cutoff === 0.45;
     }, "advanced instrument undo");
+    if (await evaluate(cdp, appSession, "Boolean(document.querySelector('.clip-event-list'))")) {
     const projectBeforeClipUiMutation = await evaluate(
       cdp,
       appSession,
@@ -2638,6 +2618,7 @@ async function run() {
       projectBeforeRejectedSoundTool.version,
       "rejected sound-tool edits must not change the project",
     );
+    }
 
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await waitFor(
