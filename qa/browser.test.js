@@ -385,6 +385,25 @@ async function run() {
       async () => evaluate(cdp, appSession, "document.querySelectorAll('.track-row').length === 3"),
       "initial arrangement",
     );
+    const timelineMidi = await evaluate(cdp, appSession, `(async () => {
+        const project = await fetch('/api/project').then((response) => response.json());
+        const graphEvents = project.tracks.flatMap((track) => track.clips.flatMap((clip) => clip.events));
+        const notes = [...document.querySelectorAll('.timeline-midi i')];
+        const levels = notes.map((note) => Number(note.style.getPropertyValue('--timeline-note-level')));
+        const positions = notes.map((note) => Number.parseFloat(note.style.getPropertyValue('--timeline-note-left')));
+        return {
+          fakeWaveforms: document.querySelectorAll('.waveform').length,
+          graphEvents: graphEvents.length,
+          renderedNotes: notes.length,
+          hasLoopedOccurrences: positions.some((position) => position > 50),
+          hasDynamicBrightness: Math.max(...levels) > Math.min(...levels),
+        };
+      })()`);
+    assert.equal(timelineMidi.fakeWaveforms, 0);
+    assert.ok(timelineMidi.graphEvents > 0);
+    assert.ok(timelineMidi.renderedNotes > timelineMidi.graphEvents);
+    assert.equal(timelineMidi.hasLoopedOccurrences, true);
+    assert.equal(timelineMidi.hasDynamicBrightness, true);
     assert.deepEqual(
       await evaluate(cdp, appSession, `({
         historyHeading: document.querySelector('#session-history-heading').textContent,
