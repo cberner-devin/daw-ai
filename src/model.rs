@@ -237,6 +237,19 @@ impl fmt::Display for ProjectFileError {
 }
 
 impl Project {
+    pub(crate) fn initial() -> Self {
+        Self {
+            name: "Untitled Project".to_owned(),
+            bpm: 120,
+            duration: 32.0,
+            version: 1,
+            tracks: vec![empty_track(1)],
+            edits: Vec::new(),
+            edit_operations: Vec::new(),
+            channel_operations: Vec::new(),
+        }
+    }
+
     #[must_use]
     pub fn demo() -> Self {
         Self {
@@ -1768,7 +1781,7 @@ impl Studio {
     pub fn reset(&mut self) {
         self.remember();
         let version = self.project.version + 1;
-        self.project = Project::demo();
+        self.project = Project::initial();
         self.project.version = version;
     }
 
@@ -2337,6 +2350,17 @@ fn demo_track(id: u64, role: TrackRole, name: &str, color: &str) -> Track {
     track
 }
 
+fn empty_track(id: u64) -> Track {
+    let mut track = generated_track(id, TrackRole::Lead);
+    track.name = "Empty Track".to_owned();
+    track.instrument.preset = "Init".to_owned();
+    track.effects.clear();
+    track.modulators.clear();
+    track.routing.effect_order.clear();
+    track.clips.clear();
+    track
+}
+
 fn generated_track(id: u64, role: TrackRole) -> Track {
     let (name, color, preset, attack, release, cutoff, effect_specs, modulator) = match role {
         TrackRole::Drums => (
@@ -2578,6 +2602,20 @@ pub(crate) fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_project_is_one_unbiased_empty_track() {
+        let project = Project::initial();
+        assert_eq!(project.name, "Untitled Project");
+        assert_eq!(project.tracks.len(), 1);
+        let track = &project.tracks[0];
+        assert_eq!(track.name, "Empty Track");
+        assert_eq!(track.instrument.preset, "Init");
+        assert!(track.clips.is_empty());
+        assert!(track.effects.is_empty());
+        assert!(track.modulators.is_empty());
+        assert!(track.routing.effect_order.is_empty());
+    }
 
     #[test]
     fn demo_project_contains_a_playable_arrangement() {

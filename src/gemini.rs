@@ -581,7 +581,7 @@ fn missing_credentials(path: Option<&Path>) -> PlannerError {
 
 fn planner_task(prompt: &str, start: f32, end: f32) -> String {
     format!(
-        "Selected edit region: {start:.3} to {end:.3} seconds. This bounds graph edits, not listening.\nUser request: {prompt}\n\nBegin by reading the current sound graph, then make the needed edits. The optional audio renderer can provide an audible baseline or evaluate changes whenever you decide listening would help. When you decide the requested edit is complete, finish the interaction."
+        "Selected edit region: {start:.3} to {end:.3} seconds. This bounds graph edits, not listening.\nUser request: {prompt}\n\nBegin by reading the current sound graph. For creative work, establish an audible baseline, audition important sound choices on isolated tracks, evaluate each coherent edit batch, and listen to the final full mix. Revise weak results before finishing."
     )
 }
 
@@ -598,8 +598,11 @@ fn system_instruction() -> String {
             "you cannot alter the graph by merely describing changes. Research unfamiliar musical ",
             "goals when useful. The selected region bounds edits only; every audio-tool call chooses ",
             "its own absolute project start and end, so include surrounding context when useful. Read ",
-            "the graph before editing. Listening is encouraged when it improves your decisions, but it ",
-            "is never required; you choose whether and when to render. When you do listen, reason from ",
+            "the graph before editing. Treat listening as a core production tool: for creative or ",
+            "style-based work, listen before editing, audition important preset or effect choices on ",
+            "isolated tracks, listen after each coherent composition or sound-design batch, and always ",
+            "evaluate the final full mix. Skip listening only for a simple literal operation whose ",
+            "audible result is already certain. When you listen, reason from ",
             "the actual audio - not event-count proxies - about groove, beat subdivision, energy contour, ",
             "tension, impact, timbre, and contrast. If a style depends on intensification, express it ",
             "through composition and rhythmic subdivision when appropriate; do not assume the project ",
@@ -1355,15 +1358,15 @@ mod tests {
     }
 
     #[test]
-    fn gemini_prompt_makes_audio_optional_without_a_tempo_assumption() {
+    fn gemini_prompt_encourages_iterative_listening_without_a_tempo_assumption() {
         let task = planner_task("make the bass hit harder", 4.0, 8.0);
         let instruction = system_instruction();
-        assert!(task.contains("optional audio renderer"));
-        assert!(task.contains("whenever you decide listening would help"));
+        assert!(task.contains("establish an audible baseline"));
+        assert!(task.contains("listen to the final full mix"));
         assert!(instruction.contains("selected region bounds edits only"));
         assert!(instruction.contains("chooses its own absolute project start and end"));
-        assert!(instruction.contains("Listening is encouraged"));
-        assert!(instruction.contains("never required"));
+        assert!(instruction.contains("Treat listening as a core production tool"));
+        assert!(instruction.contains("listen after each coherent"));
         assert!(instruction.contains("actual audio - not event-count proxies"));
         assert!(instruction.contains("rhythmic subdivision"));
         assert!(instruction.contains("tempo must change"));
