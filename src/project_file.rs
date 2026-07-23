@@ -461,7 +461,29 @@ fn parse_clip(
         return Err(invalid("MIDI clip end must be after its start"));
     }
     let source_start = range(clip, "sourceStart", 0.0, start)?;
-    let loop_beats = range(clip, "loopBeats", 0.25, 16.0)?;
+    let playback_mode = clip
+        .get("playback")
+        .and_then(JsonValue::as_object)
+        .and_then(|playback| playback.get("mode"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("loop");
+    if !matches!(playback_mode, "loop" | "once") {
+        return Err(invalid("MIDI clip playback mode must be loop or once"));
+    }
+    let maximum_beats = if playback_mode == "once" { 64.0 } else { 16.0 };
+    let published_length = clip
+        .get("playback")
+        .and_then(JsonValue::as_object)
+        .and_then(|playback| playback.get("lengthBeats"))
+        .and_then(JsonValue::as_f64)
+        .map(|value| value as f32);
+    let loop_beats = match published_length {
+        Some(value) => value,
+        None => range(clip, "loopBeats", 0.25, maximum_beats)?,
+    };
+    if !loop_beats.is_finite() || !(0.25..=maximum_beats).contains(&loop_beats) {
+        return Err(invalid("MIDI clip playback length is out of range"));
+    }
     let event_values = array(clip, "events")?;
     if event_values.len() > MAX_EVENTS_PER_CLIP {
         return Err(invalid(format!(
@@ -480,6 +502,7 @@ fn parse_clip(
         end,
         source_start,
         style: limited_string(clip, "style", 1, 64)?,
+        playback_mode: playback_mode.to_owned(),
         loop_beats,
         events,
     })

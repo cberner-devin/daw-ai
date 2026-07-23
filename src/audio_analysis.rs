@@ -700,11 +700,17 @@ fn clip_events_in_window<'a>(
     if onsets.is_empty() {
         return Vec::new();
     }
-    let first_cycle =
+    let first_cycle = if clip.playback_mode == "once" {
+        0
+    } else {
         ((((window_start - f64::from(clip.source_start)) / loop_duration).floor() as i64) - 1)
-            .max(0);
-    let last_cycle =
-        (((window_end - f64::from(clip.source_start)) / loop_duration).floor() as i64).max(0);
+            .max(0)
+    };
+    let last_cycle = if clip.playback_mode == "once" {
+        0
+    } else {
+        (((window_end - f64::from(clip.source_start)) / loop_duration).floor() as i64).max(0)
+    };
     let mut occurrences = Vec::new();
     for cycle in first_cycle..=last_cycle {
         for candidate in &pattern {
@@ -1941,6 +1947,43 @@ mod tests {
     }
 
     #[test]
+    fn once_clip_events_do_not_wrap() {
+        let mut project = Project::demo();
+        project.bpm = 60;
+        let clip = &mut project.tracks[2].clips[0];
+        clip.start = 0.0;
+        clip.source_start = 0.0;
+        clip.end = 8.0;
+        clip.loop_beats = 4.0;
+        clip.playback_mode = "loop".to_owned();
+        let event_id = clip.events[0].id;
+        let looped = clip_events_in_window(
+            &project,
+            &project.tracks[2],
+            &project.tracks[2].clips[0],
+            0.0,
+            8.0,
+        )
+        .into_iter()
+        .filter(|occurrence| occurrence.event.id == event_id)
+        .count();
+        project.tracks[2].clips[0].playback_mode = "once".to_owned();
+        let once = clip_events_in_window(
+            &project,
+            &project.tracks[2],
+            &project.tracks[2].clips[0],
+            0.0,
+            8.0,
+        )
+        .into_iter()
+        .filter(|occurrence| occurrence.event.id == event_id)
+        .count();
+
+        assert_eq!(looped, 2);
+        assert_eq!(once, 1);
+    }
+
+    #[test]
     fn builtin_note_tail_uses_the_instrument_release_duration() {
         let mut project = Project::demo();
         project.bpm = 60;
@@ -1958,6 +2001,7 @@ mod tests {
             end: 2.0,
             source_start: 0.0,
             style: "test".to_owned(),
+            playback_mode: "loop".to_owned(),
             loop_beats: 2.0,
             events: vec![ClipEvent {
                 id: 9_501,
@@ -2277,6 +2321,7 @@ mod tests {
             end: project_duration,
             source_start: 0.0,
             style: "test".to_owned(),
+            playback_mode: "loop".to_owned(),
             loop_beats: 16.0,
             events: vec![ClipEvent {
                 id: 9_101,

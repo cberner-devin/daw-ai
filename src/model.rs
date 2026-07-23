@@ -126,6 +126,7 @@ pub struct Clip {
     pub end: f32,
     pub source_start: f32,
     pub style: String,
+    pub playback_mode: String,
     pub loop_beats: f32,
     pub events: Vec<ClipEvent>,
 }
@@ -215,6 +216,7 @@ pub(crate) struct MidiClipSpec {
     pub(crate) label: String,
     pub(crate) start: f32,
     pub(crate) end: f32,
+    pub(crate) playback_mode: String,
     pub(crate) loop_beats: f32,
     pub(crate) notes: Vec<crate::prompt::MidiNote>,
 }
@@ -561,7 +563,7 @@ impl Track {
                 output,
                 concat!(
                     "{{\"id\":{},\"label\":{},\"start\":{},\"end\":{},\"sourceStart\":{},",
-                    "\"style\":{},\"loopBeats\":{},\"events\":["
+                    "\"style\":{},\"playback\":{{\"mode\":{},\"lengthBeats\":{}}},\"events\":["
                 ),
                 clip.id,
                 json_string(&clip.label),
@@ -569,6 +571,7 @@ impl Track {
                 decimal(clip.end),
                 decimal(clip.source_start),
                 json_string(&clip.style),
+                json_string(&clip.playback_mode),
                 decimal(clip.loop_beats)
             )
             .expect("writing to a string cannot fail");
@@ -1442,6 +1445,7 @@ impl Studio {
             &spec.label,
             spec.start,
             spec.end,
+            &spec.playback_mode,
             spec.loop_beats,
             &spec.notes,
             self.project.duration,
@@ -1473,6 +1477,7 @@ impl Studio {
             end: spec.end,
             source_start: spec.start,
             style: "generated".to_owned(),
+            playback_mode: spec.playback_mode.clone(),
             loop_beats: spec.loop_beats,
             events,
         });
@@ -1495,6 +1500,7 @@ impl Studio {
             &spec.label,
             spec.start,
             spec.end,
+            &spec.playback_mode,
             spec.loop_beats,
             &spec.notes,
             self.project.duration,
@@ -1549,6 +1555,7 @@ impl Studio {
             end: spec.end,
             source_start: spec.start,
             style: "generated".to_owned(),
+            playback_mode: spec.playback_mode.clone(),
             loop_beats: spec.loop_beats,
             events,
         });
@@ -1869,6 +1876,7 @@ impl Studio {
             end,
             source_start: start,
             style: "generated".to_owned(),
+            playback_mode: "loop".to_owned(),
             loop_beats,
             events: notes
                 .iter()
@@ -2076,6 +2084,7 @@ fn validate_clip_fields(
     label: &str,
     start: f32,
     end: f32,
+    playback_mode: &str,
     loop_beats: f32,
     notes: &[crate::prompt::MidiNote],
     project_duration: f32,
@@ -2088,8 +2097,11 @@ fn validate_clip_fields(
         || end <= start
         || end > project_duration
         || !loop_beats.is_finite()
-        || !(0.25..=16.0).contains(&loop_beats)
-        || notes.len() > 32
+        || match playback_mode {
+            "loop" => !(0.25..=16.0).contains(&loop_beats) || notes.len() > 32,
+            "once" => !(0.25..=64.0).contains(&loop_beats) || notes.len() > 128,
+            _ => true,
+        }
         || notes.iter().any(|note| {
             !note.time.is_finite()
                 || !(0.0..loop_beats).contains(&note.time)
@@ -2448,6 +2460,7 @@ fn clip(id: u64, label: &str, start: f32, end: f32, style: &str, role: TrackRole
         end,
         source_start: start,
         style: style.to_owned(),
+        playback_mode: "loop".to_owned(),
         loop_beats: 4.0,
         events: pattern_events(id, role),
     }
@@ -2589,7 +2602,7 @@ mod tests {
         let json = project.to_json();
         assert!(json.contains("Neon First Light"));
         assert!(json.contains("\"routing\""));
-        assert!(json.contains("\"loopBeats\""));
+        assert!(json.contains("\"playback\":{\"mode\":\"loop\",\"lengthBeats\":4.0}"));
         assert!(
             json.contains("\"source\":\"clips\",\"target\":\"instrument:101\",\"type\":\"midi\"")
         );
