@@ -15,6 +15,7 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=HOME=/var/lib/daw-ai
 Environment=XDG_DATA_HOME=/var/lib/daw-ai/surge-data
 Environment=SURGE_DATA_HOME=/var/lib/daw-ai/surge-data
+Environment=DAW_AI_SURGE_PRESET_DIR=/usr/local/share/daw-ai/patches_factory
 LoadCredential=gemini-api-key:/etc/daw-ai/gemini-api-key
 StateDirectory=daw-ai
 UMask=0077

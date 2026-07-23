@@ -597,7 +597,7 @@
                 <div class="tool-controls instrument-preset-controls">
                   <label class="tool-control">Preset
                     <select data-sound-tool="instrument" data-track-id="${track.id}" data-tool-id="${track.instrument.id}" data-parameter="preset" data-control-key="${track.id}-instrument-${track.instrument.id}-preset" aria-label="${escapeHtml(`${track.name} instrument #${track.instrument.id} Surge XT preset`)}">
-                      ${selectOptions(SURGE_PRESETS, track.instrument.preset)}
+                      ${selectOptions(SURGE_PRESETS.includes(track.instrument.preset) ? SURGE_PRESETS : [track.instrument.preset, ...SURGE_PRESETS], track.instrument.preset)}
                     </select>
                   </label>
                 </div>

@@ -21,6 +21,8 @@ export GEMINI_API_KEY="your-key"
 
 For a system service, use systemd's `LoadCredential=` with a credential named `gemini-api-key`; DAW-AI automatically reads it from `CREDENTIALS_DIRECTORY`. This keeps the key out of the unit environment, process arguments, and home directories. For interactive use, `~/gemini_creds.txt` remains a fallback. A raw key, `GEMINI_API_KEY=...`, `Gemini API key: ...`, and `export GEMINI_API_KEY=...` are accepted. `DAW_AI_GEMINI_API_KEY` and `DAW_AI_GEMINI_CREDENTIALS` provide explicit overrides.
 
+The model can search and load Surge XT's factory `.fxp` library. Development builds discover it in the pinned Surge checkout automatically. Packaged deployments should copy Surge's `resources/data/patches_factory` directory to `/usr/local/share/daw-ai/patches_factory`, or set `DAW_AI_SURGE_PRESET_DIR` to its installed location.
+
 Start the studio on the charter's default port:
 
 ```sh
