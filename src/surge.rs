@@ -5,7 +5,7 @@ use std::{
 
 use surge_rs::glue::synthesizer::{SurgeId, SurgeSynthesizer};
 
-use crate::model::Instrument;
+use crate::model::{Effect, Instrument};
 
 pub(crate) const BLOCK_SIZE: usize = 32;
 
@@ -40,10 +40,16 @@ pub(crate) struct Engine {
     synth: SurgeSynthesizer,
     _guard: MutexGuard<'static, ()>,
     parameters: HashMap<String, i32>,
+    effect_mix_parameters: HashMap<u64, String>,
 }
 
 impl Engine {
-    pub(crate) fn new(instrument: &Instrument, sample_rate: f32) -> Result<Self, String> {
+    pub(crate) fn new(
+        instrument: &Instrument,
+        effects: &[Effect],
+        effect_order: &[u64],
+        sample_rate: f32,
+    ) -> Result<Self, String> {
         let guard = SURGE_ENGINE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -53,9 +59,16 @@ impl Engine {
             _guard: guard,
             parameters: parameter_map(&synth),
             synth,
+            effect_mix_parameters: HashMap::new(),
         };
         engine.apply_preset(&instrument.preset)?;
         engine.set_instrument_parameters(instrument)?;
+        if effects
+            .iter()
+            .any(|effect| effect.enabled && is_native_effect(&effect.name))
+        {
+            engine.apply_effects(effects, effect_order)?;
+        }
         Ok(engine)
     }
 
@@ -99,6 +112,13 @@ impl Engine {
         self.synth.pull_buffer()
     }
 
+    pub(crate) fn set_effect_mix(&mut self, effect_id: u64, value: f32) -> Result<(), String> {
+        let Some(parameter) = self.effect_mix_parameters.get(&effect_id).cloned() else {
+            return Ok(());
+        };
+        self.set_parameter(&parameter, value)
+    }
+
     fn set_instrument_parameters(&mut self, instrument: &Instrument) -> Result<(), String> {
         for (name, value) in [
             ("attack", instrument.attack),
@@ -129,6 +149,111 @@ impl Engine {
         self.parameters = parameter_map(&self.synth);
         Ok(())
     }
+
+    fn apply_effects(&mut self, effects: &[Effect], effect_order: &[u64]) -> Result<(), String> {
+        let slots = [
+            "FX A1", "FX A2", "FX A3", "FX A4", "FX G1", "FX G2", "FX G3", "FX G4",
+        ];
+        let mut available = slots
+            .into_iter()
+            .filter(|slot| {
+                self.parameter_value(&format!("{slot} FX Type"))
+                    .is_some_and(|value| value < 0.02)
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
+        for effect_id in effect_order {
+            let Some(effect) = effects.iter().find(|effect| {
+                effect.id == *effect_id && effect.enabled && is_native_effect(&effect.name)
+            }) else {
+                continue;
+            };
+            let type_index = effect_type_index(&effect.name)
+                .ok_or_else(|| format!("unsupported Surge XT effect: {}", effect.name))?;
+            let slot = available.next().ok_or_else(|| {
+                "Surge XT has no free serial effect slots after loading the instrument preset"
+                    .to_owned()
+            })?;
+            self.set_parameter(
+                &format!("{slot} FX Type"),
+                type_index as f32 / (SURGE_EFFECT_TYPES.len() - 1) as f32,
+            )?;
+            self.synth.process();
+            self.parameters = parameter_map(&self.synth);
+            let mix_parameter = format!("{slot} Mix");
+            if self.parameters.contains_key(&mix_parameter) {
+                self.set_parameter(&mix_parameter, effect.mix)?;
+                self.effect_mix_parameters.insert(effect.id, mix_parameter);
+            }
+        }
+        Ok(())
+    }
+
+    fn parameter_value(&self, name: &str) -> Option<f32> {
+        let index = self.parameters.get(name)?;
+        let mut id = SurgeId::empty();
+        self.synth
+            .from_synth_side_id(*index, &mut id)
+            .then(|| self.synth.get_parameter01(&mut id))
+    }
+}
+
+pub(crate) const SURGE_EFFECT_TYPES: &[&str] = &[
+    "Off",
+    "Delay",
+    "Reverb 1",
+    "Phaser",
+    "Rotary Speaker",
+    "Distortion",
+    "EQ",
+    "Frequency Shifter",
+    "Conditioner",
+    "Chorus",
+    "Vocoder",
+    "Reverb 2",
+    "Flanger",
+    "Ring Modulator",
+    "Airwindows",
+    "Neuron",
+    "Graphic EQ",
+    "Resonator",
+    "CHOW",
+    "Exciter",
+    "Ensemble",
+    "Combulator",
+    "Nimbus",
+    "Tape",
+    "Treemonster",
+    "Waveshaper",
+    "Mid-Side Tool",
+    "Spring Reverb",
+    "Bonsai",
+    "Audio Input",
+    "Floaty Delay",
+    "Convolution",
+];
+
+pub(crate) fn effect_type_index(name: &str) -> Option<usize> {
+    let native = match name {
+        "Reverb" | "Room" => "Reverb 2",
+        "Echo" => "Delay",
+        "Low-pass filter" => "EQ",
+        "Punch compressor" => "Conditioner",
+        "Drive" => "Distortion",
+        "Shimmer" => "Nimbus",
+        name => name,
+    };
+    SURGE_EFFECT_TYPES
+        .iter()
+        .position(|candidate| *candidate == native)
+        .filter(|index| *index > 0)
+}
+
+pub(crate) fn is_native_effect(name: &str) -> bool {
+    SURGE_EFFECT_TYPES
+        .iter()
+        .skip(1)
+        .any(|candidate| *candidate == name)
 }
 
 fn parameter_map(synth: &SurgeSynthesizer) -> HashMap<String, i32> {
@@ -202,7 +327,7 @@ mod tests {
     fn binding_supports_multiple_headless_engines() {
         let instrument = crate::model::Project::demo().tracks[0].instrument.clone();
         for _ in 0..2 {
-            let mut engine = Engine::new(&instrument, 16_000.0).expect("Surge XT engine");
+            let mut engine = Engine::new(&instrument, &[], &[], 16_000.0).expect("Surge XT engine");
             engine.process();
         }
     }
@@ -211,7 +336,8 @@ mod tests {
     fn factory_patch_loads_into_the_headless_engine() {
         let mut instrument = crate::model::Project::demo().tracks[2].instrument.clone();
         instrument.preset = "Factory/Pads/Flux Capacitor".to_owned();
-        let mut engine = Engine::new(&instrument, 16_000.0).expect("factory Surge XT patch");
+        let mut engine =
+            Engine::new(&instrument, &[], &[], 16_000.0).expect("factory Surge XT patch");
         engine.play_note(60, 0.8, 1);
         let energy = (0..32)
             .map(|_| engine.process())
@@ -219,5 +345,27 @@ mod tests {
             .map(f32::abs)
             .sum::<f32>();
         assert!(energy > 0.001, "factory patch rendered silence");
+    }
+
+    #[test]
+    fn every_exposed_native_effect_loads_in_a_headless_slot() {
+        let instrument = crate::model::Project::demo().tracks[1].instrument.clone();
+        for name in SURGE_EFFECT_TYPES
+            .iter()
+            .skip(1)
+            .filter(|name| **name != "Audio Input")
+        {
+            let effect = Effect {
+                id: 77,
+                name: (*name).to_owned(),
+                mix: 0.5,
+                cutoff_hz: None,
+                resonance: None,
+                enabled: true,
+            };
+            let mut engine = Engine::new(&instrument, &[effect], &[77], 16_000.0)
+                .unwrap_or_else(|error| panic!("{name} did not load: {error}"));
+            engine.process();
+        }
     }
 }

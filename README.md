@@ -49,7 +49,7 @@ cargo run -- --port 8888
 2. Enter a request such as `increase the volume`, `add a bass`, `make the chords warm and spacious`, or `turn this section into a dubstep drop`.
 3. Press **Make change**, then use the transport to hear the result. The button becomes **Interrupt** while Gemini is working.
 4. Use session history to inspect earlier states and move forward again, or download the complete arrangement with **Export WAV**.
-5. Switch to **Advanced** to edit MIDI notes in the piano roll and select instrument, effect, and modulator nodes in the sound graph to edit their parameters. Tracks can also be created and deleted there. The **Debug** tab selects the Surge XT or built-in instrument backend, lists retained Gemini sessions, and provides a copyable environment and browser-error report.
+5. Switch to **Advanced** to edit MIDI notes in the piano roll and select instrument, effect, and modulator nodes in the sound graph to edit their parameters. Tracks can also be created and deleted there. The **Debug** tab selects the Surge XT or built-in sound engine for instruments and effects, lists retained Gemini sessions, and provides a copyable environment and browser-error report.
 
 No login is required. DAW-AI assigns each browser a private random cookie and stores its project under `users/<cookie>/sound-graph.json` beside `DAW_AI_PROJECT_PATH` (or beside the working-directory default). Each user has independent edit jobs, history, playback, backend selection, and project state. DAW-AI creates the demo graph for a new user and safely saves every accepted prompt, mixer change, Advanced edit, undo, reset, and history selection.
 

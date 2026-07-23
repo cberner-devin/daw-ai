@@ -395,7 +395,7 @@ impl Track {
             write!(
                 output,
                 concat!(
-                    "{{\"id\":{},\"type\":\"effect\",\"name\":{},",
+                    "{{\"id\":{},\"type\":\"effect\",\"engine\":\"Surge XT\",\"name\":{},",
                     "\"enabled\":{},\"parameters\":{{\"mix\":{}"
                 ),
                 effect.id,
@@ -1598,17 +1598,8 @@ impl Studio {
         name: &str,
         mix: f32,
     ) -> Result<u64, StudioError> {
-        if !matches!(
-            name,
-            "Reverb"
-                | "Room"
-                | "Echo"
-                | "Chorus"
-                | "Low-pass filter"
-                | "Punch compressor"
-                | "Drive"
-                | "Shimmer"
-        ) || !mix.is_finite()
+        if crate::surge::effect_type_index(name).is_none()
+            || !mix.is_finite()
             || !(0.0..=1.0).contains(&mix)
         {
             return Err(StudioError::InvalidSoundTool);
