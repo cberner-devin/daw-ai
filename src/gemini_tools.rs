@@ -414,7 +414,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
             "add_effect",
             "Add a named effect to one track and set its mix. Returns its stable ID.",
             object_schema(
-                serde_json::json!({"trackId":id(),"name":{"type":"string","enum":["Reverb","Room","Echo","Chorus","Low-pass filter","Punch compressor","Drive","Shimmer"]},"mix":{"type":"number","minimum":0,"maximum":1}}),
+                serde_json::json!({"trackId":id(),"name":{"type":"string","enum":["Delay","Reverb 1","Phaser","Rotary Speaker","Distortion","EQ","Frequency Shifter","Conditioner","Chorus","Vocoder","Reverb 2","Flanger","Ring Modulator","Airwindows","Neuron","Graphic EQ","Resonator","CHOW","Exciter","Ensemble","Combulator","Nimbus","Tape","Treemonster","Waveshaper","Mid-Side Tool","Spring Reverb","Bonsai","Floaty Delay","Convolution"]},"mix":{"type":"number","minimum":0,"maximum":1}}),
                 &["trackId", "name", "mix"],
             ),
         ),
