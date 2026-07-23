@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
@@ -9,6 +10,21 @@ pub(crate) struct Preset {
     pub(crate) category: String,
     pub(crate) name: String,
     pub(crate) path: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PresetFolder {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) preset_count: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct PresetLevel<'a> {
+    pub(crate) path: String,
+    pub(crate) parent: Option<String>,
+    pub(crate) folders: Vec<PresetFolder>,
+    pub(crate) presets: Vec<&'a Preset>,
 }
 
 pub(crate) fn catalog() -> Vec<Preset> {
@@ -29,28 +45,46 @@ pub(crate) fn find(id: &str) -> Option<Preset> {
     catalog().into_iter().find(|preset| preset.id == id)
 }
 
-pub(crate) fn search<'a>(
-    presets: &'a [Preset],
-    query: Option<&str>,
-    category: Option<&str>,
-) -> Vec<&'a Preset> {
-    let mut matches = presets
-        .iter()
-        .filter(|preset| category.is_none_or(|category| preset.category == category))
-        .filter_map(|preset| {
-            query
-                .map(|query| preset_score(preset, query))
-                .unwrap_or(Some(0))
-                .map(|score| (score, preset))
-        })
-        .collect::<Vec<_>>();
-    matches.sort_by(|(left_score, left), (right_score, right)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left.category.cmp(&right.category))
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    matches.into_iter().map(|(_, preset)| preset).collect()
+pub(crate) fn browse<'a>(presets: &'a [Preset], path: &str) -> Option<PresetLevel<'a>> {
+    let path = path.trim_matches('/');
+    if path != "Factory" && !path.starts_with(FACTORY_PREFIX) {
+        return None;
+    }
+    let relative = path.strip_prefix(FACTORY_PREFIX).unwrap_or("");
+    let prefix = if relative.is_empty() {
+        String::new()
+    } else {
+        format!("{relative}/")
+    };
+    let mut folders = BTreeMap::<String, usize>::new();
+    let mut direct = Vec::new();
+    let mut exists = relative.is_empty();
+    for preset in presets {
+        if preset.category == relative {
+            direct.push(preset);
+            exists = true;
+            continue;
+        }
+        let Some(remainder) = preset.category.strip_prefix(&prefix) else {
+            continue;
+        };
+        exists = true;
+        let child = remainder.split('/').next().unwrap_or(remainder);
+        *folders.entry(child.to_owned()).or_default() += 1;
+    }
+    exists.then(|| PresetLevel {
+        path: path.to_owned(),
+        parent: path.rsplit_once('/').map(|(parent, _)| parent.to_owned()),
+        folders: folders
+            .into_iter()
+            .map(|(name, preset_count)| PresetFolder {
+                path: format!("{path}/{name}"),
+                name,
+                preset_count,
+            })
+            .collect(),
+        presets: direct,
+    })
 }
 
 pub(crate) fn is_factory_id(value: &str) -> bool {
@@ -63,116 +97,6 @@ pub(crate) fn is_factory_id(value: &str) -> bool {
         && relative
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != "..")
-}
-
-fn preset_score(preset: &Preset, query: &str) -> Option<u32> {
-    let query = query.trim().to_ascii_lowercase();
-    if query.is_empty() {
-        return Some(0);
-    }
-    let id = preset.id.to_ascii_lowercase();
-    let category = preset.category.to_ascii_lowercase();
-    let name = preset.name.to_ascii_lowercase();
-    if name == query || id == query {
-        return Some(1_000);
-    }
-    if name.contains(&query) || id.contains(&query) {
-        return Some(900);
-    }
-    let query_words = words(&query);
-    let candidate_words = words(&format!("{category} {name}"));
-    if query_words
-        .iter()
-        .all(|query| candidate_words.iter().any(|candidate| candidate == query))
-    {
-        return Some(800);
-    }
-    let mut score = 0;
-    let mut matched = false;
-    for query_word in query_words {
-        if let Some(distance) = candidate_words
-            .iter()
-            .map(|candidate| edit_distance(&query_word, candidate))
-            .min()
-            .filter(|distance| *distance <= 2)
-        {
-            score += 600 - distance as u32 * 80;
-            matched = true;
-        }
-        if let Some(profile) = descriptor_profile(&query_word) {
-            if profile.categories.iter().any(|value| *value == category) {
-                score += 400;
-                matched = true;
-            }
-            for keyword in profile.keywords {
-                if name.contains(keyword) {
-                    score += 80;
-                }
-            }
-        }
-    }
-    matched.then_some(score)
-}
-
-struct DescriptorProfile {
-    categories: &'static [&'static str],
-    keywords: &'static [&'static str],
-}
-
-fn descriptor_profile(word: &str) -> Option<DescriptorProfile> {
-    let bass = DescriptorProfile {
-        categories: &["basses"],
-        keywords: &[
-            "dist", "fm", "crush", "evil", "behemoth", "doomsday", "monster", "grit", "dirty",
-        ],
-    };
-    match word {
-        "wobble" | "wub" | "growl" | "dub" | "dubstep" | "reese" | "neuro" => Some(bass),
-        "warm" | "lush" | "soft" | "dreamy" => Some(DescriptorProfile {
-            categories: &["pads", "polysynths"],
-            keywords: &["warm", "analog", "soft", "silk", "mellow", "lush"],
-        }),
-        "ambient" | "atmospheric" | "spacious" | "evolving" => Some(DescriptorProfile {
-            categories: &["pads", "fx"],
-            keywords: &["space", "drone", "evol", "atmos", "air", "cloud"],
-        }),
-        "pluck" | "plucky" | "mallet" => Some(DescriptorProfile {
-            categories: &["plucks"],
-            keywords: &["pluck", "bell", "mallet"],
-        }),
-        "acid" | "squelch" | "303" => Some(DescriptorProfile {
-            categories: &["basses", "sequences"],
-            keywords: &["acid", "squelch", "303"],
-        }),
-        "cinematic" | "impact" | "riser" | "transition" => Some(DescriptorProfile {
-            categories: &["fx", "pads"],
-            keywords: &["impact", "rise", "cinema", "sweep", "noise"],
-        }),
-        _ => None,
-    }
-}
-
-fn words(value: &str) -> Vec<String> {
-    value
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-fn edit_distance(left: &str, right: &str) -> usize {
-    let mut previous = (0..=right.len()).collect::<Vec<_>>();
-    let mut current = vec![0; right.len() + 1];
-    for (left_index, left_byte) in left.bytes().enumerate() {
-        current[0] = left_index + 1;
-        for (right_index, right_byte) in right.bytes().enumerate() {
-            current[right_index + 1] = (current[right_index] + 1)
-                .min(previous[right_index + 1] + 1)
-                .min(previous[right_index] + usize::from(left_byte != right_byte));
-        }
-        std::mem::swap(&mut previous, &mut current);
-    }
-    previous[right.len()]
 }
 
 fn factory_root() -> Option<PathBuf> {
@@ -248,30 +172,20 @@ mod tests {
     }
 
     #[test]
-    fn musical_descriptors_and_typos_rank_useful_presets() {
+    fn catalog_is_browsed_one_level_at_a_time() {
         let presets = catalog();
-        for query in ["wobble", "growl", "dubstep"] {
-            let matches = search(&presets, Some(query), None);
-            assert!(matches.len() > 10, "{query} returned too few presets");
-            assert!(
-                matches
-                    .iter()
-                    .take(10)
-                    .all(|preset| preset.category == "Basses"),
-                "{query} did not prioritize basses"
-            );
-            assert!(
-                matches.iter().take(10).any(|preset| {
-                    ["dist", "fm", "crush", "behemoth", "doomsday", "evil"]
-                        .iter()
-                        .any(|keyword| preset.name.to_ascii_lowercase().contains(keyword))
-                }),
-                "{query} did not prioritize designed bass names"
-            );
-        }
-        assert_eq!(
-            search(&presets, Some("Flux Capacitro"), Some("Pads"))[0].name,
-            "Flux Capacitor"
+        let root = browse(&presets, "Factory").expect("factory root");
+        assert!(root.presets.is_empty());
+        assert!(root.folders.iter().any(|folder| {
+            folder.name == "Pads" && folder.path == "Factory/Pads" && folder.preset_count > 10
+        }));
+        let pads = browse(&presets, "Factory/Pads").expect("pads");
+        assert_eq!(pads.parent.as_deref(), Some("Factory"));
+        assert!(
+            pads.presets
+                .iter()
+                .any(|preset| preset.name == "Flux Capacitor")
         );
+        assert!(browse(&presets, "Factory/Not Here").is_none());
     }
 }

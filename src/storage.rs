@@ -22,7 +22,7 @@ impl ProjectStore {
             let project = store.read()?;
             Ok((store, Studio::from_project(project)))
         } else {
-            let studio = Studio::new();
+            let studio = Studio::from_project(Project::initial());
             store.save(studio.project())?;
             Ok((store, studio))
         }
@@ -161,7 +161,7 @@ mod tests {
         let path = temporary_project_path("store");
         let (store, mut studio) = ProjectStore::open(path.clone()).expect("new store");
         studio
-            .configure_sound_tool(2, "instrument", 201, None, "preset", "Surge Lead")
+            .configure_sound_tool(1, "instrument", 101, None, "preset", "Surge Lead")
             .expect("valid graph edit");
         store.save(studio.project()).expect("saved graph");
 

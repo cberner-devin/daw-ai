@@ -2762,7 +2762,9 @@ mod tests {
             "daw-ai-server-test-{}-{id}.json",
             std::process::id()
         ));
-        let (store, studio) = ProjectStore::open(path.clone()).expect("test project store");
+        let (store, _) = ProjectStore::open(path.clone()).expect("test project store");
+        let studio = Studio::from_project(Project::demo());
+        store.save(studio.project()).expect("save demo fixture");
         (
             Router {
                 history: Arc::new(Mutex::new(ProjectHistory::new(studio.project().clone()))),

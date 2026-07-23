@@ -298,12 +298,10 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         }),
         function(
             PRESET_TOOL_NAME,
-            "Search the installed Surge XT factory preset catalog by name, category, typo-tolerant text, or musical character. Results are ranked by relevance and include stable IDs for set_surge_preset.",
+            "Browse one level of the installed Surge XT factory preset hierarchy. Start at Factory, choose a child folder from the returned musical metadata, and continue until preset IDs are returned for set_surge_preset.",
             object_schema(
                 serde_json::json!({
-                    "query":{"type":"string","maxLength":80,"description":"Optional name, category, approximate text, or musical descriptor such as wobble, growl, warm, ambient, pluck, acid, or riser."},
-                    "category":{"type":"string","maxLength":80,"description":"Optional exact category returned by this tool."},
-                    "limit":{"type":"integer","minimum":1,"maximum":100,"description":"Maximum matching presets to return; defaults to 40."}
+                    "path":{"type":"string","minLength":7,"maxLength":160,"description":"Exact folder path returned by a prior call. Omit to browse the Factory root."}
                 }),
                 &[],
             ),
@@ -532,63 +530,162 @@ pub(crate) fn list_surge_presets(arguments: &JsonValue) -> Result<String, String
     let object = arguments
         .as_object()
         .ok_or_else(|| "preset catalog arguments must be an object".to_owned())?;
-    let query = object
-        .get("query")
+    let path = object
+        .get("path")
         .map(|value| {
             value
                 .as_str()
                 .map(str::to_owned)
-                .ok_or_else(|| "query must be a string".to_owned())
-        })
-        .transpose()?;
-    let category = object
-        .get("category")
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| "category must be a string".to_owned())
-        })
-        .transpose()?;
-    let limit = object
-        .get("limit")
-        .map(|value| {
-            value
-                .as_u64()
-                .filter(|value| (1..=100).contains(value))
-                .map(|value| value as usize)
-                .ok_or_else(|| "limit must be an integer from 1 through 100".to_owned())
+                .ok_or_else(|| "path must be a string".to_owned())
         })
         .transpose()?
-        .unwrap_or(40);
+        .unwrap_or_else(|| "Factory".to_owned());
     let catalog = crate::surge_presets::catalog();
-    let mut categories = catalog
+    let level = crate::surge_presets::browse(&catalog, &path)
+        .ok_or_else(|| format!("preset folder does not exist: {path}; browse from Factory"))?;
+    let folders = level
+        .folders
         .iter()
-        .map(|preset| preset.category.clone())
-        .collect::<Vec<_>>();
-    categories.sort();
-    categories.dedup();
-    let matches = crate::surge_presets::search(&catalog, query.as_deref(), category.as_deref());
-    let presets = matches
-        .iter()
-        .take(limit)
-        .map(|preset| {
+        .map(|folder| {
+            let (description, suggested_roles) = preset_folder_metadata(&folder.path);
             serde_json::json!({
-                "id":preset.id,
-                "category":preset.category,
-                "name":preset.name
+                "name":folder.name,
+                "path":folder.path,
+                "presetCount":folder.preset_count,
+                "description":description,
+                "suggestedRoles":suggested_roles
             })
         })
         .collect::<Vec<_>>();
+    let presets = level
+        .presets
+        .iter()
+        .map(|preset| {
+            serde_json::json!({
+                "id":preset.id,
+                "name":preset.name,
+                "nameHints":preset_name_hints(&preset.name)
+            })
+        })
+        .collect::<Vec<_>>();
+    let (description, suggested_roles) = preset_folder_metadata(&level.path);
     Ok(serde_json::json!({
         "installed":!catalog.is_empty(),
         "total":catalog.len(),
-        "matched":matches.len(),
-        "returned":presets.len(),
-        "categories":categories,
+        "path":level.path,
+        "parent":level.parent,
+        "description":description,
+        "suggestedRoles":suggested_roles,
+        "folders":folders,
         "presets":presets
     })
     .to_string())
+}
+
+fn preset_folder_metadata(path: &str) -> (&'static str, &'static [&'static str]) {
+    let category = path
+        .strip_prefix("Factory/")
+        .unwrap_or(path)
+        .split('/')
+        .next()
+        .unwrap_or(path);
+    match category {
+        "Basses" => (
+            "Bass patches ranging from subs to harmonically rich and designed basses.",
+            &["bass"],
+        ),
+        "Brass" => (
+            "Synth and modeled brass colors for stabs, chords, and leads.",
+            &["chords", "lead"],
+        ),
+        "Chords" => (
+            "Patches designed for chordal playing and rhythmic stabs.",
+            &["chords"],
+        ),
+        "FX" => (
+            "Sound effects, transitions, atmospheres, impacts, and unusual textures.",
+            &["texture"],
+        ),
+        "Keys" => (
+            "Keyboard-like patches for harmony, riffs, and melodic parts.",
+            &["chords", "lead"],
+        ),
+        "Leads" => (
+            "Monophonic and polyphonic foreground synth voices.",
+            &["lead"],
+        ),
+        "MPE" => (
+            "Expressive patches designed for multidimensional performance.",
+            &["lead", "chords", "texture"],
+        ),
+        "Pads" => (
+            "Sustained, spacious, and evolving harmonic textures.",
+            &["chords", "texture"],
+        ),
+        "Percussion" => (
+            "Individual synthesized kicks, snares, toms, and percussion sounds.",
+            &["drums"],
+        ),
+        "Plucks" => (
+            "Short, percussive tonal patches for riffs, arpeggios, and melodies.",
+            &["lead", "chords"],
+        ),
+        "Polysynths" => (
+            "General polyphonic synthesizer patches for chords and stacked melodies.",
+            &["chords", "lead"],
+        ),
+        "Sequences" => (
+            "Rhythmic and internally animated patches that may carry their own motion.",
+            &["lead", "texture"],
+        ),
+        "Splits" => (
+            "Keyboard-split patches combining multiple timbral regions.",
+            &["chords", "lead"],
+        ),
+        "Templates" => (
+            "Sound-design starting points rather than finished role-specific patches.",
+            &["bass", "chords", "lead", "texture"],
+        ),
+        "Tutorials" => (
+            "Educational patches demonstrating Surge synthesis and modulation techniques.",
+            &["texture"],
+        ),
+        "Vocoder" => (
+            "Patches intended for vocoder-style or formant-focused sounds.",
+            &["lead", "texture"],
+        ),
+        "Winds" => (
+            "Synthesized and modeled wind-instrument colors.",
+            &["lead", "chords"],
+        ),
+        _ => ("Installed Surge XT factory preset folders.", &[]),
+    }
+}
+
+fn preset_name_hints(name: &str) -> Vec<&'static str> {
+    let name = name.to_ascii_lowercase();
+    [
+        ("sub", "sub-bass"),
+        ("dist", "distorted"),
+        ("dirty", "distorted"),
+        ("saw", "saw"),
+        ("fm", "fm"),
+        ("acid", "acid"),
+        ("pluck", "pluck"),
+        ("bell", "bell"),
+        ("warm", "warm"),
+        ("soft", "soft"),
+        ("pad", "pad"),
+        ("drone", "drone"),
+        ("kick", "kick"),
+        ("snare", "snare"),
+        ("seq", "sequence"),
+        ("vocal", "vocal"),
+        ("choir", "choir"),
+    ]
+    .into_iter()
+    .filter_map(|(needle, hint)| name.contains(needle).then_some(hint))
+    .collect()
 }
 
 pub(crate) fn is_mutation_tool(name: &str) -> bool {
@@ -1501,31 +1598,32 @@ mod tests {
     }
 
     #[test]
-    fn factory_presets_can_be_searched_and_loaded_by_stable_id() {
+    fn factory_presets_can_be_browsed_and_loaded_by_stable_id() {
+        let root: JsonValue =
+            serde_json::from_str(&list_surge_presets(&serde_json::json!({})).expect("preset root"))
+                .expect("root JSON");
+        assert!(root["total"].as_u64().unwrap() > 100);
+        assert_eq!(root["path"], "Factory");
+        let pads = root["folders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|folder| folder["path"] == "Factory/Pads")
+            .expect("Pads folder");
+        assert!(pads["presetCount"].as_u64().unwrap() > 10);
+        assert_eq!(pads["suggestedRoles"][0], "chords");
+
         let catalog: JsonValue = serde_json::from_str(
-            &list_surge_presets(&serde_json::json!({
-                "query":"Flux Capacitor",
-                "category":"Pads"
-            }))
-            .expect("preset catalog"),
+            &list_surge_presets(&serde_json::json!({"path":"Factory/Pads"})).expect("Pads catalog"),
         )
         .expect("catalog JSON");
-        assert!(catalog["total"].as_u64().unwrap() > 100);
-        assert_eq!(catalog["matched"], 1);
-        assert_eq!(catalog["presets"][0]["id"], "Factory/Pads/Flux Capacitor");
-
-        let character_search: JsonValue = serde_json::from_str(
-            &list_surge_presets(&serde_json::json!({"query":"dubstep growl","limit":10}))
-                .expect("character preset search"),
-        )
-        .expect("character search JSON");
-        assert!(character_search["matched"].as_u64().unwrap() > 10);
+        assert_eq!(catalog["parent"], "Factory");
         assert!(
-            character_search["presets"]
+            catalog["presets"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|preset| preset["category"] == "Basses")
+                .any(|preset| preset["id"] == "Factory/Pads/Flux Capacitor")
         );
 
         let session =
