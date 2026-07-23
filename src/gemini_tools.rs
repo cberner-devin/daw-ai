@@ -348,7 +348,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
             "trackId":id(), "label":{"type":"string","minLength":1,"maxLength":64},
             "startBeat":{"type":"number","minimum":0,"description":"Absolute beat from the start of the project."},
             "durationBeats":{"type":"number","minimum":0.25,"maximum":64},
-            "playback":{"description":"Use loop for deliberately repeating patterns and once for an evolving phrase.","oneOf":[
+            "playback":{"description":"Default to loop for drums, bass grooves, chord accompaniment, arpeggios, and riffs. Use once mainly for melodies, fills, transitions, or material whose individual events genuinely develop without repetition.","oneOf":[
                 {"type":"object","properties":{"mode":{"type":"string","enum":["loop"]},"lengthBeats":{"type":"number","minimum":0.25,"maximum":16}},"required":["mode","lengthBeats"],"additionalProperties":false},
                 {"type":"object","properties":{"mode":{"type":"string","enum":["once"]}},"required":["mode"],"additionalProperties":false}
             ]},
@@ -379,7 +379,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "add_midi_clip",
-            "Add a beat-positioned MIDI clip without changing other clips. Use loop for a repeating groove or riff and once for a melody, progression, fill, build, transition, or other evolving phrase.",
+            "Add a beat-positioned MIDI clip without changing other clips. Default rhythmic accompaniment to a 4-, 8-, or 16-beat loop; use once mainly for melody and genuinely non-repeating fills, transitions, or development.",
             object_schema(
                 clip_properties(),
                 &[
@@ -1527,6 +1527,22 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("you decide whether and when to listen")
+        );
+        let midi = declarations
+            .iter()
+            .find(|tool| tool["name"] == "add_midi_clip")
+            .expect("MIDI clip declaration");
+        assert!(
+            midi["description"]
+                .as_str()
+                .unwrap()
+                .contains("Default rhythmic accompaniment")
+        );
+        assert!(
+            midi["parameters"]["properties"]["playback"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Default to loop for drums")
         );
     }
 

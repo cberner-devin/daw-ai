@@ -605,7 +605,9 @@ fn system_instruction() -> String {
             "audible result is already certain. When you listen, reason from ",
             "the actual audio - not event-count proxies - about groove, beat subdivision, energy contour, ",
             "tension, impact, timbre, and contrast. If a style depends on intensification, express it ",
-            "through composition and rhythmic subdivision when appropriate; do not assume the project ",
+            "through composition and rhythmic subdivision when appropriate. Default drums, bass grooves, ",
+            "chord accompaniment, arpeggios, and repeated riffs to musical beat loops; reserve one-shot ",
+            "MIDI phrases mainly for melody and genuinely non-repeating fills or transitions. Do not assume the project ",
             "tempo must change. Continue until the result fulfills the request, then finish. There is no ",
             "separate completion reviewer. There is no ",
             "predetermined tool-call or iteration limit; the request timeout is the only loop limit.\n\n{}"
@@ -1369,6 +1371,8 @@ mod tests {
         assert!(instruction.contains("listen after each coherent"));
         assert!(instruction.contains("actual audio - not event-count proxies"));
         assert!(instruction.contains("rhythmic subdivision"));
+        assert!(instruction.contains("Default drums, bass grooves"));
+        assert!(instruction.contains("reserve one-shot MIDI phrases mainly for melody"));
         assert!(instruction.contains("tempo must change"));
         assert!(instruction.contains("no separate completion reviewer"));
         assert!(instruction.contains("no predetermined tool-call or iteration limit"));
