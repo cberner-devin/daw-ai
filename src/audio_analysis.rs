@@ -2585,7 +2585,7 @@ mod tests {
     }
 
     #[test]
-    fn surge_distortion_materially_changes_the_listening_render() {
+    fn one_native_effect_graph_drives_both_rendering_engines() {
         let mut project = Project::demo();
         let track_id = project
             .tracks
@@ -2593,7 +2593,10 @@ mod tests {
             .find(|track| track.role == TrackRole::Bass)
             .expect("demo bass")
             .id;
-        let baseline = render_region(&project, &[track_id], 0.0, 2.0).expect("baseline render");
+        let surge_baseline =
+            render_region(&project, &[track_id], 0.0, 2.0).expect("Surge baseline");
+        let builtin_baseline =
+            render_region_builtin(&project, &[track_id], 0.0, 2.0).expect("built-in baseline");
 
         project.tracks[1].effects.push(crate::model::Effect {
             id: 9_002,
@@ -2604,8 +2607,12 @@ mod tests {
             enabled: true,
         });
         project.tracks[1].routing.effect_order.push(9_002);
-        let driven = render_region(&project, &[track_id], 0.0, 2.0).expect("driven render");
-        assert!(sample_difference(&driven.samples, &baseline.samples) > 0.01);
+        let surge_driven =
+            render_region(&project, &[track_id], 0.0, 2.0).expect("Surge distortion");
+        let builtin_driven =
+            render_region_builtin(&project, &[track_id], 0.0, 2.0).expect("built-in distortion");
+        assert!(sample_difference(&surge_driven.samples, &surge_baseline.samples) > 0.01);
+        assert!(sample_difference(&builtin_driven.samples, &builtin_baseline.samples) > 0.01);
 
         project.tracks[1]
             .effects
@@ -2613,8 +2620,12 @@ mod tests {
             .find(|effect| effect.id == 9_002)
             .expect("distortion effect")
             .enabled = false;
-        let bypassed = render_region(&project, &[track_id], 0.0, 2.0).expect("bypassed render");
-        assert_eq!(bypassed.samples, baseline.samples);
+        let surge_bypassed =
+            render_region(&project, &[track_id], 0.0, 2.0).expect("bypassed Surge render");
+        let builtin_bypassed = render_region_builtin(&project, &[track_id], 0.0, 2.0)
+            .expect("bypassed built-in render");
+        assert_eq!(surge_bypassed.samples, surge_baseline.samples);
+        assert_eq!(builtin_bypassed.samples, builtin_baseline.samples);
     }
 
     #[test]

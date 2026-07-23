@@ -395,7 +395,7 @@ impl Track {
             write!(
                 output,
                 concat!(
-                    "{{\"id\":{},\"type\":\"effect\",\"engine\":\"Surge XT\",\"name\":{},",
+                    "{{\"id\":{},\"type\":\"effect\",\"name\":{},",
                     "\"enabled\":{},\"parameters\":{{\"mix\":{}"
                 ),
                 effect.id,
