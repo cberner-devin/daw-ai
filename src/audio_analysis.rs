@@ -563,6 +563,13 @@ fn render_track(
         SAMPLE_RATE as f32,
     )?;
     let mut event_index = midi.partition_point(|event| event.sample < start_sample);
+    let preset_parameters = [
+        ("attack", engine.instrument_parameter_value("attack")),
+        ("release", engine.instrument_parameter_value("release")),
+        ("cutoff", engine.instrument_parameter_value("cutoff")),
+        ("resonance", engine.instrument_parameter_value("resonance")),
+        ("pitch", engine.instrument_parameter_value("pitch")),
+    ];
     let mut output_index = 0;
     while output_index < output.len() {
         let block_start = start_sample + output_index;
@@ -576,7 +583,7 @@ fn render_track(
             }
         }
         let time = precise_sample_time(block_start);
-        for (name, target, base) in [
+        for (name, target, graph_base) in [
             ("attack", "instrument.attack", track.instrument.attack),
             ("release", "instrument.release", track.instrument.release),
             ("cutoff", "instrument.cutoff", track.instrument.cutoff),
@@ -587,6 +594,15 @@ fn render_track(
             ),
             ("pitch", "instrument.pitch", track.instrument.pitch),
         ] {
+            let base = if track.instrument.overrides(name) {
+                graph_base
+            } else {
+                preset_parameters
+                    .iter()
+                    .find_map(|(parameter, value)| (*parameter == name).then_some(*value))
+                    .flatten()
+                    .unwrap_or(graph_base)
+            };
             let mut value = parameter_at(project, track, render_state, target, base, time);
             if name == "cutoff" {
                 value += regional_filter_amount(project, track.role, time) * 0.25;

@@ -127,9 +127,19 @@ impl Engine {
             ("resonance", instrument.resonance),
             ("pitch", instrument.pitch),
         ] {
-            self.set_parameter(name, value)?;
+            if instrument.overrides(name) {
+                self.set_parameter(name, value)?;
+            }
         }
         Ok(())
+    }
+
+    pub(crate) fn instrument_parameter_value(&self, graph_name: &str) -> Option<f32> {
+        let native_name = NATIVE_PARAMETERS
+            .iter()
+            .find_map(|(graph, native)| (*graph == graph_name).then_some(*native))
+            .unwrap_or(graph_name);
+        self.parameter_value(native_name)
     }
 
     fn apply_preset(&mut self, preset: &str) -> Result<(), String> {
@@ -336,6 +346,7 @@ mod tests {
     fn factory_patch_loads_into_the_headless_engine() {
         let mut instrument = crate::model::Project::demo().tracks[2].instrument.clone();
         instrument.preset = "Factory/Pads/Flux Capacitor".to_owned();
+        instrument.parameter_overrides.clear();
         let mut engine =
             Engine::new(&instrument, &[], &[], 16_000.0).expect("factory Surge XT patch");
         engine.play_note(60, 0.8, 1);
@@ -345,6 +356,26 @@ mod tests {
             .map(f32::abs)
             .sum::<f32>();
         assert!(energy > 0.001, "factory patch rendered silence");
+    }
+
+    #[test]
+    fn factory_patch_parameters_change_only_when_explicitly_overridden() {
+        let mut instrument = crate::model::Project::demo().tracks[2].instrument.clone();
+        instrument.preset = "Factory/Leads/Violini Solo".to_owned();
+        instrument.parameter_overrides.clear();
+        instrument.cutoff = 0.01;
+        let native = Engine::new(&instrument, &[], &[], 16_000.0)
+            .expect("factory Surge XT patch")
+            .instrument_parameter_value("cutoff")
+            .expect("native cutoff");
+        assert!((native - instrument.cutoff).abs() > 0.01);
+
+        instrument.parameter_overrides.push("cutoff".to_owned());
+        let overridden = Engine::new(&instrument, &[], &[], 16_000.0)
+            .expect("overridden factory Surge XT patch")
+            .instrument_parameter_value("cutoff")
+            .expect("overridden cutoff");
+        assert!((overridden - instrument.cutoff).abs() < 0.001);
     }
 
     #[test]
