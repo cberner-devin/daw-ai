@@ -87,7 +87,19 @@
   const ERROR_TOAST_DISMISS_MS = 60_000;
   const LONG_PRESS_MS = 500;
   const LONG_PRESS_MOVE_TOLERANCE_PX = 10;
-  const SURGE_PRESETS = ["Init", "Surge Percussion", "Surge Bass", "Surge Pad", "Surge Lead", "Surge Atmosphere"];
+  const SURGE_PRESETS = [
+    "Init",
+    "Surge Kick",
+    "Surge Snare",
+    "Surge Closed Hat",
+    "Surge Open Hat",
+    "Surge Crash",
+    "Surge Percussion",
+    "Surge Bass",
+    "Surge Pad",
+    "Surge Lead",
+    "Surge Atmosphere",
+  ];
 
   class AudioEngine {
     constructor() {

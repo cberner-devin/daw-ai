@@ -2138,7 +2138,7 @@ async function run() {
       })`),
       {
         engines: ["Surge XT", "Surge XT", "Surge XT"],
-        presets: ["Surge Percussion", "Surge Bass", "Surge Pad"],
+        presets: ["Surge Kick", "Surge Bass", "Surge Pad"],
         nativeParameters: ["preset", "attack", "release", "cutoff", "resonance", "pitch"],
         filterParameters: [
           "mix",

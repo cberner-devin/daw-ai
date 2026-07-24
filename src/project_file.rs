@@ -1040,6 +1040,11 @@ fn parse_role(value: &str) -> Result<TrackRole, ProjectFileError> {
 fn surge_preset(value: &str) -> Result<&'static str, ProjectFileError> {
     match value {
         "Init" | "sine" => Ok("Init"),
+        "Surge Kick" => Ok("Surge Kick"),
+        "Surge Snare" => Ok("Surge Snare"),
+        "Surge Closed Hat" => Ok("Surge Closed Hat"),
+        "Surge Open Hat" => Ok("Surge Open Hat"),
+        "Surge Crash" => Ok("Surge Crash"),
         "Surge Percussion" => Ok("Surge Percussion"),
         "Surge Bass" | "square" => Ok("Surge Bass"),
         "Surge Pad" | "triangle" => Ok("Surge Pad"),
