@@ -516,7 +516,7 @@
             const left = (clip.start / duration) * 100;
             const width = ((clip.end - clip.start) / duration) * 100;
             return `<div class="clip audio-clip ${track.muted ? "is-muted" : ""}" style="left:${left}%;width:${width}%;--track-color:${track.color}">
-              <span class="clip-name">${escapeHtml(clip.label)}${clip.reversed ? " ↶" : ""}</span>
+              <span class="clip-name">${escapeHtml(clip.label)}${clip.reversed ? " (reversed)" : ""}</span>
               <span class="audio-waveform" aria-hidden="true">${Array.from({ length: 24 }, (_, index) => `<i style="--wave-height:${25 + ((index * 37 + clip.id) % 70)}%"></i>`).join("")}</span>
             </div>`;
           })
@@ -932,8 +932,8 @@
   }
 
   function renderAudioClipTimeline(track, clip) {
-    const flags = [clip.reversed ? "reversed" : null, `${clip.gain}x gain`].filter(Boolean).join(" · ");
-    return `<div class="clip-editor audio-clip-editor"><div class="audio-clip-summary"><span>${escapeHtml(clip.label)}</span><b>${clip.sourceDuration.toFixed(2)}s · ${flags}</b></div><div class="advanced-audio-waveform" aria-label="${escapeHtml(`${track.name} ${clip.label} audio clip`)}">${Array.from({ length: 64 }, (_, index) => `<i style="--wave-height:${20 + ((index * 43 + clip.id) % 78)}%"></i>`).join("")}</div></div>`;
+    const flags = [clip.reversed ? "reversed" : null, `${clip.gain}x gain`].filter(Boolean).join(" / ");
+    return `<div class="clip-editor audio-clip-editor"><div class="audio-clip-summary"><span>${escapeHtml(clip.label)}</span><b>${clip.sourceDuration.toFixed(2)}s / ${flags}</b></div><div class="advanced-audio-waveform" aria-label="${escapeHtml(`${track.name} ${clip.label} audio clip`)}">${Array.from({ length: 64 }, (_, index) => `<i style="--wave-height:${20 + ((index * 43 + clip.id) % 78)}%"></i>`).join("")}</div></div>`;
   }
 
   function renderPianoRoll(track, clip, selectedId) {
