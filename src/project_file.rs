@@ -162,6 +162,37 @@ fn parse_track(
         field(instrument_object, "parameters")?,
         "instrument parameters",
     )?;
+    let overrides = if let Some(value) = instrument_object.get("overrides") {
+        value
+            .as_array()
+            .ok_or_else(|| invalid("instrument overrides must be an array"))?
+            .iter()
+            .map(|value| {
+                let parameter = value
+                    .as_str()
+                    .ok_or_else(|| invalid("instrument overrides must be strings"))?;
+                if !matches!(
+                    parameter,
+                    "attack" | "release" | "cutoff" | "resonance" | "pitch"
+                ) {
+                    return Err(invalid("instrument override is unsupported"));
+                }
+                Ok(parameter.to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else if crate::surge_presets::is_factory_id(preset) {
+        Vec::new()
+    } else {
+        crate::model::instrument_parameter_names()
+    };
+    if overrides
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        != overrides.len()
+    {
+        return Err(invalid("instrument overrides must be unique"));
+    }
     let instrument = Instrument {
         id: instrument_id,
         engine: SURGE_ENGINE.to_owned(),
@@ -171,6 +202,7 @@ fn parse_track(
         cutoff: range(instrument_parameters, "cutoff", 0.0, 1.0)?,
         resonance: range(instrument_parameters, "resonance", 0.0, 1.0)?,
         pitch: range(instrument_parameters, "pitch", 0.0, 1.0)?,
+        parameter_overrides: overrides,
     };
 
     let effect_values = array(track, "effects")?;

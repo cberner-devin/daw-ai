@@ -106,6 +106,15 @@ pub struct Instrument {
     pub cutoff: f32,
     pub resonance: f32,
     pub pitch: f32,
+    pub parameter_overrides: Vec<String>,
+}
+
+impl Instrument {
+    pub(crate) fn overrides(&self, parameter: &str) -> bool {
+        self.parameter_overrides
+            .iter()
+            .any(|candidate| candidate == parameter)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -384,7 +393,7 @@ impl Track {
                 "\"volume\":{},\"muted\":{},\"instrument\":{{",
                 "\"id\":{},\"type\":\"instrument\",\"engine\":{},\"preset\":{},",
                 "\"parameters\":{{\"attack\":{},\"release\":{},",
-                "\"cutoff\":{},\"resonance\":{},\"pitch\":{}}}}},\"effects\":["
+                "\"cutoff\":{},\"resonance\":{},\"pitch\":{}}},\"overrides\":["
             ),
             self.id,
             json_string(&self.name),
@@ -402,6 +411,13 @@ impl Track {
             decimal(self.instrument.pitch)
         )
         .expect("writing to a string cannot fail");
+        for (index, parameter) in self.instrument.parameter_overrides.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            output.push_str(&json_string(parameter));
+        }
+        output.push_str("]},\"effects\":[");
 
         for (index, effect) in self.effects.iter().enumerate() {
             if index > 0 {
@@ -2142,6 +2158,11 @@ fn configure_instrument(
     if parameter == "preset" {
         return if valid_surge_preset(value) {
             instrument.preset = value.to_owned();
+            instrument.parameter_overrides = if crate::surge_presets::is_factory_id(value) {
+                Vec::new()
+            } else {
+                instrument_parameter_names()
+            };
             Ok(())
         } else {
             Err(StudioError::InvalidSoundTool)
@@ -2155,7 +2176,17 @@ fn configure_instrument(
         "pitch" => instrument.pitch = parse_range(value, 0.0, 1.0)?,
         _ => return Err(StudioError::InvalidSoundTool),
     }
+    if !instrument.overrides(parameter) {
+        instrument.parameter_overrides.push(parameter.to_owned());
+    }
     Ok(())
+}
+
+pub(crate) fn instrument_parameter_names() -> Vec<String> {
+    ["attack", "release", "cutoff", "resonance", "pitch"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
 }
 
 pub(crate) fn valid_surge_preset(value: &str) -> bool {
@@ -2451,6 +2482,7 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
             cutoff,
             resonance: 0.18,
             pitch: 0.5,
+            parameter_overrides: instrument_parameter_names(),
         },
         effects,
         modulators: vec![Modulator {
@@ -2674,12 +2706,33 @@ mod tests {
         let instrument = &studio.project().tracks[1].instrument;
         assert_eq!(instrument.engine, SURGE_ENGINE);
         assert_eq!(instrument.preset, "Surge Pad");
+        assert!(
+            instrument
+                .parameter_overrides
+                .contains(&"cutoff".to_owned())
+        );
 
         studio
             .configure_sound_tool(bass_id, "instrument", instrument_id, None, "cutoff", "0.4")
             .expect("manual Surge parameter");
         assert_eq!(studio.project().tracks[1].instrument.cutoff, 0.4);
         assert_eq!(studio.project().tracks[1].instrument.preset, "Surge Pad");
+        studio
+            .configure_sound_tool(
+                bass_id,
+                "instrument",
+                instrument_id,
+                None,
+                "preset",
+                "Factory/Leads/Violini Solo",
+            )
+            .expect("factory Surge preset");
+        assert!(
+            studio.project().tracks[1]
+                .instrument
+                .parameter_overrides
+                .is_empty()
+        );
         assert_eq!(
             studio.configure_sound_tool(
                 bass_id,
