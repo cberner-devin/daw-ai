@@ -74,6 +74,7 @@
     geminiSessions: [],
     projectHistory: { current: 0, entries: [] },
     graphNodeSelection: {},
+    midiEventSelection: {},
   };
   let historyLoadQueue = Promise.resolve();
 
@@ -719,6 +720,16 @@
           ?.focus({ preventScroll: true });
       });
     });
+    elements.channelList.querySelectorAll("[data-midi-event]").forEach((note) => {
+      note.addEventListener("click", () => {
+        const clipKey = note.closest("[data-clip-key]").dataset.clipKey;
+        state.midiEventSelection[clipKey] = Number(note.dataset.midiEvent);
+        renderAdvanced();
+        elements.channelList
+          .querySelector(`[data-clip-key="${clipKey}"] [data-tool-id="${note.dataset.midiEvent}"][data-parameter="pitch"]`)
+          ?.focus({ preventScroll: true });
+      });
+    });
     elements.channelList.querySelectorAll("[data-sound-tool]").forEach((control) => {
       validateSoundToolControl(control);
       if (control.matches('input[type="range"]')) {
@@ -914,7 +925,10 @@
     const playback = clip.playback?.mode === "once"
       ? `${clip.playback.lengthBeats} beat phrase`
       : `${clip.playback?.lengthBeats ?? clip.loopBeats} beat loop`;
-    return `<details class="clip-editor" data-clip-key="${track.id}-${clip.id}" open><summary><span>${escapeHtml(clip.label)}</span><b>${clip.events.length} events &middot; ${playback}</b></summary>${renderPianoRoll(track, clip)}</details>`;
+    const clipKey = `${track.id}-${clip.id}`;
+    const selectedId = state.midiEventSelection[clipKey];
+    const selected = clip.events.find((event) => event.id === selectedId);
+    return `<details class="clip-editor" data-clip-key="${clipKey}" open><summary><span>${escapeHtml(clip.label)}</span><b>${clip.events.length} events &middot; ${playback}</b></summary>${renderPianoRoll(track, clip, selectedId)}${selected ? renderMidiNoteInspector(track, clip, selected) : ""}</details>`;
   }
 
   function renderAudioClipTimeline(track, clip) {
@@ -922,7 +936,7 @@
     return `<div class="clip-editor audio-clip-editor"><div class="audio-clip-summary"><span>${escapeHtml(clip.label)}</span><b>${clip.sourceDuration.toFixed(2)}s · ${flags}</b></div><div class="advanced-audio-waveform" aria-label="${escapeHtml(`${track.name} ${clip.label} audio clip`)}">${Array.from({ length: 64 }, (_, index) => `<i style="--wave-height:${20 + ((index * 43 + clip.id) % 78)}%"></i>`).join("")}</div></div>`;
   }
 
-  function renderPianoRoll(track, clip) {
+  function renderPianoRoll(track, clip, selectedId) {
     if (clip.events.length === 0) return '<div class="empty-piano-roll">No notes in this clip</div>';
     const pitches = clip.events.map((event) => event.pitch);
     const minimum = Math.max(0, Math.floor(Math.min(...pitches) / 12) * 12);
@@ -944,12 +958,26 @@
         const left = (event.time / playbackBeats) * 100;
         const width = Math.max(0.8, (event.duration / playbackBeats) * 100);
         const top = (maximum - event.pitch) * rowHeight;
-        return `<span class="midi-note" role="img" style="--note-left:${left}%;--note-width:${width}%;--note-top:${top}%;--note-height:${rowHeight}%;--note-velocity:${event.velocity}" aria-label="${escapeHtml(`${midiNoteName(event.pitch)} at beat ${event.time}, length ${event.duration}, velocity ${event.velocity}`)}"><span>${escapeHtml(midiNoteName(event.pitch))}</span></span>`;
+        return `<button type="button" class="midi-note ${event.id === selectedId ? "is-selected" : ""}" data-midi-event="${event.id}" aria-pressed="${String(event.id === selectedId)}" style="--note-left:${left}%;--note-width:${width}%;--note-top:${top}%;--note-height:${rowHeight}%;--note-velocity:${event.velocity}" aria-label="${escapeHtml(`Edit ${midiNoteName(event.pitch)} at beat ${event.time}, length ${event.duration}, velocity ${event.velocity}`)}"><span>${escapeHtml(midiNoteName(event.pitch))}</span></button>`;
       })
       .join("");
     return `<div class="piano-roll" role="group" aria-label="${escapeHtml(`${track.name} ${clip.label} piano roll`)}">
       <div class="piano-keyboard" aria-hidden="true">${keys}</div>
       <div class="piano-grid" style="--pitch-row-height:${rowHeight}%;--beat-width:${beatWidth}%">${notes}</div>
+    </div>`;
+  }
+
+  function renderMidiNoteInspector(track, clip, event) {
+    const key = `${track.id}-clip-${clip.id}-event-${event.id}`;
+    const name = `${track.name} ${clip.label} note #${event.id}`;
+    const input = (label, parameter, value, minimum, maximum, step, exclusive = false) =>
+      `<label>${label}<input type="number" min="${minimum}" max="${maximum}" step="${step}" value="${value}" ${exclusive ? `data-maximum-exclusive="${maximum}"` : ""} data-sound-tool="event" data-track-id="${track.id}" data-tool-id="${event.id}" data-clip-id="${clip.id}" data-parameter="${parameter}" data-control-key="${key}-${parameter}" aria-label="${escapeHtml(`${name} ${label.toLowerCase()}`)}"></label>`;
+    return `<div class="midi-note-inspector" aria-label="${escapeHtml(`${name} editor`)}">
+      <strong>${escapeHtml(midiNoteName(event.pitch))}</strong>
+      ${input("Beat", "time", event.time, 0, clip.playback?.lengthBeats ?? clip.loopBeats, "any", true)}
+      ${input("Length", "duration", event.duration, 0.0625, clip.playback?.lengthBeats ?? clip.loopBeats, "any")}
+      ${input("Pitch", "pitch", event.pitch, 0, 127, 1)}
+      ${input("Velocity", "velocity", event.velocity, 0.01, 1, "any")}
     </div>`;
   }
 

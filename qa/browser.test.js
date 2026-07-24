@@ -2081,6 +2081,7 @@ async function run() {
         visibleInspectors: [...document.querySelectorAll('.node-inspector')].filter((pane) => !pane.hidden).length,
         pianoRolls: document.querySelectorAll('.piano-roll').length,
         visualNotes: document.querySelectorAll('.midi-note').length,
+        editableNotes: document.querySelectorAll('button.midi-note[data-midi-event]').length,
       }))()`);
     assert.deepEqual(
       advancedGraphSummary,
@@ -2091,9 +2092,42 @@ async function run() {
         visibleInspectors: 3,
         pianoRolls: 3,
         visualNotes: 22,
+        editableNotes: 22,
       },
       `Advanced must render selectable sound graphs and standard MIDI piano rolls (${JSON.stringify(advancedGraphSummary)})`,
     );
+    const projectBeforePianoRollEdit = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      document.querySelector('[data-clip-key="2-12"] [data-midi-event="1201"]').click();
+      const pitch = document.querySelector(
+        '[data-sound-tool="event"][data-track-id="2"][data-tool-id="1201"][data-parameter="pitch"]',
+      );
+      pitch.value = '34';
+      pitch.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.version === projectBeforePianoRollEdit.version + 1 &&
+        project.tracks[1].clips[0].events[0].pitch === 34;
+    }, "piano-roll note edit");
+    assert.equal(
+      await evaluate(
+        cdp,
+        appSession,
+        "document.activeElement.dataset.controlKey",
+      ),
+      "2-clip-12-event-1201-pitch",
+      "piano-roll note edits must restore focus to the selected note inspector",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => {
+      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
+      return project.tracks[1].clips[0].events[0].pitch === 33;
+    }, "piano-roll note edit undo");
     await evaluate(cdp, appSession, `document.querySelector(
       '[data-graph-node="effect:210"][data-track-id="2"]',
     ).click()`);

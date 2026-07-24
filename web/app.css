@@ -2015,10 +2015,49 @@ input[type="range"]::-moz-range-thumb {
 }
 
 .midi-note:hover,
-.midi-note:focus-visible {
+.midi-note:focus-visible,
+.midi-note.is-selected {
   z-index: 2;
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+
+.midi-note-inspector {
+  display: grid;
+  grid-template-columns: 48px repeat(4, minmax(0, 1fr));
+  align-items: end;
+  gap: 6px;
+  padding: 8px;
+  border-top: 1px solid var(--line);
+  background: #181a21;
+}
+
+.midi-note-inspector > strong {
+  align-self: center;
+  color: var(--track-color);
+  font-size: 9px;
+}
+
+.midi-note-inspector label {
+  display: grid;
+  gap: 3px;
+  color: var(--faint);
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.midi-note-inspector input {
+  width: 100%;
+  min-width: 0;
+  min-height: 28px;
+  padding: 4px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  color: var(--text);
+  background: #292c36;
+  font: inherit;
 }
 
 .empty-piano-roll {
