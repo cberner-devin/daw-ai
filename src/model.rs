@@ -1834,6 +1834,11 @@ impl Studio {
         {
             return Err(StudioError::InvalidSoundTool);
         }
+        let source_offset = if source.reversed {
+            source.source_offset + source.source_duration - spec.source_end
+        } else {
+            source.source_offset + spec.source_start
+        };
         self.create_audio_clip(
             track_id,
             AudioClip {
@@ -1842,7 +1847,7 @@ impl Studio {
                 start: spec.destination_start,
                 end: 0.0,
                 asset: source.asset,
-                source_offset: source.source_offset + spec.source_start,
+                source_offset,
                 source_duration: spec.source_end - spec.source_start,
                 gain: source.gain,
                 reversed: spec.reversed ^ source.reversed,
@@ -3324,6 +3329,65 @@ mod tests {
             studio.configure_sound_tool(track_id, "effect", disabled_id, None, "enabled", "true",),
             Err(StudioError::EffectCapacity)
         );
+    }
+
+    #[test]
+    fn slicing_reversed_audio_uses_playback_relative_coordinates() {
+        let sample_rate = crate::audio_analysis::SAMPLE_RATE as usize;
+        let path =
+            std::env::temp_dir().join(format!("daw-ai-reversed-slice-{}.wav", std::process::id()));
+        let samples = (0..sample_rate)
+            .map(|index| index as f32 / sample_rate as f32 * 0.8 - 0.4)
+            .collect::<Vec<_>>();
+        std::fs::write(&path, crate::audio_analysis::wav_bytes(&samples))
+            .expect("reversed slice fixture");
+
+        let mut studio = Studio::from_project(Project::initial());
+        let track_id = studio.project().tracks[0].id;
+        studio.project.tracks[0].volume = 1.0;
+        let source_id = studio
+            .create_audio_clip(
+                track_id,
+                AudioClip {
+                    id: 0,
+                    label: "Reversed source".to_owned(),
+                    start: 0.0,
+                    end: 0.0,
+                    asset: path.to_string_lossy().into_owned(),
+                    source_offset: 0.0,
+                    source_duration: 1.0,
+                    gain: 1.0,
+                    reversed: true,
+                },
+            )
+            .expect("source clip");
+        studio
+            .slice_audio_clip(
+                track_id,
+                source_id,
+                AudioClipSliceSpec {
+                    label: "Audible beginning",
+                    source_start: 0.0,
+                    source_end: 0.25,
+                    destination_start: 1.0,
+                    reversed: false,
+                },
+            )
+            .expect("reversed slice");
+
+        let sliced = &studio.project().tracks[0].audio_clips[1];
+        assert!((sliced.source_offset - 0.75).abs() < 0.000_01);
+        assert!(sliced.reversed);
+        let rendered =
+            crate::audio_analysis::render_region(studio.project(), &[track_id], 0.0, 1.25)
+                .expect("reversed clips render");
+        let quarter = sample_rate / 4;
+        assert_eq!(
+            crate::audio_analysis::pcm_bytes(&rendered.samples[..quarter]),
+            crate::audio_analysis::pcm_bytes(&rendered.samples[sample_rate..sample_rate + quarter])
+        );
+
+        std::fs::remove_file(path).expect("remove reversed slice fixture");
     }
 
     #[test]
