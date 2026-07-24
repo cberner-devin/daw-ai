@@ -290,6 +290,7 @@ fn render_builtin_samples(
             }
         }
         process_track_audio(project, track, &state, start_sample, &mut rendered, false);
+        mix_audio_clips(track, start_sample, &mut rendered)?;
         for (mixed, sample) in mix.iter_mut().zip(rendered) {
             *mixed += sample;
         }
@@ -468,6 +469,7 @@ fn render_audio_samples(
             &mut rendered,
             true,
         );
+        mix_audio_clips(track, start_sample, &mut rendered)?;
         for (output, sample) in mix.iter_mut().zip(rendered) {
             *output += sample;
         }
@@ -481,6 +483,62 @@ fn render_audio_samples(
         event_count,
         event_onsets,
     })
+}
+
+fn mix_audio_clips(
+    track: &Track,
+    render_start_sample: usize,
+    output: &mut [f32],
+) -> Result<(), String> {
+    for clip in &track.audio_clips {
+        let bytes = std::fs::read(&clip.asset)
+            .map_err(|error| format!("could not read audio clip {}: {error}", clip.asset))?;
+        let samples = decode_mono_pcm16_wav(&bytes)?;
+        let clip_start = playback_start_sample(clip.start);
+        let source_start = playback_start_sample(clip.source_offset).min(samples.len());
+        let source_count = playback_sample_count(0.0, clip.source_duration);
+        for source_index in 0..source_count {
+            let project_sample = clip_start.saturating_add(source_index);
+            if project_sample < render_start_sample {
+                continue;
+            }
+            let output_index = project_sample - render_start_sample;
+            if output_index >= output.len() {
+                break;
+            }
+            let relative = if clip.reversed {
+                source_count.saturating_sub(source_index + 1)
+            } else {
+                source_index
+            };
+            if let Some(sample) = samples.get(source_start.saturating_add(relative)) {
+                output[output_index] += *sample * clip.gain;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_mono_pcm16_wav(bytes: &[u8]) -> Result<Vec<f32>, String> {
+    if bytes.len() < 44
+        || &bytes[0..4] != b"RIFF"
+        || &bytes[8..12] != b"WAVE"
+        || u16::from_le_bytes([bytes[20], bytes[21]]) != 1
+        || u16::from_le_bytes([bytes[22], bytes[23]]) != 1
+        || u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]) != SAMPLE_RATE
+        || u16::from_le_bytes([bytes[34], bytes[35]]) != 16
+        || &bytes[36..40] != b"data"
+    {
+        return Err("audio clip must be a DAW-AI mono 16-bit WAV asset".to_owned());
+    }
+    let declared = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
+    let data = bytes
+        .get(44..44_usize.saturating_add(declared))
+        .ok_or_else(|| "audio clip WAV data is truncated".to_owned())?;
+    Ok(data
+        .chunks_exact(2)
+        .map(|sample| f32::from(i16::from_le_bytes([sample[0], sample[1]])) / f32::from(i16::MAX))
+        .collect())
 }
 
 pub(crate) fn wav_bytes(samples: &[f32]) -> Vec<u8> {
