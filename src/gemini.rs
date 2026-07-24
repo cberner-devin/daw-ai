@@ -89,6 +89,7 @@ pub struct GeminiEdit {
 struct LoopState {
     plans: Vec<EditPlan>,
     audio_listens: usize,
+    audio_artifacts: usize,
 }
 
 impl GeminiPlanner {
@@ -364,8 +365,9 @@ fn execute_tool(
                 .and_then(render_audio)
             {
                 Ok(audio) => {
+                    state.audio_artifacts += 1;
                     let name = session
-                        .record_audio(sequence * 100 + 99, &audio.wav)
+                        .record_audio(sequence * 1_000_000 + state.audio_artifacts, &audio.wav)
                         .map_err(PlannerError::Io)?;
                     let mut arguments = call.arguments.clone();
                     let arguments_object = arguments
@@ -409,8 +411,9 @@ fn execute_tool(
         {
             Ok(audio) => {
                 state.audio_listens += 1;
+                state.audio_artifacts += 1;
                 let audio_name = session
-                    .record_audio(sequence * 100 + state.audio_listens, &audio.wav)
+                    .record_audio(sequence * 1_000_000 + state.audio_artifacts, &audio.wav)
                     .map_err(PlannerError::Io)?;
                 let description = format!("{} Session artifact: {audio_name}.", audio.description);
                 let output = ToolOutput {
@@ -1444,6 +1447,54 @@ mod tests {
         )
         .expect("edited audio");
         assert_eq!(state.audio_listens, 2);
+    }
+
+    #[test]
+    fn multiple_resamples_in_one_interaction_get_unique_artifacts() {
+        let mut project = Project::initial();
+        project.duration = 4.0;
+        let session =
+            EditSession::create(&project, "make two resamples", 0.0, 4.0).expect("session");
+        let mut state = LoopState::default();
+        let mut render_audio = |_: AudioRenderRequest| {
+            Ok(AudioRender {
+                wav: crate::audio_analysis::wav_bytes(&vec![0.1; 16_000]),
+                description: "Rendered one second".to_owned(),
+            })
+        };
+        for (index, destination) in [0.0, 1.0].into_iter().enumerate() {
+            let resample = FunctionCall {
+                id: format!("resample-{index}"),
+                name: "resample_audio_region".to_owned(),
+                arguments: serde_json::json!({
+                    "sourceTracks": "all",
+                    "sourceStart": 0.0,
+                    "sourceEnd": 1.0,
+                    "targetTrackId": 1,
+                    "destinationStart": destination,
+                    "label": format!("Slice {}", index + 1),
+                    "gain": 1.0,
+                    "reversed": false
+                }),
+            };
+            execute_tool(
+                &session,
+                2,
+                &resample,
+                &mut state,
+                &mut render_audio,
+                &mut |edit| Ok(edit.project),
+            )
+            .expect("same-interaction resample");
+        }
+
+        let artifacts = std::fs::read_dir(session.path())
+            .expect("session artifacts")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("audio-"))
+            .count();
+        assert_eq!(artifacts, 2);
+        assert_eq!(state.audio_artifacts, 2);
     }
 
     #[test]

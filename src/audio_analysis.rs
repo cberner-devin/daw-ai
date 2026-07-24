@@ -755,6 +755,38 @@ fn set_surge_effect_controls(
             time,
         );
         engine.set_effect_mix(effect.id, mix)?;
+        if let Some(cutoff) = effect.cutoff_hz {
+            let value = parameter_at(
+                project,
+                track,
+                render_state,
+                &format!("effect:{}.cutoff", effect.id),
+                cutoff,
+                time,
+            );
+            engine.set_effect_parameter(
+                effect.id,
+                "cutoff",
+                crate::surge::normalize_filter_cutoff(value),
+            )?;
+        }
+        if let Some(resonance) = effect.resonance {
+            let value = parameter_at(
+                project,
+                track,
+                render_state,
+                &format!("effect:{}.resonance", effect.id),
+                resonance,
+                time,
+            );
+            engine.set_effect_parameter(
+                effect.id,
+                "resonance",
+                crate::surge::normalize_filter_resonance(value),
+            )?;
+        }
+        // Detailed EQ controls intentionally win when both compatibility surfaces
+        // address the same native band in one control frame.
         for (parameter, base) in &effect.parameters {
             let target = format!("effect:{}.{}", effect.id, parameter);
             if !effect.parameter_overrides.contains(parameter)
@@ -3101,6 +3133,46 @@ mod tests {
         assert!(
             modulation_difference > 0.000_1,
             "filter modulation render difference was {modulation_difference}"
+        );
+    }
+
+    #[test]
+    fn legacy_filter_controls_shape_the_surge_render() {
+        let mut project = Project::demo();
+        let track_index = project
+            .tracks
+            .iter()
+            .position(|track| track.role == TrackRole::Bass)
+            .expect("demo bass");
+        let track_id = project.tracks[track_index].id;
+        project.tracks[track_index].modulators.clear();
+        let baseline =
+            render_region(&project, &[track_id], 0.0, 2.0).expect("legacy filter baseline");
+
+        let effect_id = project.tracks[track_index].effects[0].id;
+        project.edits.push(Edit {
+            id: 9_120,
+            operation_id: None,
+            start: 0.0,
+            end: 2.0,
+            prompt: "Open the legacy filter".to_owned(),
+            summary: "Automated the legacy filter".to_owned(),
+            action: Action::Automation {
+                track_id,
+                parameter: format!("effect:{effect_id}.cutoff"),
+                curve: "hold",
+                points: vec![AutomationPoint {
+                    time: 0.0,
+                    value: crate::model::FILTER_CUTOFF_MAX_HZ,
+                }],
+                target: TrackRole::Bass,
+            },
+        });
+        let changed = render_region(&project, &[track_id], 0.0, 2.0).expect("legacy filter change");
+
+        assert!(
+            sample_difference(&baseline.samples, &changed.samples) > 0.001,
+            "legacy cutoff automation must reach Surge XT"
         );
     }
 

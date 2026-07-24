@@ -253,6 +253,39 @@ impl Engine {
                         .insert((effect.id, spec.name.to_owned()), native);
                 }
             }
+            if effect.name == "Low-pass filter" {
+                self.register_legacy_filter_parameters(effect, slot)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn register_legacy_filter_parameters(
+        &mut self,
+        effect: &Effect,
+        slot: &str,
+    ) -> Result<(), String> {
+        for (graph, native, value) in [
+            (
+                "cutoff",
+                "Frequency 3",
+                effect.cutoff_hz.map(normalize_filter_cutoff).unwrap_or(0.5),
+            ),
+            (
+                "resonance",
+                "Gain 3",
+                effect
+                    .resonance
+                    .map(normalize_filter_resonance)
+                    .unwrap_or(0.5),
+            ),
+        ] {
+            let native = format!("{slot} {native}");
+            if self.parameters.contains_key(&native) {
+                self.set_parameter(&native, value)?;
+                self.effect_parameters
+                    .insert((effect.id, graph.to_owned()), native);
+            }
         }
         Ok(())
     }
@@ -347,6 +380,21 @@ pub(crate) fn effect_type_index(name: &str) -> Option<usize> {
 
 pub(crate) fn is_native_effect(name: &str) -> bool {
     effect_type_index(name).is_some()
+}
+
+pub(crate) fn normalize_filter_cutoff(value: f32) -> f32 {
+    let minimum = crate::model::FILTER_CUTOFF_MIN_HZ;
+    let maximum = crate::model::FILTER_CUTOFF_MAX_HZ;
+    ((value.clamp(minimum, maximum) / minimum).ln() / (maximum / minimum).ln()).clamp(0.0, 1.0)
+}
+
+pub(crate) fn normalize_filter_resonance(value: f32) -> f32 {
+    ((value.clamp(
+        crate::model::FILTER_RESONANCE_MIN,
+        crate::model::FILTER_RESONANCE_MAX,
+    ) - crate::model::FILTER_RESONANCE_MIN)
+        / (crate::model::FILTER_RESONANCE_MAX - crate::model::FILTER_RESONANCE_MIN))
+        .clamp(0.0, 1.0)
 }
 
 fn parameter_map(synth: &SurgeSynthesizer) -> HashMap<String, i32> {
