@@ -844,10 +844,27 @@
           ),
         ].join("")
       : "";
+    const detailedControls = Object.entries(effect.parameters)
+      .filter(([parameter, value]) => !["mix", "cutoff", "resonance"].includes(parameter) && Number.isFinite(value))
+      .map(([parameter, value]) => soundRange(
+        track,
+        "effect",
+        effect.id,
+        effect.name,
+        parameter,
+        value,
+        0,
+        1,
+        "%",
+        "",
+        parameter.replace(/([A-Z])/g, " $1").replace(/^./, (letter) => letter.toUpperCase()),
+      ))
+      .join("");
     return `<div class="effect-card ${effect.enabled ? "" : "is-disabled"}">
       <div class="effect-card-heading"><span class="effect-pill"><strong>${escapeHtml(effect.name)}</strong> <b>${formatSoundValue(effect.parameters.mix, "%")}</b></span><code>#${effect.id}</code></div>
       ${soundRange(track, "effect", effect.id, effect.name, "mix", effect.parameters.mix, 0, 1, "%")}
       ${filterControls}
+      ${detailedControls}
       <div class="tool-actions">
         ${soundToggle(track, "effect", effect.id, effect.name, effect.enabled)}
         <button type="button" aria-label="${escapeHtml(`Move ${track.name} ${effect.name} effect #${effect.id} earlier`)}" ${index === 0 ? "disabled" : ""} data-sound-tool="routing" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="position" data-sound-value="${Math.max(0, index - 1)}" data-control-key="${track.id}-routing-${effect.id}-up">&uarr;</button>

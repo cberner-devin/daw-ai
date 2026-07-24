@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::{self, Write};
 
 use crate::prompt::{Action, PromptEngine};
@@ -94,6 +95,167 @@ pub struct Effect {
     pub cutoff_hz: Option<f32>,
     pub resonance: Option<f32>,
     pub enabled: bool,
+    pub parameters: BTreeMap<String, f32>,
+    pub parameter_overrides: Vec<String>,
+}
+
+pub(crate) struct EffectParameterSpec {
+    pub(crate) name: &'static str,
+    pub(crate) native: &'static str,
+    pub(crate) default: f32,
+}
+
+pub(crate) fn effect_parameter_specs(name: &str) -> &'static [EffectParameterSpec] {
+    match name {
+        "Delay" | "Echo" | "Floaty Delay" => &[
+            EffectParameterSpec {
+                name: "time",
+                native: "Left",
+                default: 0.35,
+            },
+            EffectParameterSpec {
+                name: "feedback",
+                native: "Feedback",
+                default: 0.3,
+            },
+            EffectParameterSpec {
+                name: "lowCut",
+                native: "Low Cut",
+                default: 0.15,
+            },
+            EffectParameterSpec {
+                name: "highCut",
+                native: "High Cut",
+                default: 0.8,
+            },
+            EffectParameterSpec {
+                name: "width",
+                native: "Width",
+                default: 0.75,
+            },
+        ],
+        "Reverb 1" | "Reverb 2" | "Reverb" | "Room" | "Spring Reverb" => &[
+            EffectParameterSpec {
+                name: "size",
+                native: "Room Size",
+                default: 0.55,
+            },
+            EffectParameterSpec {
+                name: "decay",
+                native: "Decay Time",
+                default: 0.5,
+            },
+            EffectParameterSpec {
+                name: "preDelay",
+                native: "Pre-Delay",
+                default: 0.15,
+            },
+            EffectParameterSpec {
+                name: "damping",
+                native: "HF Damping",
+                default: 0.55,
+            },
+            EffectParameterSpec {
+                name: "width",
+                native: "Width",
+                default: 0.8,
+            },
+        ],
+        "Distortion" | "Drive" | "Waveshaper" | "CHOW" | "Tape" => &[
+            EffectParameterSpec {
+                name: "drive",
+                native: "Drive",
+                default: 0.45,
+            },
+            EffectParameterSpec {
+                name: "tone",
+                native: "Frequency",
+                default: 0.55,
+            },
+            EffectParameterSpec {
+                name: "output",
+                native: "Gain",
+                default: 0.5,
+            },
+        ],
+        "EQ" | "Graphic EQ" | "Low-pass filter" => &[
+            EffectParameterSpec {
+                name: "lowGain",
+                native: "Gain 1",
+                default: 0.5,
+            },
+            EffectParameterSpec {
+                name: "midGain",
+                native: "Gain 2",
+                default: 0.5,
+            },
+            EffectParameterSpec {
+                name: "highGain",
+                native: "Gain 3",
+                default: 0.5,
+            },
+            EffectParameterSpec {
+                name: "lowFrequency",
+                native: "Frequency 1",
+                default: 0.3,
+            },
+            EffectParameterSpec {
+                name: "midFrequency",
+                native: "Frequency 2",
+                default: 0.5,
+            },
+            EffectParameterSpec {
+                name: "highFrequency",
+                native: "Frequency 3",
+                default: 0.7,
+            },
+        ],
+        "Conditioner" | "Punch compressor" => &[
+            EffectParameterSpec {
+                name: "threshold",
+                native: "Threshold",
+                default: 0.55,
+            },
+            EffectParameterSpec {
+                name: "attack",
+                native: "Attack Rate",
+                default: 0.35,
+            },
+            EffectParameterSpec {
+                name: "release",
+                native: "Release Rate",
+                default: 0.55,
+            },
+            EffectParameterSpec {
+                name: "output",
+                native: "Gain",
+                default: 0.5,
+            },
+        ],
+        "Phaser" | "Chorus" | "Flanger" | "Ensemble" => &[
+            EffectParameterSpec {
+                name: "rate",
+                native: "Rate",
+                default: 0.3,
+            },
+            EffectParameterSpec {
+                name: "depth",
+                native: "Depth",
+                default: 0.5,
+            },
+            EffectParameterSpec {
+                name: "feedback",
+                native: "Feedback",
+                default: 0.35,
+            },
+            EffectParameterSpec {
+                name: "width",
+                native: "Width",
+                default: 0.75,
+            },
+        ],
+        _ => &[],
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -468,7 +630,18 @@ impl Track {
                 write!(output, ",\"resonance\":{}", decimal(resonance))
                     .expect("writing to a string cannot fail");
             }
-            output.push_str("}}");
+            for (name, value) in &effect.parameters {
+                write!(output, ",{}:{}", json_string(name), decimal(*value))
+                    .expect("writing to a string cannot fail");
+            }
+            output.push_str("},\"overrides\":[");
+            for (index, parameter) in effect.parameter_overrides.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&json_string(parameter));
+            }
+            output.push_str("]}");
         }
 
         output.push_str("],\"modulators\":[");
@@ -2181,6 +2354,18 @@ fn configure_track_tool(
                     )?);
                 }
                 "enabled" => effect.enabled = parse_bool(value)?,
+                parameter if effect.parameters.contains_key(parameter) => {
+                    effect
+                        .parameters
+                        .insert(parameter.to_owned(), parse_range(value, 0.0, 1.0)?);
+                    if !effect
+                        .parameter_overrides
+                        .iter()
+                        .any(|candidate| candidate == parameter)
+                    {
+                        effect.parameter_overrides.push(parameter.to_owned());
+                    }
+                }
                 _ => return Err(StudioError::InvalidSoundTool),
             }
             Ok(())
@@ -2453,6 +2638,16 @@ fn modulation_targets(track: &Track) -> Vec<ModulationTarget> {
                 minimum: FILTER_RESONANCE_MIN,
                 maximum: FILTER_RESONANCE_MAX,
                 scale: 10.0,
+                mode: "add",
+            });
+        }
+        for parameter in effect.parameters.keys() {
+            targets.push(ModulationTarget {
+                id: format!("effect:{}.{}", effect.id, parameter),
+                label: format!("{} {}", effect.name, parameter),
+                minimum: 0.0,
+                maximum: 1.0,
+                scale: 1.0,
                 mode: "add",
             });
         }
@@ -2734,6 +2929,10 @@ const fn tool_id(track_id: u64, offset: u64) -> u64 {
 
 fn effect(id: u64, name: &str, mix: f32) -> Effect {
     let is_filter = name == "Low-pass filter";
+    let parameters = effect_parameter_specs(name)
+        .iter()
+        .map(|spec| (spec.name.to_owned(), spec.default))
+        .collect();
     Effect {
         id,
         name: name.to_owned(),
@@ -2741,6 +2940,8 @@ fn effect(id: u64, name: &str, mix: f32) -> Effect {
         cutoff_hz: is_filter.then_some(FILTER_CUTOFF_DEFAULT_HZ),
         resonance: is_filter.then_some(FILTER_RESONANCE_DEFAULT),
         enabled: true,
+        parameters,
+        parameter_overrides: Vec::new(),
     }
 }
 
@@ -3059,6 +3260,20 @@ mod tests {
         assert!(targets.contains(&"effect:210.mix".to_owned()));
         assert!(targets.contains(&"effect:210.cutoff".to_owned()));
         assert!(targets.contains(&"effect:210.resonance".to_owned()));
+        assert!(targets.contains(&"effect:210.lowGain".to_owned()));
+
+        studio
+            .configure_sound_tool(bass_id, "effect", 210, None, "lowGain", "0.72")
+            .expect("detailed effect parameter");
+        assert_eq!(
+            studio.project().tracks[1].effects[0].parameters["lowGain"],
+            0.72
+        );
+        assert!(
+            studio.project().tracks[1].effects[0]
+                .parameter_overrides
+                .contains(&"lowGain".to_owned())
+        );
 
         for target in &targets {
             studio

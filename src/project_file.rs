@@ -331,6 +331,40 @@ fn parse_effect(value: &JsonValue, ids: &mut HashSet<u64>) -> Result<Effect, Pro
     }
     let parameters = object(field(effect, "parameters")?, "effect parameters")?;
     let is_filter = name == "Low-pass filter";
+    let mut extra_parameters = std::collections::BTreeMap::new();
+    for spec in crate::model::effect_parameter_specs(&name) {
+        let value = parameters
+            .get(spec.name)
+            .and_then(JsonValue::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(spec.default);
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(invalid(format!(
+                "effect parameter {} must be between 0 and 1",
+                spec.name
+            )));
+        }
+        extra_parameters.insert(spec.name.to_owned(), value);
+    }
+    let parameter_overrides = effect
+        .get("overrides")
+        .and_then(JsonValue::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    let name = value
+                        .as_str()
+                        .ok_or_else(|| invalid("effect overrides must be strings"))?;
+                    if !extra_parameters.contains_key(name) {
+                        return Err(invalid("effect override is unsupported"));
+                    }
+                    Ok(name.to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     Ok(Effect {
         id,
         name,
@@ -356,6 +390,8 @@ fn parse_effect(value: &JsonValue, ids: &mut HashSet<u64>) -> Result<Effect, Pro
             None
         },
         enabled: boolean(effect, "enabled")?,
+        parameters: extra_parameters,
+        parameter_overrides,
     })
 }
 
