@@ -434,7 +434,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "resample_audio_region",
-            "Render selected tracks into a new immutable WAV asset and place it as an audio clip. Use this before slicing, reversing, or rearranging generated material.",
+            "Render selected tracks into a new immutable WAV asset and place it as an audio clip. Use this before slicing, reversing, or rearranging generated material. A track containing audio clips reserves one of Surge XT's eight serial effect slots, so it can have at most seven enabled graph effects.",
             object_schema(
                 serde_json::json!({
                     "sourceTracks":{"oneOf":[{"type":"string","enum":["all"]},{"type":"array","items":id(),"minItems":1,"maxItems":32,"uniqueItems":true}]},
@@ -491,7 +491,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "add_effect",
-            "Add a named effect with renderer-independent default controls and set its mix. Returns its stable ID; read the graph afterward to discover the effect family's exact configurable parameters.",
+            "Add a named effect with renderer-independent default controls and set its mix. Surge XT supports at most eight enabled graph effects per MIDI-only track or seven on a track containing resampled audio. Graph effects explicitly replace a preset's embedded serial effects. Returns the stable effect ID; read the graph afterward to discover the effect family's exact configurable parameters.",
             object_schema(
                 serde_json::json!({"trackId":id(),"name":{"type":"string","enum":["Delay","Reverb 1","Phaser","Rotary Speaker","Distortion","EQ","Frequency Shifter","Conditioner","Chorus","Vocoder","Reverb 2","Flanger","Ring Modulator","Airwindows","Neuron","Graphic EQ","Resonator","CHOW","Exciter","Ensemble","Combulator","Nimbus","Tape","Treemonster","Waveshaper","Mid-Side Tool","Spring Reverb","Bonsai","Floaty Delay","Convolution"]},"mix":{"type":"number","minimum":0,"maximum":1}}),
                 &["trackId", "name", "mix"],
@@ -1583,6 +1583,11 @@ fn studio_error_message(error: StudioError) -> String {
         StudioError::InvalidSoundTool => concat!(
             "A sound-tool value or connection is incompatible or outside its published range. ",
             "Use modulationTargets and the ranges in the graph contract."
+        )
+        .to_owned(),
+        StudioError::EffectCapacity => concat!(
+            "The Surge XT serial effect chain is full. Delete or disable an effect before adding ",
+            "another; tracks with resampled audio reserve one native slot for Audio Input."
         )
         .to_owned(),
     }

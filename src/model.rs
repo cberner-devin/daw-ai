@@ -1180,6 +1180,7 @@ pub enum StudioError {
     InvalidChannel,
     UnknownSoundTool,
     InvalidSoundTool,
+    EffectCapacity,
 }
 
 #[derive(Clone)]
@@ -1771,6 +1772,9 @@ impl Studio {
             .iter()
             .position(|track| track.id == track_id)
             .ok_or(StudioError::UnknownTrack)?;
+        if !track_effects_fit(&self.project.tracks[track_index], true) {
+            return Err(StudioError::EffectCapacity);
+        }
         let id = self.take_id();
         clip.id = id;
         clip.label = clip.label.trim().to_owned();
@@ -1975,6 +1979,9 @@ impl Studio {
             .iter()
             .position(|track| track.id == track_id)
             .ok_or(StudioError::UnknownTrack)?;
+        if !track_effects_fit_with_added_effect(&self.project.tracks[track_index]) {
+            return Err(StudioError::EffectCapacity);
+        }
         let id = self.take_id();
         self.remember();
         self.project.tracks[track_index]
@@ -2373,7 +2380,11 @@ fn configure_track_tool(
                 }
                 _ => return Err(StudioError::InvalidSoundTool),
             }
-            Ok(())
+            if track_effects_fit(track, !track.audio_clips.is_empty()) {
+                Ok(())
+            } else {
+                Err(StudioError::EffectCapacity)
+            }
         }
         "modulator" => {
             if parameter == "target" && !valid_modulator_target(track, value) {
@@ -2448,6 +2459,20 @@ fn configure_track_tool(
         "routing" => Err(StudioError::InvalidSoundTool),
         _ => Err(StudioError::UnknownSoundTool),
     }
+}
+
+pub(crate) fn track_effects_fit(track: &Track, has_audio_input: bool) -> bool {
+    let enabled = track.effects.iter().filter(|effect| effect.enabled).count();
+    let input_slots =
+        usize::from(has_audio_input && enabled > 0) * crate::surge::AUDIO_INPUT_EFFECT_SLOT_COUNT;
+    enabled + input_slots <= crate::surge::SERIAL_EFFECT_SLOT_COUNT
+}
+
+fn track_effects_fit_with_added_effect(track: &Track) -> bool {
+    let enabled = track.effects.iter().filter(|effect| effect.enabled).count() + 1;
+    let input_slots =
+        usize::from(!track.audio_clips.is_empty()) * crate::surge::AUDIO_INPUT_EFFECT_SLOT_COUNT;
+    enabled + input_slots <= crate::surge::SERIAL_EFFECT_SLOT_COUNT
 }
 
 fn validate_clip_fields(
@@ -3234,6 +3259,70 @@ mod tests {
         assert_ne!(
             studio.project().tracks[2].routing.effect_order[0],
             later_effect_id
+        );
+    }
+
+    #[test]
+    fn effect_capacity_keeps_every_committed_track_renderable() {
+        let mut studio = Studio::from_project(Project::initial());
+        let track_id = studio.project().tracks[0].id;
+        for _ in 0..crate::surge::SERIAL_EFFECT_SLOT_COUNT {
+            studio
+                .create_effect(track_id, "Distortion", 0.5)
+                .expect("native effect slot");
+        }
+        assert_eq!(
+            studio.create_effect(track_id, "Distortion", 0.5),
+            Err(StudioError::EffectCapacity)
+        );
+        assert_eq!(
+            studio.create_audio_clip(
+                track_id,
+                AudioClip {
+                    id: 0,
+                    label: "Needs input slot".to_owned(),
+                    start: 0.0,
+                    end: 0.0,
+                    asset: "/tmp/effect-capacity.wav".to_owned(),
+                    source_offset: 0.0,
+                    source_duration: 1.0,
+                    gain: 1.0,
+                    reversed: false,
+                },
+            ),
+            Err(StudioError::EffectCapacity)
+        );
+
+        studio
+            .configure_sound_tool(
+                track_id,
+                "effect",
+                studio.project().tracks[0].effects[0].id,
+                None,
+                "enabled",
+                "false",
+            )
+            .expect("release one slot");
+        studio
+            .create_audio_clip(
+                track_id,
+                AudioClip {
+                    id: 0,
+                    label: "Fits reserved input".to_owned(),
+                    start: 0.0,
+                    end: 0.0,
+                    asset: "/tmp/effect-capacity.wav".to_owned(),
+                    source_offset: 0.0,
+                    source_duration: 1.0,
+                    gain: 1.0,
+                    reversed: false,
+                },
+            )
+            .expect("audio input reservation");
+        let disabled_id = studio.project().tracks[0].effects[0].id;
+        assert_eq!(
+            studio.configure_sound_tool(track_id, "effect", disabled_id, None, "enabled", "true",),
+            Err(StudioError::EffectCapacity)
         );
     }
 

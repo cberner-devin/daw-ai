@@ -284,6 +284,11 @@ fn parse_track(
         clips,
         audio_clips,
     };
+    if !crate::model::track_effects_fit(&parsed, !parsed.audio_clips.is_empty()) {
+        return Err(invalid(format!(
+            "{context} exceeds Surge XT's serial effect capacity"
+        )));
+    }
     validate_modulator_targets(&parsed)?;
     Ok(parsed)
 }

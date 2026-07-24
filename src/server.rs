@@ -2700,6 +2700,7 @@ const fn studio_error_message(error: StudioError) -> &'static str {
         StudioError::InvalidChannel => "invalid channel change",
         StudioError::UnknownSoundTool => "sound tool not found",
         StudioError::InvalidSoundTool => "invalid sound tool setting",
+        StudioError::EffectCapacity => "Surge XT effect chain is full",
     }
 }
 
