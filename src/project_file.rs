@@ -309,6 +309,11 @@ fn parse_audio_clip(
         return Err(invalid("audio clip asset must be an absolute WAV path"));
     }
     let source_duration = range(clip, "sourceDuration", 0.001, 16.0)?;
+    if (end - (start + source_duration)).abs() > 0.000_1 {
+        return Err(invalid(
+            "audio clip end must equal start plus sourceDuration",
+        ));
+    }
     let source_offset = range(clip, "sourceOffset", 0.0, 16.0)?;
     if source_offset + source_duration > 16.001 {
         return Err(invalid("audio clip source range exceeds its asset"));
@@ -1357,6 +1362,27 @@ mod tests {
 
         let parsed = parse_project(&source).expect("valid retained clip slices");
         assert_eq!(parsed.to_json(), source);
+    }
+
+    #[test]
+    fn rejects_audio_clip_timing_that_disagrees_with_its_source_duration() {
+        let mut project = Project::initial();
+        project.tracks[0].audio_clips.push(crate::model::AudioClip {
+            id: 9_900,
+            label: "Slice".to_owned(),
+            start: 0.25,
+            end: 1.25,
+            asset: "/tmp/daw-ai-persisted-slice.wav".to_owned(),
+            source_offset: 0.0,
+            source_duration: 1.0,
+            gain: 1.0,
+            reversed: false,
+        });
+        let source = project.to_json();
+        parse_project(&source).expect("consistent audio clip timing");
+
+        let inconsistent = source.replacen("\"end\":1.25", "\"end\":0.75", 1);
+        assert!(parse_project(&inconsistent).is_err());
     }
 
     #[test]
