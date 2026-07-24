@@ -555,27 +555,22 @@
     const maximumPitch = Math.max(...pitches);
     const pitchSpan = Math.max(1, maximumPitch - minimumPitch);
     const notes = [];
-    let occurrenceIndex = 0;
-    for (let loop = 0; loop < loopCount; loop += 1) {
+    const renderedOccurrences = Math.min(occurrenceCount, 512);
+    for (let renderedIndex = 0; renderedIndex < renderedOccurrences; renderedIndex += 1) {
+      const occurrenceIndex = renderedIndex * stride;
+      const loop = Math.floor(occurrenceIndex / clip.events.length);
+      const event = clip.events[occurrenceIndex % clip.events.length];
       const loopStart = loop * loopDuration;
-      for (const event of clip.events) {
-        const noteStart = loopStart + event.time * beatDuration;
-        if (noteStart >= clipDuration) {
-          occurrenceIndex += 1;
-          continue;
-        }
-        if (occurrenceIndex % stride === 0) {
-          const noteDuration = Math.min(event.duration * beatDuration, clipDuration - noteStart);
-          const left = (noteStart / clipDuration) * 100;
-          const width = Math.max(0.35, (noteDuration / clipDuration) * 100);
-          const pitch = (maximumPitch - event.pitch) / pitchSpan;
-          const level = track.muted ? 0.06 : clamp(event.velocity * track.volume, 0.08, 1);
-          notes.push(
-            `<i style="--timeline-note-left:${left}%;--timeline-note-width:${width}%;--timeline-note-pitch:${pitch};--timeline-note-level:${level}"></i>`,
-          );
-        }
-        occurrenceIndex += 1;
-      }
+      const noteStart = loopStart + event.time * beatDuration;
+      if (noteStart >= clipDuration) continue;
+      const noteDuration = Math.min(event.duration * beatDuration, clipDuration - noteStart);
+      const left = (noteStart / clipDuration) * 100;
+      const width = Math.max(0.35, (noteDuration / clipDuration) * 100);
+      const pitch = (maximumPitch - event.pitch) / pitchSpan;
+      const level = track.muted ? 0.06 : clamp(event.velocity * track.volume, 0.08, 1);
+      notes.push(
+        `<i style="--timeline-note-left:${left}%;--timeline-note-width:${width}%;--timeline-note-pitch:${pitch};--timeline-note-level:${level}"></i>`,
+      );
     }
     return notes.join("");
   }
@@ -1901,7 +1896,7 @@
   }
 
   async function reset() {
-    if (!window.confirm("Reset to the original demo arrangement? You can still undo this.")) return;
+    if (!window.confirm("Reset to an empty project? You can still undo this.")) return;
     await enqueueProjectMutation(applyReset);
   }
 

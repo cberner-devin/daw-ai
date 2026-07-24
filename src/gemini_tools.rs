@@ -483,7 +483,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "delete_audio_clip",
-            "Delete one audio clip without deleting its immutable source asset.",
+            "Delete one audio clip inside the selected edit region without deleting its immutable source asset. The entire clip placement must be inside the selection.",
             object_schema(
                 serde_json::json!({"trackId":id(),"clipId":id()}),
                 &["trackId", "clipId"],
@@ -939,7 +939,7 @@ pub(crate) fn apply_agent_mutation(
             let track_id = required_id(object, "trackId")?;
             let clip_id = required_id(object, "clipId")?;
             studio
-                .delete_audio_clip(track_id, clip_id)
+                .delete_audio_clip(track_id, clip_id, selection_start, selection_end)
                 .map_err(studio_error_message)?;
             format!("Deleted audio clip {clip_id} from track {track_id}")
         }

@@ -2091,8 +2091,8 @@ async function run() {
         selectedNodes: 3,
         visibleInspectors: 3,
         pianoRolls: 3,
-        visualNotes: 22,
-        editableNotes: 22,
+        visualNotes: 14,
+        editableNotes: 14,
       },
       `Advanced must render selectable sound graphs and standard MIDI piano rolls (${JSON.stringify(advancedGraphSummary)})`,
     );
