@@ -36,6 +36,26 @@ struct EffectMixes {
     output_gain: f32,
 }
 
+#[derive(Default)]
+struct AudioAssetCache {
+    decoded: HashMap<String, Vec<f32>>,
+}
+
+impl AudioAssetCache {
+    fn samples(&mut self, asset: &str) -> Result<&[f32], String> {
+        if !self.decoded.contains_key(asset) {
+            let bytes = std::fs::read(asset)
+                .map_err(|error| format!("could not read audio clip {asset}: {error}"))?;
+            self.decoded
+                .insert(asset.to_owned(), decode_mono_pcm16_wav(&bytes)?);
+        }
+        Ok(self
+            .decoded
+            .get(asset)
+            .expect("decoded asset was inserted above"))
+    }
+}
+
 #[derive(Clone, Copy)]
 struct AutomationFrame {
     gain: f32,
@@ -256,6 +276,7 @@ fn render_builtin_samples(
     let end = precise_sample_time(end_sample);
     let mut mix = vec![0.0_f32; end_sample - start_sample];
     let mut event_onsets = Vec::new();
+    let mut audio_assets = AudioAssetCache::default();
     for track_id in track_ids {
         let track = project
             .tracks
@@ -301,7 +322,7 @@ fn render_builtin_samples(
                     * 0.16;
             }
         }
-        mix_audio_clips(track, start_sample, &mut rendered)?;
+        mix_audio_clips(track, start_sample, &mut rendered, &mut audio_assets)?;
         process_builtin_track_audio(project, track, &state, start_sample, &mut rendered);
         for (mixed, sample) in mix.iter_mut().zip(rendered) {
             *mixed += sample;
@@ -453,6 +474,7 @@ fn render_audio_samples(
     let sample_count = end_sample - start_sample;
     let mut mix = vec![0.0; sample_count.max(1)];
     let mut event_onsets = Vec::new();
+    let mut audio_assets = AudioAssetCache::default();
     for &track_id in track_ids {
         let track = project
             .tracks
@@ -464,7 +486,7 @@ fn render_audio_samples(
         }
         let mut rendered = vec![0.0; mix.len()];
         let mut audio_input = vec![0.0; mix.len()];
-        mix_audio_clips(track, start_sample, &mut audio_input)?;
+        mix_audio_clips(track, start_sample, &mut audio_input, &mut audio_assets)?;
         let render_state = TrackRenderState::new(project, track, start, end);
         render_track(
             project,
@@ -495,11 +517,10 @@ fn mix_audio_clips(
     track: &Track,
     render_start_sample: usize,
     output: &mut [f32],
+    audio_assets: &mut AudioAssetCache,
 ) -> Result<(), String> {
     for clip in &track.audio_clips {
-        let bytes = std::fs::read(&clip.asset)
-            .map_err(|error| format!("could not read audio clip {}: {error}", clip.asset))?;
-        let samples = decode_mono_pcm16_wav(&bytes)?;
+        let samples = audio_assets.samples(&clip.asset)?;
         let clip_start = playback_start_sample(clip.start);
         let source_start = playback_start_sample(clip.source_offset).min(samples.len());
         let source_count = playback_sample_count(0.0, clip.source_duration);
@@ -2123,6 +2144,9 @@ mod tests {
     use super::*;
     use crate::model::{AudioClip, Edit, Modulator};
     use crate::prompt::AutomationPoint;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static AUDIO_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
     fn automation_frame_at(project: &Project, track: &Track, time: f32) -> AutomationFrame {
         let time = f64::from(time);
@@ -2138,8 +2162,9 @@ mod tests {
 
     fn audio_clip_project() -> (Project, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!(
-            "daw-ai-audio-clip-routing-{}.wav",
-            std::process::id()
+            "daw-ai-audio-clip-routing-{}-{}.wav",
+            std::process::id(),
+            AUDIO_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
         ));
         let samples = (0..SAMPLE_RATE)
             .map(|index| (2.0 * PI * 220.0 * index as f32 / SAMPLE_RATE as f32).sin() * 0.25)
@@ -2160,6 +2185,22 @@ mod tests {
             reversed: false,
         });
         (project, path)
+    }
+
+    #[test]
+    fn audio_asset_cache_reuses_decoded_samples_for_shared_slices() {
+        let (project, path) = audio_clip_project();
+        let asset = &project.tracks[0].audio_clips[0].asset;
+        let mut cache = AudioAssetCache::default();
+        assert_eq!(
+            cache.samples(asset).expect("initial decode").len(),
+            SAMPLE_RATE as usize
+        );
+        std::fs::remove_file(path).expect("remove cached audio fixture");
+        assert_eq!(
+            cache.samples(asset).expect("cached decode").len(),
+            SAMPLE_RATE as usize
+        );
     }
 
     #[test]
