@@ -141,6 +141,27 @@ pub struct Clip {
 }
 
 #[derive(Clone, Debug)]
+pub struct AudioClip {
+    pub id: u64,
+    pub label: String,
+    pub start: f32,
+    pub end: f32,
+    pub asset: String,
+    pub source_offset: f32,
+    pub source_duration: f32,
+    pub gain: f32,
+    pub reversed: bool,
+}
+
+pub(crate) struct AudioClipSliceSpec<'a> {
+    pub(crate) label: &'a str,
+    pub(crate) source_start: f32,
+    pub(crate) source_end: f32,
+    pub(crate) destination_start: f32,
+    pub(crate) reversed: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct Modulator {
     pub id: u64,
     pub name: String,
@@ -172,6 +193,7 @@ pub struct Track {
     pub modulators: Vec<Modulator>,
     pub routing: Routing,
     pub clips: Vec<Clip>,
+    pub audio_clips: Vec<AudioClip>,
 }
 
 #[derive(Clone, Debug)]
@@ -306,6 +328,9 @@ impl Project {
                 for event in &clip.events {
                     highest = highest.max(event.id);
                 }
+            }
+            for clip in &track.audio_clips {
+                highest = highest.max(clip.id);
             }
         }
         highest
@@ -624,6 +649,29 @@ impl Track {
                 .expect("writing to a string cannot fail");
             }
             output.push_str("]}");
+        }
+        output.push_str("],\"audioClips\":[");
+        for (index, clip) in self.audio_clips.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            write!(
+                output,
+                concat!(
+                    "{{\"id\":{},\"label\":{},\"start\":{},\"end\":{},\"asset\":{},",
+                    "\"sourceOffset\":{},\"sourceDuration\":{},\"gain\":{},\"reversed\":{}}}"
+                ),
+                clip.id,
+                json_string(&clip.label),
+                decimal(clip.start),
+                decimal(clip.end),
+                json_string(&clip.asset),
+                decimal(clip.source_offset),
+                decimal(clip.source_duration),
+                decimal(clip.gain),
+                clip.reversed
+            )
+            .expect("writing to a string cannot fail");
         }
         output.push_str("]}");
     }
@@ -1515,6 +1563,109 @@ impl Studio {
             .sort_by(|left, right| left.start.total_cmp(&right.start));
         self.project.version += 1;
         Ok(clip_id)
+    }
+
+    pub(crate) fn create_audio_clip(
+        &mut self,
+        track_id: u64,
+        mut clip: AudioClip,
+    ) -> Result<u64, StudioError> {
+        clip.end = clip.start + clip.source_duration;
+        if clip.label.trim().is_empty()
+            || clip.label.chars().count() > 64
+            || !clip.start.is_finite()
+            || !clip.source_offset.is_finite()
+            || !clip.source_duration.is_finite()
+            || !clip.gain.is_finite()
+            || clip.start < 0.0
+            || clip.source_offset < 0.0
+            || !(0.001..=16.0).contains(&clip.source_duration)
+            || clip.end > self.project.duration
+            || !(0.0..=2.0).contains(&clip.gain)
+            || !std::path::Path::new(&clip.asset).is_absolute()
+            || !clip.asset.ends_with(".wav")
+        {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        let track_index = self
+            .project
+            .tracks
+            .iter()
+            .position(|track| track.id == track_id)
+            .ok_or(StudioError::UnknownTrack)?;
+        let id = self.take_id();
+        clip.id = id;
+        clip.label = clip.label.trim().to_owned();
+        self.remember();
+        self.project.tracks[track_index].audio_clips.push(clip);
+        self.project.tracks[track_index]
+            .audio_clips
+            .sort_by(|left, right| left.start.total_cmp(&right.start));
+        self.project.version += 1;
+        Ok(id)
+    }
+
+    pub(crate) fn delete_audio_clip(
+        &mut self,
+        track_id: u64,
+        clip_id: u64,
+    ) -> Result<(), StudioError> {
+        let track_index = self
+            .project
+            .tracks
+            .iter()
+            .position(|track| track.id == track_id)
+            .ok_or(StudioError::UnknownTrack)?;
+        let clip_index = self.project.tracks[track_index]
+            .audio_clips
+            .iter()
+            .position(|clip| clip.id == clip_id)
+            .ok_or(StudioError::UnknownSoundTool)?;
+        self.remember();
+        self.project.tracks[track_index]
+            .audio_clips
+            .remove(clip_index);
+        self.project.version += 1;
+        Ok(())
+    }
+
+    pub(crate) fn slice_audio_clip(
+        &mut self,
+        track_id: u64,
+        clip_id: u64,
+        spec: AudioClipSliceSpec<'_>,
+    ) -> Result<u64, StudioError> {
+        let source = self
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .ok_or(StudioError::UnknownTrack)?
+            .audio_clips
+            .iter()
+            .find(|clip| clip.id == clip_id)
+            .ok_or(StudioError::UnknownSoundTool)?
+            .clone();
+        if spec.source_start < 0.0
+            || spec.source_end <= spec.source_start
+            || spec.source_end > source.source_duration
+        {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        self.create_audio_clip(
+            track_id,
+            AudioClip {
+                id: 0,
+                label: spec.label.to_owned(),
+                start: spec.destination_start,
+                end: 0.0,
+                asset: source.asset,
+                source_offset: source.source_offset + spec.source_start,
+                source_duration: spec.source_end - spec.source_start,
+                gain: source.gain,
+                reversed: spec.reversed ^ source.reversed,
+            },
+        )
     }
 
     pub(crate) fn replace_midi_clip(
@@ -2505,6 +2656,7 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
             output: "master".to_owned(),
         },
         clips: Vec::new(),
+        audio_clips: Vec::new(),
     }
 }
 

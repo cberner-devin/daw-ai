@@ -344,26 +344,60 @@ fn execute_tool(
             list_surge_presets(&call.arguments)
                 .unwrap_or_else(|error| format!("Tool error: {error}")),
         )),
-        name if is_mutation_tool(name) => {
-            match apply_agent_mutation(session.path(), name, &call.arguments) {
-                Ok(message) => {
-                    let (plan, project) = session
-                        .take_update()
-                        .map_err(|message| invalid(&message))?
-                        .ok_or_else(|| invalid("mutation tool did not publish its graph update"))?;
-                    let committed = on_update(GeminiEdit {
-                        plan: plan.clone(),
-                        project,
-                    })?;
-                    session
-                        .synchronize_project(&committed)
-                        .map_err(|message| invalid(&message))?;
-                    state.plans.push(plan);
-                    Ok(ToolOutput::text(message))
+        "resample_audio_region" => {
+            let object = call
+                .arguments
+                .as_object()
+                .ok_or_else(|| invalid("resample arguments must be an object"))?;
+            let render_arguments = serde_json::json!({
+                "tracks": object.get("sourceTracks").cloned().unwrap_or(JsonValue::String("all".to_owned())),
+                "start": object.get("sourceStart").cloned().unwrap_or(JsonValue::Null),
+                "end": object.get("sourceEnd").cloned().unwrap_or(JsonValue::Null)
+            });
+            let output = match prepare_audio_render(session.path(), &render_arguments)
+                .and_then(render_audio)
+            {
+                Ok(audio) => {
+                    let name = session
+                        .record_audio(sequence * 100 + 99, &audio.wav)
+                        .map_err(PlannerError::Io)?;
+                    let mut arguments = call.arguments.clone();
+                    let arguments_object = arguments
+                        .as_object_mut()
+                        .expect("validated resample arguments object");
+                    arguments_object.insert(
+                        "asset".to_owned(),
+                        JsonValue::String(
+                            session.path().join(&name).to_string_lossy().into_owned(),
+                        ),
+                    );
+                    let duration = object
+                        .get("sourceEnd")
+                        .and_then(JsonValue::as_f64)
+                        .zip(object.get("sourceStart").and_then(JsonValue::as_f64))
+                        .map(|(end, start)| end - start)
+                        .ok_or_else(|| invalid("resample source times must be numbers"))?;
+                    arguments_object
+                        .insert("sourceDuration".to_owned(), serde_json::json!(duration));
+                    apply_and_commit_mutation(
+                        session,
+                        &arguments,
+                        "resample_audio_region",
+                        state,
+                        on_update,
+                    )?
                 }
-                Err(error) => Ok(ToolOutput::text(format!("Tool error: {error}"))),
-            }
+                Err(error) => format!("Tool error: {error}"),
+            };
+            Ok(ToolOutput::text(output))
         }
+        name if is_mutation_tool(name) => Ok(ToolOutput::text(apply_and_commit_mutation(
+            session,
+            &call.arguments,
+            name,
+            state,
+            on_update,
+        )?)),
         AUDIO_TOOL_NAME => match prepare_audio_render(session.path(), &call.arguments)
             .and_then(render_audio)
         {
@@ -404,6 +438,33 @@ fn execute_tool(
             "Tool error: unknown tool {}",
             call.name
         ))),
+    }
+}
+
+fn apply_and_commit_mutation(
+    session: &EditSession,
+    arguments: &JsonValue,
+    name: &str,
+    state: &mut LoopState,
+    on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
+) -> Result<String, PlannerError> {
+    match apply_agent_mutation(session.path(), name, arguments) {
+        Ok(message) => {
+            let (plan, project) = session
+                .take_update()
+                .map_err(|message| invalid(&message))?
+                .ok_or_else(|| invalid("mutation tool did not publish its graph update"))?;
+            let committed = on_update(GeminiEdit {
+                plan: plan.clone(),
+                project,
+            })?;
+            session
+                .synchronize_project(&committed)
+                .map_err(|message| invalid(&message))?;
+            state.plans.push(plan);
+            Ok(message)
+        }
+        Err(error) => Ok(format!("Tool error: {error}")),
     }
 }
 

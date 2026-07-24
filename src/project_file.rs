@@ -252,6 +252,20 @@ fn parse_track(
         .iter()
         .map(|value| parse_clip(value, project_duration, ids, event_ids))
         .collect::<Result<Vec<_>, _>>()?;
+    let audio_clip_values = track
+        .get("audioClips")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if audio_clip_values.len() > MAX_CLIPS_PER_TRACK {
+        return Err(invalid(format!(
+            "{context} supports at most {MAX_CLIPS_PER_TRACK} audio clips"
+        )));
+    }
+    let audio_clips = audio_clip_values
+        .iter()
+        .map(|value| parse_audio_clip(value, project_duration, ids))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let parsed = Track {
         id,
@@ -268,9 +282,43 @@ fn parse_track(
             output,
         },
         clips,
+        audio_clips,
     };
     validate_modulator_targets(&parsed)?;
     Ok(parsed)
+}
+
+fn parse_audio_clip(
+    value: &JsonValue,
+    project_duration: f32,
+    ids: &mut HashSet<u64>,
+) -> Result<crate::model::AudioClip, ProjectFileError> {
+    let clip = object(value, "audio clip")?;
+    let start = range(clip, "start", 0.0, project_duration)?;
+    let end = range(clip, "end", 0.0, project_duration)?;
+    if end <= start {
+        return Err(invalid("audio clip end must be after its start"));
+    }
+    let asset = limited_string(clip, "asset", 1, 1_024)?;
+    if !std::path::Path::new(&asset).is_absolute() || !asset.ends_with(".wav") {
+        return Err(invalid("audio clip asset must be an absolute WAV path"));
+    }
+    let source_duration = range(clip, "sourceDuration", 0.001, 16.0)?;
+    let source_offset = range(clip, "sourceOffset", 0.0, 16.0)?;
+    if source_offset + source_duration > 16.001 {
+        return Err(invalid("audio clip source range exceeds its asset"));
+    }
+    Ok(crate::model::AudioClip {
+        id: unique_id(clip, "id", ids, "audio clip")?,
+        label: limited_string(clip, "label", 1, 64)?,
+        start,
+        end,
+        asset,
+        source_offset,
+        source_duration,
+        gain: range(clip, "gain", 0.0, 2.0)?,
+        reversed: boolean(clip, "reversed")?,
+    })
 }
 
 fn parse_effect(value: &JsonValue, ids: &mut HashSet<u64>) -> Result<Effect, ProjectFileError> {
