@@ -8,6 +8,11 @@ use surge_rs::glue::synthesizer::{SurgeId, SurgeSynthesizer};
 use crate::model::{Effect, Instrument};
 
 pub(crate) const BLOCK_SIZE: usize = 32;
+pub(crate) const SERIAL_EFFECT_SLOT_COUNT: usize = 8;
+pub(crate) const AUDIO_INPUT_EFFECT_SLOT_COUNT: usize = 1;
+const SERIAL_EFFECT_SLOTS: [&str; SERIAL_EFFECT_SLOT_COUNT] = [
+    "FX A1", "FX A2", "FX A3", "FX A4", "FX G1", "FX G2", "FX G3", "FX G4",
+];
 
 // The alpha binding does not expose Surge's parameter count. This comfortably
 // covers the current engine while from_synth_side_id rejects unused indices.
@@ -187,17 +192,27 @@ impl Engine {
     }
 
     fn apply_effects(&mut self, effects: &[Effect], effect_order: &[u64]) -> Result<(), String> {
-        let slots = [
-            "FX A1", "FX A2", "FX A3", "FX A4", "FX G1", "FX G2", "FX G3", "FX G4",
-        ];
-        let mut available = slots
-            .into_iter()
-            .filter(|slot| {
-                self.parameter_value(&format!("{slot} FX Type"))
-                    .is_some_and(|value| value < 0.02)
+        let enabled = effect_order
+            .iter()
+            .filter(|effect_id| {
+                effects.iter().any(|effect| {
+                    effect.id == **effect_id && effect.enabled && is_native_effect(&effect.name)
+                })
             })
-            .collect::<Vec<_>>()
-            .into_iter();
+            .count();
+        if enabled > SERIAL_EFFECT_SLOT_COUNT {
+            return Err(format!(
+                "Surge XT supports at most {SERIAL_EFFECT_SLOT_COUNT} enabled track effects"
+            ));
+        }
+        // Once the graph declares effects it owns the complete serial chain.
+        // Preset effects are replaced so capacity and ordering never depend on hidden preset state.
+        for slot in SERIAL_EFFECT_SLOTS {
+            self.set_parameter(&format!("{slot} FX Type"), 0.0)?;
+        }
+        self.synth.process();
+        self.parameters = parameter_map(&self.synth);
+        let mut available = SERIAL_EFFECT_SLOTS.into_iter();
         for effect_id in effect_order {
             let Some(effect) = effects.iter().find(|effect| {
                 effect.id == *effect_id && effect.enabled && is_native_effect(&effect.name)
@@ -207,8 +222,9 @@ impl Engine {
             let type_index = effect_type_index(&effect.name)
                 .ok_or_else(|| format!("unsupported Surge XT effect: {}", effect.name))?;
             let slot = available.next().ok_or_else(|| {
-                "Surge XT has no free serial effect slots after loading the instrument preset"
-                    .to_owned()
+                format!(
+                    "Surge XT supports at most {SERIAL_EFFECT_SLOT_COUNT} enabled track effects"
+                )
             })?;
             self.set_parameter(
                 &format!("{slot} FX Type"),
@@ -246,6 +262,17 @@ impl Engine {
         self.synth
             .from_synth_side_id(*index, &mut id)
             .then(|| self.synth.get_parameter01(&mut id))
+    }
+
+    #[cfg(test)]
+    fn occupied_effect_slots(&self) -> usize {
+        SERIAL_EFFECT_SLOTS
+            .iter()
+            .filter(|slot| {
+                self.parameter_value(&format!("{slot} FX Type"))
+                    .is_some_and(|value| value >= 0.02)
+            })
+            .count()
     }
 }
 
@@ -480,6 +507,46 @@ mod tests {
             .instrument_parameter_value("cutoff")
             .expect("overridden cutoff");
         assert!((overridden - instrument.cutoff).abs() < 0.001);
+    }
+
+    #[test]
+    fn graph_effects_replace_busy_factory_slots_up_to_the_native_limit() {
+        let mut instrument = crate::model::Project::demo().tracks[2].instrument.clone();
+        instrument.preset = "Factory/Pads/Flux Capacitor".to_owned();
+        instrument.parameter_overrides.clear();
+        let mut engine =
+            Engine::new(&instrument, &[], &[], 16_000.0).expect("factory Surge XT patch");
+        engine
+            .set_parameter(
+                "FX A1 FX Type",
+                effect_type_index("Reverb 2").expect("reverb type") as f32
+                    / (SURGE_EFFECT_TYPES.len() - 1) as f32,
+            )
+            .expect("embedded preset effect");
+        engine.synth.process();
+        engine.parameters = parameter_map(&engine.synth);
+        assert_eq!(engine.occupied_effect_slots(), 1);
+
+        let effects = (0..SERIAL_EFFECT_SLOT_COUNT)
+            .map(|index| Effect {
+                id: 100 + index as u64,
+                name: "Distortion".to_owned(),
+                mix: 0.5,
+                cutoff_hz: None,
+                resonance: None,
+                enabled: true,
+                parameters: crate::model::effect_parameter_specs("Distortion")
+                    .iter()
+                    .map(|spec| (spec.name.to_owned(), spec.default))
+                    .collect(),
+                parameter_overrides: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let order = effects.iter().map(|effect| effect.id).collect::<Vec<_>>();
+        engine
+            .apply_effects(&effects, &order)
+            .expect("full graph-owned Surge effect chain");
+        assert_eq!(engine.occupied_effect_slots(), SERIAL_EFFECT_SLOT_COUNT);
     }
 
     #[test]
