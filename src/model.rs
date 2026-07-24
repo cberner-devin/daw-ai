@@ -1791,7 +1791,12 @@ impl Studio {
         &mut self,
         track_id: u64,
         clip_id: u64,
+        selection_start: f32,
+        selection_end: f32,
     ) -> Result<(), StudioError> {
+        if selection_end <= selection_start {
+            return Err(StudioError::InvalidSelection);
+        }
         let track_index = self
             .project
             .tracks
@@ -1803,6 +1808,10 @@ impl Studio {
             .iter()
             .position(|clip| clip.id == clip_id)
             .ok_or(StudioError::UnknownSoundTool)?;
+        let clip = &self.project.tracks[track_index].audio_clips[clip_index];
+        if clip.start < selection_start || clip.end > selection_end {
+            return Err(StudioError::InvalidSelection);
+        }
         self.remember();
         self.project.tracks[track_index]
             .audio_clips
@@ -2557,7 +2566,7 @@ pub(crate) fn instrument_parameter_names() -> Vec<String> {
 }
 
 pub(crate) fn valid_surge_preset(value: &str) -> bool {
-    SURGE_PRESETS.contains(&value) || crate::surge_presets::is_factory_id(value)
+    SURGE_PRESETS.contains(&value) || crate::surge_presets::find(value).is_some()
 }
 
 fn parse_range(value: &str, minimum: f32, maximum: f32) -> Result<f32, StudioError> {
@@ -2904,17 +2913,9 @@ fn pattern_events(clip_id: u64, role: TrackRole) -> Vec<ClipEvent> {
     let specs: Vec<(&str, f32, f32, u8, f32)> = match role {
         TrackRole::Drums => vec![
             ("note", 0.0, 0.25, 36, 0.92),
-            ("note", 0.0, 0.12, 42, 0.58),
-            ("note", 0.5, 0.12, 42, 0.42),
-            ("note", 1.0, 0.25, 38, 0.78),
-            ("note", 1.0, 0.12, 42, 0.58),
-            ("note", 1.5, 0.12, 42, 0.42),
+            ("note", 1.0, 0.25, 36, 0.84),
             ("note", 2.0, 0.25, 36, 0.88),
-            ("note", 2.0, 0.12, 42, 0.58),
-            ("note", 2.5, 0.12, 42, 0.42),
-            ("note", 3.0, 0.25, 38, 0.78),
-            ("note", 3.0, 0.12, 42, 0.58),
-            ("note", 3.5, 0.12, 42, 0.42),
+            ("note", 3.0, 0.25, 36, 0.84),
         ],
         TrackRole::Bass => vec![
             ("note", 0.0, 0.7, 33, 0.82),
@@ -3045,6 +3046,12 @@ mod tests {
                 .all(|track| track.instrument.engine == SURGE_ENGINE)
         );
         assert_eq!(project.tracks[0].instrument.preset, "Surge Kick");
+        assert!(
+            project.tracks[0].clips[0]
+                .events
+                .iter()
+                .all(|event| event.pitch == 36)
+        );
         assert_eq!(project.tracks[1].instrument.preset, "Surge Bass");
         assert_eq!(project.tracks[2].instrument.preset, "Surge Pad");
         assert!(project.tracks.iter().all(|track| !track.clips.is_empty()));
@@ -3124,6 +3131,43 @@ mod tests {
             ),
             Err(StudioError::InvalidSoundTool)
         );
+        assert_eq!(
+            studio.configure_sound_tool(
+                bass_id,
+                "instrument",
+                instrument_id,
+                None,
+                "preset",
+                "Factory/Leads/Definitely Missing",
+            ),
+            Err(StudioError::InvalidSoundTool)
+        );
+    }
+
+    #[test]
+    fn audio_clip_deletion_cannot_escape_the_selection() {
+        let mut studio = Studio::new();
+        let track_id = studio.project.tracks[0].id;
+        studio.project.tracks[0].audio_clips.push(AudioClip {
+            id: 9_001,
+            label: "Region".to_owned(),
+            start: 1.0,
+            end: 3.0,
+            asset: "/tmp/unused.wav".to_owned(),
+            source_offset: 0.0,
+            source_duration: 2.0,
+            gain: 1.0,
+            reversed: false,
+        });
+
+        assert_eq!(
+            studio.delete_audio_clip(track_id, 9_001, 1.5, 2.5),
+            Err(StudioError::InvalidSelection)
+        );
+        studio
+            .delete_audio_clip(track_id, 9_001, 1.0, 3.0)
+            .expect("selected audio clip deletion");
+        assert!(studio.project.tracks[0].audio_clips.is_empty());
     }
 
     #[test]

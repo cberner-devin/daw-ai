@@ -45,7 +45,10 @@ type Object = Map<String, JsonValue>;
 pub enum PlannerError {
     Unavailable(String),
     TimedOut,
-    Failed(String),
+    Failed {
+        message: String,
+        code: Option<String>,
+    },
     ProjectChanged,
     SaveFailed,
     Interrupted,
@@ -61,7 +64,7 @@ impl fmt::Display for PlannerError {
                 formatter,
                 "Gemini took too long to complete the edit; try again"
             ),
-            Self::Failed(message) => {
+            Self::Failed { message, .. } => {
                 write!(formatter, "Gemini could not complete the edit: {message}")
             }
             Self::ProjectChanged => write!(formatter, "the project changed; submit the edit again"),
@@ -292,7 +295,7 @@ impl ToolOutput {
 
 fn function_calls(response: &JsonValue) -> Result<Vec<FunctionCall>, PlannerError> {
     if let Some(error) = response.get("error") {
-        return Err(PlannerError::Failed(api_error_message(error)));
+        return Err(api_failure(error));
     }
     let status = response
         .get("status")
@@ -302,9 +305,10 @@ fn function_calls(response: &JsonValue) -> Result<Vec<FunctionCall>, PlannerErro
         status,
         "failed" | "cancelled" | "incomplete" | "budget_exceeded"
     ) {
-        return Err(PlannerError::Failed(format!(
-            "interaction ended with status {status}"
-        )));
+        return Err(PlannerError::Failed {
+            message: format!("interaction ended with status {status}"),
+            code: None,
+        });
     }
     let steps = response
         .get("steps")
@@ -559,12 +563,16 @@ fn call_interactions(
         if status.code() == Some(28) {
             return Err(PlannerError::TimedOut);
         }
-        let message = serde_json::from_str::<JsonValue>(&response)
+        if let Some(error) = serde_json::from_str::<JsonValue>(&response)
             .ok()
-            .and_then(|body| body.get("error").map(api_error_message))
-            .filter(|message| !message.is_empty())
-            .unwrap_or_else(|| bounded_text(&stderr, 1_000));
-        return Err(PlannerError::Failed(message));
+            .and_then(|body| body.get("error").cloned())
+        {
+            return Err(api_failure(&error));
+        }
+        return Err(PlannerError::Failed {
+            message: bounded_text(&stderr, 1_000),
+            code: None,
+        });
     }
     Ok(response)
 }
@@ -619,7 +627,9 @@ fn retry_transient_interaction(
         let response = transport(&exchange_name, available);
         let retry = match &response {
             Ok(body) => transient_api_error(body),
-            Err(PlannerError::Failed(message)) => transient_api_message(message),
+            Err(PlannerError::Failed { message, code }) => {
+                code.as_deref() == Some("service_unavailable") || transient_api_message(message)
+            }
             _ => false,
         };
         if !retry || attempt == retry_delays.len() {
@@ -794,6 +804,16 @@ fn api_error_message(error: &JsonValue) -> String {
         .and_then(JsonValue::as_str)
         .unwrap_or("the Gemini API returned an error")
         .to_owned()
+}
+
+fn api_failure(error: &JsonValue) -> PlannerError {
+    PlannerError::Failed {
+        message: api_error_message(error),
+        code: error
+            .get("code")
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned),
+    }
 }
 
 fn bounded_text(value: &str, maximum: usize) -> String {
@@ -1615,6 +1635,32 @@ mod tests {
             ]
         );
         assert!(response.contains("\"id\":\"recovered\""));
+    }
+
+    #[test]
+    fn transient_error_code_retries_even_with_a_new_message() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut attempt = 0;
+        let response = retry_transient_interaction(
+            8,
+            Duration::from_secs(1),
+            &cancellation,
+            &[Duration::ZERO],
+            &mut |_, _| {
+                attempt += 1;
+                if attempt == 1 {
+                    Err(PlannerError::Failed {
+                        message: "capacity is temporarily constrained".to_owned(),
+                        code: Some("service_unavailable".to_owned()),
+                    })
+                } else {
+                    Ok(r#"{"status":"completed","steps":[]}"#.to_owned())
+                }
+            },
+        )
+        .expect("structured transient error recovery");
+        assert_eq!(attempt, 2);
+        assert!(response.contains("completed"));
     }
 
     #[test]

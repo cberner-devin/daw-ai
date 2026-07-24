@@ -520,10 +520,15 @@ fn mix_audio_clips(
     audio_assets: &mut AudioAssetCache,
 ) -> Result<(), String> {
     for clip in &track.audio_clips {
-        let samples = audio_assets.samples(&clip.asset)?;
         let clip_start = playback_start_sample(clip.start);
-        let source_start = playback_start_sample(clip.source_offset).min(samples.len());
         let source_count = playback_sample_count(0.0, clip.source_duration);
+        let clip_end = clip_start.saturating_add(source_count);
+        let render_end = render_start_sample.saturating_add(output.len());
+        if clip_end <= render_start_sample || clip_start >= render_end {
+            continue;
+        }
+        let samples = audio_assets.samples(&clip.asset)?;
+        let source_start = playback_start_sample(clip.source_offset).min(samples.len());
         for source_index in 0..source_count {
             let project_sample = clip_start.saturating_add(source_index);
             if project_sample < render_start_sample {
@@ -1698,26 +1703,21 @@ fn target_matches(target: Option<TrackRole>, role: TrackRole) -> bool {
 
 fn apply_effect(name: &str, mix: f32, effects: &mut EffectMixes) {
     let normalized = name.to_ascii_lowercase();
-    if normalized.contains("drive") || normalized.contains("distortion") {
-        effects.drive = effects.drive.max(mix);
-    }
-    if normalized.contains("echo") || normalized.contains("delay") {
-        effects.echo = effects.echo.max(mix);
-    }
-    if normalized == "reverb" {
-        effects.reverb = effects.reverb.max(mix);
-    }
     if normalized == "room" {
         effects.room = effects.room.max(mix);
-    }
-    if normalized == "shimmer" {
+    } else if normalized == "shimmer" {
         effects.shimmer = effects.shimmer.max(mix);
-    }
-    if normalized.contains("chorus") {
-        effects.chorus = effects.chorus.max(mix);
-    }
-    if normalized.contains("compressor") || normalized.contains("compression") {
-        effects.compression = effects.compression.max(mix);
+    } else {
+        match effect_stage(name) {
+            Some(EffectStage::Drive) => effects.drive = effects.drive.max(mix),
+            Some(EffectStage::Echo) => effects.echo = effects.echo.max(mix),
+            Some(EffectStage::Reverb) => effects.reverb = effects.reverb.max(mix),
+            Some(EffectStage::Chorus) => effects.chorus = effects.chorus.max(mix),
+            Some(EffectStage::Compression) => {
+                effects.compression = effects.compression.max(mix);
+            }
+            None => {}
+        }
     }
     if normalized.contains("low-pass")
         || normalized.contains("low pass")
@@ -1731,23 +1731,27 @@ fn apply_effect(name: &str, mix: f32, effects: &mut EffectMixes) {
 fn remove_effect(name: &str, effects: &mut EffectMixes) {
     let normalized = name.to_ascii_lowercase();
     let remove_all = matches!(normalized.as_str(), "effect" | "effects" | "fx");
-    if normalized.contains("drive") || normalized.contains("distortion") || remove_all {
-        effects.drive = 0.0;
-    }
-    if normalized.contains("echo") || normalized.contains("delay") || remove_all {
-        effects.echo = 0.0;
-    }
-    if normalized == "reverb" || remove_all {
-        effects.reverb = 0.0;
-    }
     if normalized == "room" || remove_all {
         effects.room = 0.0;
     }
     if normalized == "shimmer" || remove_all {
         effects.shimmer = 0.0;
     }
-    if normalized.contains("chorus") || remove_all {
+    if remove_all {
+        effects.drive = 0.0;
+        effects.echo = 0.0;
+        effects.reverb = 0.0;
         effects.chorus = 0.0;
+        effects.compression = 0.0;
+    } else {
+        match effect_stage(name) {
+            Some(EffectStage::Drive) => effects.drive = 0.0,
+            Some(EffectStage::Echo) => effects.echo = 0.0,
+            Some(EffectStage::Reverb) => effects.reverb = 0.0,
+            Some(EffectStage::Chorus) => effects.chorus = 0.0,
+            Some(EffectStage::Compression) => effects.compression = 0.0,
+            None => {}
+        }
     }
     if normalized.contains("compressor") || normalized.contains("compression") || remove_all {
         effects.compression = 0.0;
@@ -2236,6 +2240,37 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_audio_clips_do_not_load_assets() {
+        let mut project = Project::initial();
+        project.tracks[0].audio_clips.push(AudioClip {
+            id: 9_101,
+            label: "Offscreen".to_owned(),
+            start: 4.0,
+            end: 5.0,
+            asset: "/tmp/daw-ai-intentionally-missing.wav".to_owned(),
+            source_offset: 0.0,
+            source_duration: 1.0,
+            gain: 1.0,
+            reversed: false,
+        });
+        let region = render_region_builtin(&project, &[project.tracks[0].id], 0.0, 1.0)
+            .expect("offscreen clip render");
+        assert_eq!(region.samples.len(), SAMPLE_RATE as usize);
+    }
+
+    #[test]
+    fn builtin_effect_aliases_share_their_processing_stage() {
+        let mut effects = EffectMixes::default();
+        apply_effect("Reverb 2", 0.7, &mut effects);
+        apply_effect("Spring Reverb", 0.8, &mut effects);
+        apply_effect("Phaser", 0.6, &mut effects);
+        assert_eq!(effects.reverb, 0.8);
+        assert_eq!(effects.chorus, 0.6);
+        remove_effect("Reverb 1", &mut effects);
+        assert_eq!(effects.reverb, 0.0);
+    }
+
+    #[test]
     fn once_clip_events_do_not_wrap() {
         let mut project = Project::demo();
         project.bpm = 60;
@@ -2346,8 +2381,13 @@ mod tests {
         for track_id in [1, 2, 3] {
             let track = render_region(&project, &[track_id], 0.0, 2.0).expect("demo track render");
             let track = analyze(&track);
+            let (minimum_peak, minimum_rms) = if track_id == 1 {
+                (0.03, 0.005)
+            } else {
+                (0.05, 0.009)
+            };
             assert!(
-                track.peak > 0.05 && track.rms > 0.009,
+                track.peak > minimum_peak && track.rms > minimum_rms,
                 "reset demo track {track_id} was too quiet: peak {}, RMS {}",
                 track.peak,
                 track.rms
