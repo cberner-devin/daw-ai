@@ -564,7 +564,6 @@ dependencies = [
 [[package]]
 name = "surge-rs"
 version = "0.1.0"
-source = "git+https://github.com/surge-synthesizer/surge-rs.git?rev=7bfeafc76d1c57860a177e9e076bed7ec764009a#7bfeafc76d1c57860a177e9e076bed7ec764009a"
 dependencies = [
  "bindgen",
  "cc",

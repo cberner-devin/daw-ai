@@ -7,7 +7,7 @@ description = "A local, prompt-driven music studio"
 license = "MIT"
 
 [workspace]
-exclude = ["vendor/surge-bridge", "vendor/surge-sys"]
+exclude = ["vendor/surge-bridge", "vendor/surge-rs", "vendor/surge-sys"]
 
 [dependencies]
 serde_json = "1.0"
@@ -17,6 +17,7 @@ surge-rs = { git = "https://github.com/surge-synthesizer/surge-rs.git", rev = "7
 # The official alpha binding needs ABI and lifetime fixes documented in each
 # vendored crate's PATCHES.md.
 surge-bridge = { path = "vendor/surge-bridge" }
+surge-rs = { path = "vendor/surge-rs" }
 surge-sys = { path = "vendor/surge-sys" }
 
 [profile.release]

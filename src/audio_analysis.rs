@@ -301,8 +301,8 @@ fn render_builtin_samples(
                     * 0.16;
             }
         }
-        process_builtin_track_audio(project, track, &state, start_sample, &mut rendered);
         mix_audio_clips(track, start_sample, &mut rendered)?;
+        process_builtin_track_audio(project, track, &state, start_sample, &mut rendered);
         for (mixed, sample) in mix.iter_mut().zip(rendered) {
             *mixed += sample;
         }
@@ -473,8 +473,8 @@ fn render_audio_samples(
             &mut rendered,
             &mut event_onsets,
         )?;
+        render_surge_audio_clips(project, track, &render_state, start_sample, &mut rendered)?;
         apply_track_gain(project, track, &render_state, start_sample, &mut rendered);
-        mix_audio_clips(track, start_sample, &mut rendered)?;
         for (output, sample) in mix.iter_mut().zip(rendered) {
             *output += sample;
         }
@@ -520,6 +520,70 @@ fn mix_audio_clips(
                 output[output_index] += *sample * clip.gain;
             }
         }
+    }
+    Ok(())
+}
+
+fn render_surge_audio_clips(
+    project: &Project,
+    track: &Track,
+    render_state: &TrackRenderState<'_>,
+    start_sample: usize,
+    output: &mut [f32],
+) -> Result<(), String> {
+    if track.audio_clips.is_empty() {
+        return Ok(());
+    }
+    let mut clips = vec![0.0; output.len()];
+    mix_audio_clips(track, start_sample, &mut clips)?;
+    if !track.effects.iter().any(|effect| effect.enabled) {
+        for (sample, clip) in output.iter_mut().zip(clips) {
+            *sample += clip;
+        }
+        return Ok(());
+    }
+
+    let input_id = u64::MAX;
+    let mut effects = Vec::with_capacity(track.effects.len() + 1);
+    effects.push(crate::model::Effect {
+        id: input_id,
+        name: "Audio Input".to_owned(),
+        mix: 1.0,
+        cutoff_hz: None,
+        resonance: None,
+        enabled: true,
+        parameters: std::collections::BTreeMap::new(),
+        parameter_overrides: Vec::new(),
+    });
+    effects.extend(track.effects.iter().cloned());
+    let mut effect_order = Vec::with_capacity(track.routing.effect_order.len() + 1);
+    effect_order.push(input_id);
+    effect_order.extend(track.routing.effect_order.iter().copied());
+    let mut instrument = track.instrument.clone();
+    instrument.preset = "Init".to_owned();
+    instrument.parameter_overrides.clear();
+    let mut engine =
+        crate::surge::Engine::new(&instrument, &effects, &effect_order, SAMPLE_RATE as f32)?;
+
+    let mut output_index = 0;
+    while output_index < output.len() {
+        let block_start = start_sample + output_index;
+        let count = crate::surge::BLOCK_SIZE.min(output.len() - output_index);
+        set_surge_effect_controls(
+            &mut engine,
+            project,
+            track,
+            render_state,
+            precise_sample_time(block_start),
+        )?;
+        let mut input = [[0.0; crate::surge::BLOCK_SIZE]; 2];
+        input[0][..count].copy_from_slice(&clips[output_index..output_index + count]);
+        input[1][..count].copy_from_slice(&clips[output_index..output_index + count]);
+        let block = engine.process_with_input(input);
+        for index in 0..count {
+            output[output_index + index] += (block[0][index] + block[1][index]) * 0.5;
+        }
+        output_index += count;
     }
     Ok(())
 }
@@ -672,36 +736,47 @@ fn render_track(
             }
             engine.set_parameter(name, value)?;
         }
-        for effect in &track.effects {
-            let mix = parameter_at(
-                project,
-                track,
-                render_state,
-                &format!("effect:{}.mix", effect.id),
-                effect.mix,
-                time,
-            );
-            engine.set_effect_mix(effect.id, mix)?;
-            for (parameter, base) in &effect.parameters {
-                let target = format!("effect:{}.{}", effect.id, parameter);
-                if !effect.parameter_overrides.contains(parameter)
-                    && !render_state.automation.lanes.contains_key(target.as_str())
-                    && !track
-                        .modulators
-                        .iter()
-                        .any(|modulator| modulator.enabled && modulator.target == target)
-                {
-                    continue;
-                }
-                let value = parameter_at(project, track, render_state, &target, *base, time);
-                engine.set_effect_parameter(effect.id, parameter, value)?;
-            }
-        }
+        set_surge_effect_controls(&mut engine, project, track, render_state, time)?;
         let block = engine.process();
         for index in 0..count {
             output[output_index + index] = (block[0][index] + block[1][index]) * 0.5;
         }
         output_index += count;
+    }
+    Ok(())
+}
+
+fn set_surge_effect_controls(
+    engine: &mut crate::surge::Engine,
+    project: &Project,
+    track: &Track,
+    render_state: &TrackRenderState<'_>,
+    time: f64,
+) -> Result<(), String> {
+    for effect in &track.effects {
+        let mix = parameter_at(
+            project,
+            track,
+            render_state,
+            &format!("effect:{}.mix", effect.id),
+            effect.mix,
+            time,
+        );
+        engine.set_effect_mix(effect.id, mix)?;
+        for (parameter, base) in &effect.parameters {
+            let target = format!("effect:{}.{}", effect.id, parameter);
+            if !effect.parameter_overrides.contains(parameter)
+                && !render_state.automation.lanes.contains_key(target.as_str())
+                && !track
+                    .modulators
+                    .iter()
+                    .any(|modulator| modulator.enabled && modulator.target == target)
+            {
+                continue;
+            }
+            let value = parameter_at(project, track, render_state, &target, *base, time);
+            engine.set_effect_parameter(effect.id, parameter, value)?;
+        }
     }
     Ok(())
 }
@@ -1431,7 +1506,11 @@ fn automation_at(
     let clip_active = track
         .clips
         .iter()
-        .any(|clip| time >= f64::from(clip.start) && time < f64::from(clip.end));
+        .any(|clip| time >= f64::from(clip.start) && time < f64::from(clip.end))
+        || track
+            .audio_clips
+            .iter()
+            .any(|clip| time >= f64::from(clip.start) && time < f64::from(clip.end));
     let mut gain = if clip_active {
         parameter_at(
             project,
@@ -2071,7 +2150,7 @@ fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Edit, Modulator};
+    use crate::model::{AudioClip, Edit, Modulator};
     use crate::prompt::AutomationPoint;
 
     fn automation_frame_at(project: &Project, track: &Track, time: f32) -> AutomationFrame {
@@ -2084,6 +2163,32 @@ mod tests {
         let time = f64::from(time);
         let render_state = TrackRenderState::new(project, track, time, time + 0.000_01);
         modulator_value(project, &render_state, &track.modulators[0], time)
+    }
+
+    fn audio_clip_project() -> (Project, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "daw-ai-audio-clip-routing-{}.wav",
+            std::process::id()
+        ));
+        let samples = (0..SAMPLE_RATE)
+            .map(|index| (2.0 * PI * 220.0 * index as f32 / SAMPLE_RATE as f32).sin() * 0.25)
+            .collect::<Vec<_>>();
+        std::fs::write(&path, wav_bytes(&samples)).expect("audio clip fixture");
+        let mut project = Project::initial();
+        project.duration = 2.0;
+        project.tracks[0].volume = 1.0;
+        project.tracks[0].audio_clips.push(AudioClip {
+            id: 9_100,
+            label: "Resample".to_owned(),
+            start: 0.0,
+            end: 1.0,
+            asset: path.to_string_lossy().into_owned(),
+            source_offset: 0.0,
+            source_duration: 1.0,
+            gain: 1.0,
+            reversed: false,
+        });
+        (project, path)
     }
 
     #[test]
@@ -2816,6 +2921,80 @@ mod tests {
             .expect("bypassed built-in render");
         assert_eq!(surge_bypassed.samples, surge_baseline.samples);
         assert_eq!(builtin_bypassed.samples, builtin_baseline.samples);
+    }
+
+    #[test]
+    fn audio_clips_follow_track_volume_and_effects_in_both_engines() {
+        let (mut project, path) = audio_clip_project();
+        let track_id = project.tracks[0].id;
+        let render = |project: &Project, builtin| {
+            if builtin {
+                render_region_builtin(project, &[track_id], 0.0, 1.0)
+            } else {
+                render_region(project, &[track_id], 0.0, 1.0)
+            }
+            .expect("audio clip render")
+        };
+
+        for builtin in [false, true] {
+            project.tracks[0].volume = 1.0;
+            project.tracks[0].effects.clear();
+            project.tracks[0].routing.effect_order.clear();
+            let full = render(&project, builtin);
+            project.tracks[0].volume = 0.25;
+            let quiet = render(&project, builtin);
+            assert!(
+                analyze(&quiet).rms < analyze(&full).rms * 0.4,
+                "track volume must attenuate audio clips in both engines"
+            );
+
+            project.tracks[0].volume = 1.0;
+            project.edits.push(Edit {
+                id: 9_102,
+                operation_id: None,
+                start: 0.0,
+                end: 1.0,
+                prompt: "Fade the resample".to_owned(),
+                summary: "Automated the resample level".to_owned(),
+                action: Action::Automation {
+                    track_id,
+                    parameter: "track.volume".to_owned(),
+                    curve: "hold",
+                    points: vec![AutomationPoint {
+                        time: 0.0,
+                        value: 0.1,
+                    }],
+                    target: project.tracks[0].role,
+                },
+            });
+            let automated = render(&project, builtin);
+            assert!(
+                analyze(&automated).rms < analyze(&full).rms * 0.2,
+                "track volume automation must attenuate audio clips in both engines"
+            );
+            project.edits.clear();
+
+            project.tracks[0].effects.push(crate::model::Effect {
+                id: 9_101,
+                name: "Distortion".to_owned(),
+                mix: 1.0,
+                cutoff_hz: None,
+                resonance: None,
+                enabled: true,
+                parameters: crate::model::effect_parameter_specs("Distortion")
+                    .iter()
+                    .map(|spec| (spec.name.to_owned(), spec.default))
+                    .collect(),
+                parameter_overrides: Vec::new(),
+            });
+            project.tracks[0].routing.effect_order.push(9_101);
+            let effected = render(&project, builtin);
+            assert!(
+                sample_difference(&effected.samples, &full.samples) > 0.001,
+                "track effects must process audio clips in both engines"
+            );
+        }
+        std::fs::remove_file(path).expect("remove audio clip fixture");
     }
 
     #[test]
