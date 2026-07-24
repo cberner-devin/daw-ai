@@ -114,6 +114,14 @@ impl Engine {
         self.synth.pull_buffer()
     }
 
+    pub(crate) fn process_with_input(
+        &mut self,
+        input: [[f32; BLOCK_SIZE]; 2],
+    ) -> [[f32; BLOCK_SIZE]; 2] {
+        self.synth.set_input_buffer(input);
+        self.process()
+    }
+
     pub(crate) fn set_effect_mix(&mut self, effect_id: u64, value: f32) -> Result<(), String> {
         let Some(parameter) = self.effect_mix_parameters.get(&effect_id).cloned() else {
             return Ok(());

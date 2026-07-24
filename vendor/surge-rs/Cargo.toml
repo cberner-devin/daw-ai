@@ -1,0 +1,39 @@
+[package]
+name = "surge-rs"
+version = "0.1.0"
+authors = ["NV4 <cattobyte@kyararanbii.xyz>"]
+edition = "2024"
+description = "(Official) Rust bindings for the Surge XT synthesizer."
+license = "GPL-3.0-or-later"
+keywords = ["audio", "synthesis", "api", "ffi"]
+categories = ["multimedia::audio", "api-bindings", "external-ffi-bindings"]
+exclude = ["/sbmod"]
+
+[dependencies]
+surge-bridge = { path = "../surge-bridge" }
+
+[dev-dependencies]
+textplots = "0.8.7"
+cpal = "0.17.3"
+ringbuf = "0.4.8"
+midly = "0.5.3"
+bus = "2.4.1"
+
+[build-dependencies]
+bindgen = "0.72.1"
+cmake = "0.1.57"
+serde_json = "1.0.149"
+shell-words = "1.1.1"
+cc = "1.2.57"
+git2 = "0.20.4"
+
+[[example]]
+name = "everything"
+path = "examples/everything.rs"
+
+[features]
+in-surge-tree = []
+
+# whatever the default release one does is *not* apt and will give link errors.
+#[profile.release]
+#opt-level = 1
