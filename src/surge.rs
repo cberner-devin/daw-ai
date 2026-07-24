@@ -14,7 +14,7 @@ pub(crate) const BLOCK_SIZE: usize = 32;
 const MAX_NATIVE_PARAMETERS: i32 = 800;
 const FILTER_LP12: f32 = 1.0 / 31.0;
 const OSC_SINE: f32 = 1.0 / 11.0;
-const OSC_FM3: f32 = 5.0 / 11.0;
+const OSC_SH_NOISE: f32 = 3.0 / 11.0;
 const OSC_FM2: f32 = 6.0 / 11.0;
 const OSC_MODERN: f32 = 8.0 / 11.0;
 
@@ -293,10 +293,7 @@ pub(crate) fn effect_type_index(name: &str) -> Option<usize> {
 }
 
 pub(crate) fn is_native_effect(name: &str) -> bool {
-    SURGE_EFFECT_TYPES
-        .iter()
-        .skip(1)
-        .any(|candidate| *candidate == name)
+    effect_type_index(name).is_some()
 }
 
 fn parameter_map(synth: &SurgeSynthesizer) -> HashMap<String, i32> {
@@ -318,9 +315,75 @@ fn preset_parameters(preset: &str) -> Option<&'static [(&'static str, f32)]> {
             ("A Osc 2 Mute", 1.0),
             ("A Osc 3 Mute", 1.0),
         ]),
+        "Surge Kick" => Some(&[
+            ("A Osc 1 Type", OSC_SINE),
+            ("A Osc 1 Volume", 1.0),
+            ("A Amp EG Attack", 0.0),
+            ("A Amp EG Decay", 0.4),
+            ("A Amp EG Sustain", 0.0),
+            ("A Amp EG Release", 0.2),
+            ("A Filter 1 Cutoff", 0.35),
+            ("A Filter 1 Resonance", 0.15),
+            ("A Osc 2 Mute", 1.0),
+            ("A Osc 3 Mute", 1.0),
+        ]),
+        "Surge Snare" => Some(&[
+            ("A Osc 1 Type", OSC_SH_NOISE),
+            ("A Osc 1 Volume", 0.72),
+            ("A Amp EG Attack", 0.0),
+            ("A Amp EG Decay", 0.3),
+            ("A Amp EG Sustain", 0.0),
+            ("A Amp EG Release", 0.18),
+            ("A Filter 1 Cutoff", 0.72),
+            ("A Filter 1 Resonance", 0.1),
+            ("A Osc 2 Mute", 1.0),
+            ("A Osc 3 Mute", 1.0),
+        ]),
+        "Surge Closed Hat" => Some(&[
+            ("A Osc 1 Type", OSC_SH_NOISE),
+            ("A Osc 1 Volume", 0.42),
+            ("A Amp EG Attack", 0.0),
+            ("A Amp EG Decay", 0.24),
+            ("A Amp EG Sustain", 0.0),
+            ("A Amp EG Release", 0.1),
+            ("A Filter 1 Cutoff", 0.9),
+            ("A Filter 1 Resonance", 0.08),
+            ("A Osc 2 Mute", 1.0),
+            ("A Osc 3 Mute", 1.0),
+        ]),
+        "Surge Open Hat" => Some(&[
+            ("A Osc 1 Type", OSC_SH_NOISE),
+            ("A Osc 1 Volume", 0.4),
+            ("A Amp EG Attack", 0.0),
+            ("A Amp EG Decay", 0.38),
+            ("A Amp EG Sustain", 0.0),
+            ("A Amp EG Release", 0.28),
+            ("A Filter 1 Cutoff", 0.88),
+            ("A Filter 1 Resonance", 0.08),
+            ("A Osc 2 Mute", 1.0),
+            ("A Osc 3 Mute", 1.0),
+        ]),
+        "Surge Crash" => Some(&[
+            ("A Osc 1 Type", OSC_SH_NOISE),
+            ("A Osc 1 Volume", 0.36),
+            ("A Amp EG Attack", 0.0),
+            ("A Amp EG Decay", 0.64),
+            ("A Amp EG Sustain", 0.0),
+            ("A Amp EG Release", 0.58),
+            ("A Filter 1 Cutoff", 0.84),
+            ("A Filter 1 Resonance", 0.06),
+            ("A Osc 2 Mute", 1.0),
+            ("A Osc 3 Mute", 1.0),
+        ]),
         "Surge Percussion" => Some(&[
-            ("A Osc 1 Type", OSC_FM3),
-            ("A Osc 1 Volume", 0.82),
+            ("A Osc 1 Type", OSC_SH_NOISE),
+            ("A Osc 1 Volume", 0.6),
+            ("A Amp EG Attack", 0.0),
+            ("A Amp EG Decay", 0.3),
+            ("A Amp EG Sustain", 0.0),
+            ("A Amp EG Release", 0.18),
+            ("A Filter 1 Cutoff", 0.75),
+            ("A Filter 1 Resonance", 0.1),
             ("A Osc 2 Mute", 1.0),
             ("A Osc 3 Mute", 1.0),
         ]),
@@ -435,6 +498,21 @@ mod tests {
             let mut engine = Engine::new(&instrument, &[effect], &[77], 16_000.0)
                 .unwrap_or_else(|error| panic!("{name} did not load: {error}"));
             engine.process();
+        }
+    }
+
+    #[test]
+    fn friendly_effect_aliases_are_native_surge_effects() {
+        for alias in [
+            "Reverb",
+            "Room",
+            "Echo",
+            "Low-pass filter",
+            "Punch compressor",
+            "Drive",
+            "Shimmer",
+        ] {
+            assert!(is_native_effect(alias), "{alias} bypassed Surge XT");
         }
     }
 }

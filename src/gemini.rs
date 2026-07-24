@@ -1095,6 +1095,11 @@ fn effect_name(name: &str, allow_all: bool) -> Result<&'static str, PlannerError
 fn surge_preset_name(name: &str) -> Result<&'static str, PlannerError> {
     match name {
         "Init" => Ok("Init"),
+        "Surge Kick" => Ok("Surge Kick"),
+        "Surge Snare" => Ok("Surge Snare"),
+        "Surge Closed Hat" => Ok("Surge Closed Hat"),
+        "Surge Open Hat" => Ok("Surge Open Hat"),
+        "Surge Crash" => Ok("Surge Crash"),
         "Surge Percussion" => Ok("Surge Percussion"),
         "Surge Bass" => Ok("Surge Bass"),
         "Surge Pad" => Ok("Surge Pad"),

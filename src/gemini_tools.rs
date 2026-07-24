@@ -344,7 +344,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
             "type":"array","maxItems":128,"description":"Loop mode supports at most 32 events; once mode supports at most 128.","items":{"type":"object","properties":{
                 "time":{"type":"number","minimum":0,"maximum":64,"description":"Beat offset from the clip start."},
                 "duration":{"type":"number","minimum":0.0625,"maximum":64},
-                "pitch":{"type":"integer","minimum":0,"maximum":127},
+                "pitch":{"type":"integer","minimum":0,"maximum":127,"description":"For a dedicated starter drum voice use only its canonical pitch: kick 36, snare 38, closedHat 42, openHat 46, crash 49. Never combine drum voices on one Surge track."},
                 "velocity":{"type":"number","minimum":0.01,"maximum":1}
             },"required":["time","duration","pitch","velocity"],"additionalProperties":false}
         })
@@ -364,8 +364,14 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
     vec![
         function(
             "new_track",
-            "Create one empty track with its required instrument and no MIDI clips. Returns stable IDs for subsequent calls.",
-            object_schema(serde_json::json!({"role":role()}), &["role"]),
+            "Create one empty Surge XT instrument track with no MIDI clips. For drums, one track is one drum voice, not a General MIDI kit: choose drumVoice and create separate tracks for kick, snare, hats, and crash. Returns stable IDs for subsequent calls.",
+            object_schema(
+                serde_json::json!({
+                    "role":role(),
+                    "drumVoice":{"type":"string","enum":["kick","snare","closedHat","openHat","crash"],"description":"Only for role=drums; defaults to kick. Each drum track renders one dedicated Surge patch."}
+                }),
+                &["role"],
+            ),
         ),
         function(
             "delete_track",
@@ -776,8 +782,34 @@ pub(crate) fn apply_agent_mutation(
             let id = studio
                 .add_empty_channel(role)
                 .map_err(studio_error_message)?;
+            let drum_voice = object.get("drumVoice").and_then(JsonValue::as_str);
+            if role != TrackRole::Drums && drum_voice.is_some() {
+                return Err("drumVoice is only valid when role is drums".to_owned());
+            }
+            let voice = if role == TrackRole::Drums {
+                Some(drum_voice.unwrap_or("kick"))
+            } else {
+                None
+            };
+            if let Some(voice) = voice {
+                let (preset, _) = drum_voice_spec(voice)?;
+                let instrument_id = studio
+                    .project()
+                    .tracks
+                    .iter()
+                    .find(|track| track.id == id)
+                    .map(|track| track.instrument.id)
+                    .ok_or_else(|| format!("track {id} does not exist"))?;
+                studio
+                    .configure_sound_tool(id, "instrument", instrument_id, None, "preset", preset)
+                    .map_err(studio_error_message)?;
+            }
             result_id = Some(id);
-            format!("Created {} track {id}", role.as_str())
+            if let Some(voice) = voice {
+                format!("Created drums {voice} voice track {id}")
+            } else {
+                format!("Created {} track {id}", role.as_str())
+            }
         }
         "delete_track" => {
             let id = required_id(object, "trackId")?;
@@ -814,6 +846,7 @@ pub(crate) fn apply_agent_mutation(
         "add_midi_clip" => {
             let (track_id, spec) = clip_arguments(object, studio.project().bpm)?;
             validate_clip_selection(&spec, selection_start, selection_end)?;
+            validate_surge_drum_notes(studio.project(), track_id, &spec.notes)?;
             let id = studio
                 .create_midi_clip(track_id, &spec)
                 .map_err(studio_error_message)?;
@@ -823,6 +856,7 @@ pub(crate) fn apply_agent_mutation(
         "update_midi_clip" => {
             let clip_id = required_id(object, "clipId")?;
             let (track_id, spec) = clip_arguments(object, studio.project().bpm)?;
+            validate_surge_drum_notes(studio.project(), track_id, &spec.notes)?;
             studio
                 .replace_midi_clip(track_id, clip_id, &spec, selection_start, selection_end)
                 .map_err(studio_error_message)?;
@@ -1053,6 +1087,58 @@ fn validate_clip_selection(
         return Err(format!(
             "MIDI clip must stay within the selected region ({selection_start}-{selection_end}s)"
         ));
+    }
+    Ok(())
+}
+
+fn drum_voice_spec(voice: &str) -> Result<(&'static str, u8), String> {
+    match voice {
+        "kick" => Ok(("Surge Kick", 36)),
+        "snare" => Ok(("Surge Snare", 38)),
+        "closedHat" => Ok(("Surge Closed Hat", 42)),
+        "openHat" => Ok(("Surge Open Hat", 46)),
+        "crash" => Ok(("Surge Crash", 49)),
+        _ => Err("drumVoice must be kick, snare, closedHat, openHat, or crash".to_owned()),
+    }
+}
+
+fn validate_surge_drum_notes(
+    project: &Project,
+    track_id: u64,
+    notes: &[crate::prompt::MidiNote],
+) -> Result<(), String> {
+    let track = project
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .ok_or_else(|| format!("track {track_id} does not exist"))?;
+    if track.role != TrackRole::Drums {
+        return Ok(());
+    }
+    let expected = match track.instrument.preset.as_str() {
+        "Surge Kick" => Some(36),
+        "Surge Snare" => Some(38),
+        "Surge Closed Hat" => Some(42),
+        "Surge Open Hat" => Some(46),
+        "Surge Crash" => Some(49),
+        _ => None,
+    };
+    if let Some(expected) = expected {
+        if notes.iter().any(|note| note.pitch != expected) {
+            return Err(format!(
+                "this Surge drum voice accepts only MIDI pitch {expected}; create a separate drums track with the matching drumVoice for other sounds"
+            ));
+        }
+    } else {
+        let mut pitches = notes.iter().map(|note| note.pitch).collect::<Vec<_>>();
+        pitches.sort_unstable();
+        pitches.dedup();
+        if pitches.len() > 1 {
+            return Err(
+                "a Surge percussion preset is one pitched instrument, not a General MIDI kit; use one pitch on this track and create separate drums tracks for other voices"
+                    .to_owned(),
+            );
+        }
     }
     Ok(())
 }
@@ -1757,6 +1843,46 @@ mod tests {
     }
 
     #[test]
+    fn drum_tracks_are_dedicated_surge_voices() {
+        let original = Project::initial();
+        let session = EditSession::create(&original, "add hats", 0.0, 4.0).expect("edit session");
+        let response = apply_agent_mutation(
+            session.path(),
+            "new_track",
+            &serde_json::json!({"role":"drums","drumVoice":"closedHat"}),
+        )
+        .expect("new drum voice");
+        let response: JsonValue = serde_json::from_str(&response).unwrap();
+        let track_id = response["id"].as_u64().expect("created track ID");
+        let (_, project) = session.take_update().unwrap().expect("published update");
+        let track = project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .expect("created drum voice");
+        assert_eq!(track.instrument.preset, "Surge Closed Hat");
+        assert!(track.instrument.parameter_overrides.is_empty());
+
+        let error = apply_agent_mutation(
+            session.path(),
+            "add_midi_clip",
+            &serde_json::json!({
+                "trackId":track_id,
+                "label":"Invalid combined kit",
+                "startBeat":0,
+                "durationBeats":4,
+                "playback":{"mode":"loop","lengthBeats":4},
+                "events":[
+                    {"time":0,"duration":0.125,"pitch":42,"velocity":0.8},
+                    {"time":1,"duration":0.125,"pitch":36,"velocity":0.9}
+                ]
+            }),
+        )
+        .expect_err("combined kit must be rejected");
+        assert!(error.contains("only MIDI pitch 42"), "{error}");
+    }
+
+    #[test]
     fn resampled_audio_can_be_sliced_reversed_and_rendered() {
         let original = Project::demo();
         let session =
@@ -1887,7 +2013,7 @@ mod tests {
                 serde_json::json!({
                     "time":index as f32 / 16.0,
                     "duration":0.0625,
-                    "pitch":42,
+                    "pitch":36,
                     "velocity":0.7
                 })
             })

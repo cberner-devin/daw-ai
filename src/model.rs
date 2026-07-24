@@ -16,6 +16,11 @@ pub(crate) const FILTER_RESONANCE_DEFAULT: f32 = 0.7;
 pub(crate) const SURGE_ENGINE: &str = "Surge XT";
 pub(crate) const SURGE_PRESETS: &[&str] = &[
     "Init",
+    "Surge Kick",
+    "Surge Snare",
+    "Surge Closed Hat",
+    "Surge Open Hat",
+    "Surge Crash",
     "Surge Percussion",
     "Surge Bass",
     "Surge Pad",
@@ -2494,11 +2499,7 @@ fn configure_instrument(
     if parameter == "preset" {
         return if valid_surge_preset(value) {
             instrument.preset = value.to_owned();
-            instrument.parameter_overrides = if crate::surge_presets::is_factory_id(value) {
-                Vec::new()
-            } else {
-                instrument_parameter_names()
-            };
+            instrument.parameter_overrides.clear();
             Ok(())
         } else {
             Err(StudioError::InvalidSoundTool)
@@ -2741,9 +2742,9 @@ fn empty_track(id: u64) -> Track {
 fn generated_track(id: u64, role: TrackRole) -> Track {
     let (name, color, preset, attack, release, cutoff, effect_specs, modulator) = match role {
         TrackRole::Drums => (
-            "AI Drum Rack",
+            "AI Drum Voice",
             "#ffb86b",
-            "Surge Percussion",
+            "Surge Kick",
             0.0,
             0.25,
             0.82,
@@ -3013,7 +3014,7 @@ mod tests {
                 .iter()
                 .all(|track| track.instrument.engine == SURGE_ENGINE)
         );
-        assert_eq!(project.tracks[0].instrument.preset, "Surge Percussion");
+        assert_eq!(project.tracks[0].instrument.preset, "Surge Kick");
         assert_eq!(project.tracks[1].instrument.preset, "Surge Bass");
         assert_eq!(project.tracks[2].instrument.preset, "Surge Pad");
         assert!(project.tracks.iter().all(|track| !track.clips.is_empty()));
@@ -3059,11 +3060,7 @@ mod tests {
         let instrument = &studio.project().tracks[1].instrument;
         assert_eq!(instrument.engine, SURGE_ENGINE);
         assert_eq!(instrument.preset, "Surge Pad");
-        assert!(
-            instrument
-                .parameter_overrides
-                .contains(&"cutoff".to_owned())
-        );
+        assert!(instrument.parameter_overrides.is_empty());
 
         studio
             .configure_sound_tool(bass_id, "instrument", instrument_id, None, "cutoff", "0.4")
