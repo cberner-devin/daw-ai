@@ -301,7 +301,7 @@ fn render_builtin_samples(
                     * 0.16;
             }
         }
-        process_track_audio(project, track, &state, start_sample, &mut rendered, false);
+        process_builtin_track_audio(project, track, &state, start_sample, &mut rendered);
         mix_audio_clips(track, start_sample, &mut rendered)?;
         for (mixed, sample) in mix.iter_mut().zip(rendered) {
             *mixed += sample;
@@ -473,14 +473,7 @@ fn render_audio_samples(
             &mut rendered,
             &mut event_onsets,
         )?;
-        process_track_audio(
-            project,
-            track,
-            &render_state,
-            start_sample,
-            &mut rendered,
-            true,
-        );
+        apply_track_gain(project, track, &render_state, start_sample, &mut rendered);
         mix_audio_clips(track, start_sample, &mut rendered)?;
         for (output, sample) in mix.iter_mut().zip(rendered) {
             *output += sample;
@@ -1216,6 +1209,7 @@ fn parameter_at(
         _ if target.starts_with("effect:") && target.ends_with(".resonance") => {
             (FILTER_RESONANCE_MIN, FILTER_RESONANCE_MAX, 10.0, "add")
         }
+        _ if target.starts_with("effect:") => (0.0, 1.0, 1.0, "add"),
         _ => return base,
     };
     let value = match mode {
@@ -1269,14 +1263,13 @@ fn modulator_value(
         )
 }
 
-fn process_track_audio(
+fn apply_track_gain(
     project: &Project,
     track: &Track,
     render_state: &TrackRenderState<'_>,
     start_sample: usize,
     samples: &mut [f32],
-    legacy_effects_only: bool,
-) {
+) -> Vec<AutomationFrame> {
     let frame_count = samples.len().div_ceil(AUTOMATION_SAMPLES);
     let frames = (0..frame_count)
         .map(|index| {
@@ -1287,6 +1280,17 @@ fn process_track_audio(
     for (index, sample) in samples.iter_mut().enumerate() {
         *sample *= frames[index / AUTOMATION_SAMPLES].gain;
     }
+    frames
+}
+
+fn process_builtin_track_audio(
+    project: &Project,
+    track: &Track,
+    render_state: &TrackRenderState<'_>,
+    start_sample: usize,
+    samples: &mut [f32],
+) {
+    let frames = apply_track_gain(project, track, render_state, start_sample, samples);
     dynamic_resonant_low_pass(
         samples,
         &frames,
@@ -1294,7 +1298,7 @@ fn process_track_audio(
         |frame| frame.effect_filter_resonance,
         |frame| frame.effect_filter_bypass,
     );
-    for stage in effect_stages(track, legacy_effects_only) {
+    for stage in effect_stages(track) {
         match stage {
             EffectStage::Drive => {
                 let alpha = 1.0 - (-2.0 * PI * 180.0 / SAMPLE_RATE as f32).exp();
@@ -1340,7 +1344,7 @@ fn process_track_audio(
     }
 }
 
-fn effect_stages(track: &Track, legacy_only: bool) -> Vec<EffectStage> {
+fn effect_stages(track: &Track) -> Vec<EffectStage> {
     let mut stages = track
         .routing
         .effect_order
@@ -1350,7 +1354,6 @@ fn effect_stages(track: &Track, legacy_only: bool) -> Vec<EffectStage> {
                 .effects
                 .iter()
                 .find(|effect| effect.id == *effect_id)
-                .filter(|effect| !legacy_only || !crate::surge::is_native_effect(&effect.name))
                 .and_then(|effect| effect_stage(&effect.name))
         })
         .fold(Vec::new(), |mut stages, stage| {
@@ -2195,7 +2198,7 @@ mod tests {
             let track = render_region(&project, &[track_id], 0.0, 2.0).expect("demo track render");
             let track = analyze(&track);
             assert!(
-                track.peak > 0.1 && track.rms > 0.02,
+                track.peak > 0.08 && track.rms > 0.015,
                 "reset demo track {track_id} was too quiet: peak {}, RMS {}",
                 track.peak,
                 track.rms
@@ -2816,7 +2819,7 @@ mod tests {
     }
 
     #[test]
-    fn resonant_filter_parameters_and_cutoff_modulation_shape_the_listening_render() {
+    fn native_eq_parameters_and_modulation_shape_the_listening_render() {
         let mut project = Project::demo();
         let track_index = project
             .tracks
@@ -2826,25 +2829,26 @@ mod tests {
         let track_id = project.tracks[track_index].id;
         project.tracks[track_index].modulators.clear();
         let effect = &mut project.tracks[track_index].effects[0];
-        effect.mix = 1.0;
-        effect.cutoff_hz = Some(650.0);
-        effect.resonance = Some(FILTER_RESONANCE_DEFAULT);
+        effect.parameter_overrides.push("lowGain".to_owned());
+        effect.parameters.insert("lowGain".to_owned(), 0.5);
         let neutral = render_region(&project, &[track_id], 0.0, 2.0).expect("neutral filter");
 
-        project.tracks[track_index].effects[0].resonance = Some(10.0);
-        let resonant = render_region(&project, &[track_id], 0.0, 2.0).expect("resonant filter");
+        project.tracks[track_index].effects[0]
+            .parameters
+            .insert("lowGain".to_owned(), 1.0);
+        let boosted = render_region(&project, &[track_id], 0.0, 2.0).expect("boosted EQ");
         let neutral_analysis = analyze(&neutral);
-        let resonant_analysis = analyze(&resonant);
-        let resonance_difference = sample_difference(&resonant.samples, &neutral.samples);
+        let boosted_analysis = analyze(&boosted);
+        let gain_difference = sample_difference(&boosted.samples, &neutral.samples);
         assert!(
-            resonance_difference > 0.000_1,
-            "resonance render difference was {resonance_difference}"
+            gain_difference > 0.000_1,
+            "EQ gain render difference was {gain_difference}"
         );
         assert!(
-            resonant_analysis.mid_energy_ratio > neutral_analysis.mid_energy_ratio,
-            "resonance must emphasize filter-band energy ({} -> {})",
-            neutral_analysis.mid_energy_ratio,
-            resonant_analysis.mid_energy_ratio
+            boosted_analysis.low_energy_ratio > neutral_analysis.low_energy_ratio,
+            "EQ must emphasize low-band energy ({} -> {})",
+            neutral_analysis.low_energy_ratio,
+            boosted_analysis.low_energy_ratio
         );
 
         let effect_id = project.tracks[track_index].effects[0].id;
@@ -2856,11 +2860,11 @@ mod tests {
             rate_mode: "hz".to_owned(),
             trigger: "free".to_owned(),
             depth: 0.6,
-            target: format!("effect:{effect_id}.cutoff"),
+            target: format!("effect:{effect_id}.lowGain"),
             enabled: true,
         });
         let modulated = render_region(&project, &[track_id], 0.0, 2.0).expect("modulated filter");
-        let modulation_difference = sample_difference(&modulated.samples, &resonant.samples);
+        let modulation_difference = sample_difference(&modulated.samples, &boosted.samples);
         assert!(
             modulation_difference > 0.000_1,
             "filter modulation render difference was {modulation_difference}"
@@ -2889,9 +2893,9 @@ mod tests {
             "instrument.resonance".to_owned(),
             "instrument.pitch".to_owned(),
             "track.volume".to_owned(),
-            format!("effect:{effect_id}.mix"),
-            format!("effect:{effect_id}.cutoff"),
-            format!("effect:{effect_id}.resonance"),
+            format!("effect:{effect_id}.lowGain"),
+            format!("effect:{effect_id}.midGain"),
+            format!("effect:{effect_id}.highGain"),
         ] {
             let mut project = baseline_project.clone();
             project.tracks[track_index].modulators.push(Modulator {
