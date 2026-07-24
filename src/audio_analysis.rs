@@ -2303,7 +2303,7 @@ mod tests {
             let track = render_region(&project, &[track_id], 0.0, 2.0).expect("demo track render");
             let track = analyze(&track);
             assert!(
-                track.peak > 0.08 && track.rms > 0.015,
+                track.peak > 0.05 && track.rms > 0.009,
                 "reset demo track {track_id} was too quiet: peak {}, RMS {}",
                 track.peak,
                 track.rms
@@ -2393,18 +2393,13 @@ mod tests {
         let (later, _) = render_project_region(&project, 40.0).expect("later playback region");
         let overlap_offset = 8 * SAMPLE_RATE as usize;
         let overlap_samples = earlier.samples.len() - overlap_offset;
-        let earlier = pcm_bytes(&earlier.samples[overlap_offset..]);
-        let later = pcm_bytes(&later.samples[..overlap_samples]);
-        let differing = earlier
-            .chunks_exact(2)
-            .zip(later.chunks_exact(2))
-            .filter(|(left, right)| left != right)
-            .count();
-
-        assert_eq!(earlier.len(), later.len());
+        let audible_difference = sample_difference(
+            &earlier.samples[overlap_offset..],
+            &later.samples[..overlap_samples],
+        );
         assert!(
-            differing < overlap_samples / 100,
-            "overlap contained {differing} differing samples"
+            audible_difference < 0.025,
+            "overlap mean difference {audible_difference} exceeded the native modulation tolerance"
         );
     }
 

@@ -70,10 +70,7 @@ impl Engine {
         };
         engine.apply_preset(&instrument.preset)?;
         engine.set_instrument_parameters(instrument)?;
-        if effects
-            .iter()
-            .any(|effect| effect.enabled && is_native_effect(&effect.name))
-        {
+        if !effects.is_empty() {
             engine.apply_effects(effects, effect_order)?;
         }
         Ok(engine)
@@ -240,14 +237,12 @@ impl Engine {
             for spec in crate::model::effect_parameter_specs(&effect.name) {
                 let native = format!("{slot} {}", spec.native);
                 if self.parameters.contains_key(&native) {
-                    if effect
-                        .parameter_overrides
-                        .iter()
-                        .any(|parameter| parameter == spec.name)
-                        && let Some(value) = effect.parameters.get(spec.name)
-                    {
-                        self.set_parameter(&native, *value)?;
-                    }
+                    let value = effect
+                        .parameters
+                        .get(spec.name)
+                        .copied()
+                        .unwrap_or(spec.default);
+                    self.set_parameter(&native, value)?;
                     self.effect_parameters
                         .insert((effect.id, spec.name.to_owned()), native);
                 }
@@ -273,6 +268,13 @@ impl Engine {
                     .is_some_and(|value| value >= 0.02)
             })
             .count()
+    }
+
+    #[cfg(test)]
+    fn effect_parameter_value(&self, effect_id: u64, parameter: &str) -> Option<f32> {
+        self.effect_parameters
+            .get(&(effect_id, parameter.to_owned()))
+            .and_then(|native| self.parameter_value(native))
     }
 }
 
@@ -527,7 +529,7 @@ mod tests {
         engine.parameters = parameter_map(&engine.synth);
         assert_eq!(engine.occupied_effect_slots(), 1);
 
-        let effects = (0..SERIAL_EFFECT_SLOT_COUNT)
+        let mut effects = (0..SERIAL_EFFECT_SLOT_COUNT)
             .map(|index| Effect {
                 id: 100 + index as u64,
                 name: "Distortion".to_owned(),
@@ -547,6 +549,57 @@ mod tests {
             .apply_effects(&effects, &order)
             .expect("full graph-owned Surge effect chain");
         assert_eq!(engine.occupied_effect_slots(), SERIAL_EFFECT_SLOT_COUNT);
+
+        for effect in &mut effects {
+            effect.enabled = false;
+        }
+        engine
+            .set_parameter(
+                "FX A1 FX Type",
+                effect_type_index("Reverb 2").expect("reverb type") as f32
+                    / (SURGE_EFFECT_TYPES.len() - 1) as f32,
+            )
+            .expect("restored embedded preset effect");
+        engine
+            .apply_effects(&effects, &order)
+            .expect("disabled graph-owned effect chain");
+        assert_eq!(engine.occupied_effect_slots(), 0);
+    }
+
+    #[test]
+    fn graph_effect_defaults_are_applied_without_explicit_overrides() {
+        let instrument = crate::model::Project::demo().tracks[1].instrument.clone();
+        let effect = Effect {
+            id: 77,
+            name: "Distortion".to_owned(),
+            mix: 0.6,
+            cutoff_hz: None,
+            resonance: None,
+            enabled: true,
+            parameters: crate::model::effect_parameter_specs("Distortion")
+                .iter()
+                .map(|spec| (spec.name.to_owned(), spec.default))
+                .collect(),
+            parameter_overrides: Vec::new(),
+        };
+        let engine = Engine::new(
+            &instrument,
+            std::slice::from_ref(&effect),
+            &[effect.id],
+            16_000.0,
+        )
+        .expect("graph effect defaults");
+        for spec in crate::model::effect_parameter_specs("Distortion") {
+            let actual = engine
+                .effect_parameter_value(effect.id, spec.name)
+                .unwrap_or_else(|| panic!("missing native {} parameter", spec.name));
+            assert!(
+                (actual - spec.default).abs() < 0.001,
+                "{} used native {actual} instead of graph default {}",
+                spec.name,
+                spec.default
+            );
+        }
     }
 
     #[test]
