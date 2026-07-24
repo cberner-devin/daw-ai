@@ -33,6 +33,11 @@ const DEFAULT_INTERACTIONS_ENDPOINT: &str =
 const SYSTEMD_CREDENTIAL_NAME: &str = "gemini-api-key";
 pub(crate) const EDIT_TIMEOUT_SECONDS: u64 = 20 * 60;
 const EDIT_TIMEOUT: Duration = Duration::from_secs(EDIT_TIMEOUT_SECONDS);
+const TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
 #[cfg(test)]
 type Object = Map<String, JsonValue>;
 
@@ -143,14 +148,15 @@ fn run_session(
         on_update,
         &|| cancellation.load(Ordering::SeqCst),
         &mut |sequence, request, remaining| {
-            call_interactions(
+            call_interactions_with_retry(
                 session,
-                &format!("interaction-{sequence:03}"),
+                sequence,
                 request,
                 &api_key,
                 &endpoint,
                 remaining,
                 &cancellation,
+                &TRANSIENT_RETRY_DELAYS,
             )
         },
     )
@@ -558,6 +564,108 @@ fn call_interactions(
         return Err(PlannerError::Failed(message));
     }
     Ok(response)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_interactions_with_retry(
+    session: &EditSession,
+    sequence: usize,
+    request: &JsonValue,
+    api_key: &str,
+    endpoint: &str,
+    remaining: Duration,
+    cancellation: &Arc<AtomicBool>,
+    retry_delays: &[Duration],
+) -> Result<String, PlannerError> {
+    retry_transient_interaction(
+        sequence,
+        remaining,
+        cancellation,
+        retry_delays,
+        &mut |exchange_name, available| {
+            call_interactions(
+                session,
+                exchange_name,
+                request,
+                api_key,
+                endpoint,
+                available,
+                cancellation,
+            )
+        },
+    )
+}
+
+fn retry_transient_interaction(
+    sequence: usize,
+    remaining: Duration,
+    cancellation: &Arc<AtomicBool>,
+    retry_delays: &[Duration],
+    transport: &mut impl FnMut(&str, Duration) -> Result<String, PlannerError>,
+) -> Result<String, PlannerError> {
+    let started = Instant::now();
+    for attempt in 0..=retry_delays.len() {
+        let exchange_name = if attempt == 0 {
+            format!("interaction-{sequence:03}")
+        } else {
+            format!("interaction-{sequence:03}-retry-{attempt}")
+        };
+        let available = remaining
+            .checked_sub(started.elapsed())
+            .ok_or(PlannerError::TimedOut)?;
+        let response = transport(&exchange_name, available);
+        let retry = match &response {
+            Ok(body) => transient_api_error(body),
+            Err(PlannerError::Failed(message)) => transient_api_message(message),
+            _ => false,
+        };
+        if !retry || attempt == retry_delays.len() {
+            return response;
+        }
+        wait_for_retry(retry_delays[attempt], remaining, started, cancellation)?;
+    }
+    unreachable!("retry loop always returns")
+}
+
+fn transient_api_error(source: &str) -> bool {
+    serde_json::from_str::<JsonValue>(source)
+        .ok()
+        .and_then(|body| {
+            body.get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|code| code == "service_unavailable")
+}
+
+fn transient_api_message(message: &str) -> bool {
+    message.eq_ignore_ascii_case("the service is currently unavailable.")
+        || message.eq_ignore_ascii_case("service unavailable")
+}
+
+fn wait_for_retry(
+    delay: Duration,
+    remaining: Duration,
+    started: Instant,
+    cancellation: &Arc<AtomicBool>,
+) -> Result<(), PlannerError> {
+    let deadline = Instant::now() + delay;
+    loop {
+        if cancellation.load(Ordering::SeqCst) {
+            return Err(PlannerError::Interrupted);
+        }
+        if started.elapsed() >= remaining {
+            return Err(PlannerError::TimedOut);
+        }
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(25));
+        if wait.is_zero() {
+            return Ok(());
+        }
+        thread::sleep(wait);
+    }
 }
 
 fn load_api_key() -> Result<String, PlannerError> {
@@ -1418,6 +1526,39 @@ mod tests {
             &cancellation,
         );
         assert!(matches!(result, Err(PlannerError::Interrupted)));
+    }
+
+    #[test]
+    fn transient_service_unavailability_retries_the_same_interaction() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut attempts = Vec::new();
+        let mut responses = [
+            r#"{"error":{"message":"The service is currently unavailable.","code":"service_unavailable"}}"#,
+            r#"{"error":{"message":"The service is currently unavailable.","code":"service_unavailable"}}"#,
+            r#"{"id":"recovered","status":"completed","steps":[]}"#,
+        ]
+        .into_iter();
+        let response = retry_transient_interaction(
+            7,
+            Duration::from_secs(1),
+            &cancellation,
+            &[Duration::ZERO, Duration::ZERO],
+            &mut |name, _| {
+                attempts.push(name.to_owned());
+                Ok(responses.next().expect("retry response").to_owned())
+            },
+        )
+        .expect("transient interaction recovery");
+
+        assert_eq!(
+            attempts,
+            [
+                "interaction-007",
+                "interaction-007-retry-1",
+                "interaction-007-retry-2"
+            ]
+        );
+        assert!(response.contains("\"id\":\"recovered\""));
     }
 
     #[test]
