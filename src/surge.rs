@@ -41,6 +41,7 @@ pub(crate) struct Engine {
     _guard: MutexGuard<'static, ()>,
     parameters: HashMap<String, i32>,
     effect_mix_parameters: HashMap<u64, String>,
+    effect_parameters: HashMap<(u64, String), String>,
 }
 
 impl Engine {
@@ -60,6 +61,7 @@ impl Engine {
             parameters: parameter_map(&synth),
             synth,
             effect_mix_parameters: HashMap::new(),
+            effect_parameters: HashMap::new(),
         };
         engine.apply_preset(&instrument.preset)?;
         engine.set_instrument_parameters(instrument)?;
@@ -117,6 +119,22 @@ impl Engine {
             return Ok(());
         };
         self.set_parameter(&parameter, value)
+    }
+
+    pub(crate) fn set_effect_parameter(
+        &mut self,
+        effect_id: u64,
+        parameter: &str,
+        value: f32,
+    ) -> Result<(), String> {
+        let Some(native) = self
+            .effect_parameters
+            .get(&(effect_id, parameter.to_owned()))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        self.set_parameter(&native, value)
     }
 
     fn set_instrument_parameters(&mut self, instrument: &Instrument) -> Result<(), String> {
@@ -194,6 +212,21 @@ impl Engine {
             if self.parameters.contains_key(&mix_parameter) {
                 self.set_parameter(&mix_parameter, effect.mix)?;
                 self.effect_mix_parameters.insert(effect.id, mix_parameter);
+            }
+            for spec in crate::model::effect_parameter_specs(&effect.name) {
+                let native = format!("{slot} {}", spec.native);
+                if self.parameters.contains_key(&native) {
+                    if effect
+                        .parameter_overrides
+                        .iter()
+                        .any(|parameter| parameter == spec.name)
+                        && let Some(value) = effect.parameters.get(spec.name)
+                    {
+                        self.set_parameter(&native, *value)?;
+                    }
+                    self.effect_parameters
+                        .insert((effect.id, spec.name.to_owned()), native);
+                }
             }
         }
         Ok(())
@@ -393,6 +426,11 @@ mod tests {
                 cutoff_hz: None,
                 resonance: None,
                 enabled: true,
+                parameters: crate::model::effect_parameter_specs(name)
+                    .iter()
+                    .map(|spec| (spec.name.to_owned(), spec.default))
+                    .collect(),
+                parameter_overrides: Vec::new(),
             };
             let mut engine = Engine::new(&instrument, &[effect], &[77], 16_000.0)
                 .unwrap_or_else(|error| panic!("{name} did not load: {error}"));

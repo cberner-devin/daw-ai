@@ -28,6 +28,12 @@ struct EffectMixes {
     chorus: f32,
     compression: f32,
     filter_bypass: bool,
+    drive_amount: f32,
+    delay_time: f32,
+    reverb_decay: f32,
+    modulation_depth: f32,
+    compressor_threshold: f32,
+    output_gain: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -41,6 +47,12 @@ struct AutomationFrame {
     reverb: f32,
     chorus: f32,
     compression: f32,
+    delay_time: f32,
+    reverb_decay: f32,
+    modulation_depth: f32,
+    compressor_threshold: f32,
+    drive_amount: f32,
+    output_gain: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -677,6 +689,20 @@ fn render_track(
                 time,
             );
             engine.set_effect_mix(effect.id, mix)?;
+            for (parameter, base) in &effect.parameters {
+                let target = format!("effect:{}.{}", effect.id, parameter);
+                if !effect.parameter_overrides.contains(parameter)
+                    && !render_state.automation.lanes.contains_key(target.as_str())
+                    && !track
+                        .modulators
+                        .iter()
+                        .any(|modulator| modulator.enabled && modulator.target == target)
+                {
+                    continue;
+                }
+                let value = parameter_at(project, track, render_state, &target, *base, time);
+                engine.set_effect_parameter(effect.id, parameter, value)?;
+            }
         }
         let block = engine.process();
         for index in 0..count {
@@ -1275,26 +1301,38 @@ fn process_track_audio(
                 let mut low = 0.0;
                 for (index, sample) in samples.iter_mut().enumerate() {
                     let send = frames[index / AUTOMATION_SAMPLES].drive;
-                    let wet = drive_sample(*sample * send);
+                    let wet = drive_sample(
+                        *sample
+                            * send
+                            * (0.5 + frames[index / AUTOMATION_SAMPLES].drive_amount * 3.0),
+                    ) * (0.5 + frames[index / AUTOMATION_SAMPLES].output_gain);
                     low += alpha * (wet - low);
                     *sample += wet - low;
                 }
             }
             EffectStage::Echo => {
-                dynamic_delay_mix(samples, &frames, 30.0 / project.bpm as f32, |frame| {
-                    frame.echo
-                })
+                let delay = frames.first().map_or(30.0 / project.bpm as f32, |frame| {
+                    let beat = 60.0 / project.bpm as f32;
+                    beat * (1.0 + (frame.delay_time * 7.0).round()) / 8.0
+                });
+                dynamic_delay_mix(samples, &frames, delay, |frame| frame.echo)
             }
             EffectStage::Reverb => {
-                dynamic_delay_mix(samples, &frames, 0.085, |frame| frame.reverb);
+                dynamic_delay_mix(samples, &frames, 0.085, |frame| {
+                    frame.reverb * (0.5 + frame.reverb_decay)
+                });
             }
             EffectStage::Chorus => {
-                dynamic_delay_mix(samples, &frames, 0.018, |frame| frame.chorus);
+                dynamic_delay_mix(samples, &frames, 0.018, |frame| {
+                    frame.chorus * (0.5 + frame.modulation_depth)
+                });
             }
             EffectStage::Compression => {
                 for (index, sample) in samples.iter_mut().enumerate() {
                     let mix = frames[index / AUTOMATION_SAMPLES].compression;
-                    let compressed = (*sample * 2.5).tanh() / 2.5_f32.tanh();
+                    let drive = 1.25
+                        + (1.0 - frames[index / AUTOMATION_SAMPLES].compressor_threshold) * 4.0;
+                    let compressed = (*sample * drive).tanh() / drive.tanh();
                     *sample += compressed * mix;
                 }
             }
@@ -1431,6 +1469,25 @@ fn automation_at(
                 time,
             );
         }
+        for (name, base) in &effect.parameters {
+            let value = parameter_at(
+                project,
+                track,
+                render_state,
+                &format!("effect:{}.{}", effect.id, name),
+                *base,
+                time,
+            );
+            match name.as_str() {
+                "drive" => effects.drive_amount = value,
+                "time" => effects.delay_time = value,
+                "decay" => effects.reverb_decay = value,
+                "depth" => effects.modulation_depth = value,
+                "threshold" => effects.compressor_threshold = value,
+                "output" => effects.output_gain = value,
+                _ => {}
+            }
+        }
     }
     let mut regional = RegionalAutomation {
         role: track.role,
@@ -1473,6 +1530,12 @@ fn automation_at(
         reverb: (effects.reverb.max(effects.room).max(effects.shimmer) * 0.7).min(0.6),
         chorus: (effects.chorus * 0.5).min(0.5),
         compression: (effects.compression * 0.45).min(0.5),
+        delay_time: effects.delay_time,
+        reverb_decay: effects.reverb_decay,
+        modulation_depth: effects.modulation_depth,
+        compressor_threshold: effects.compressor_threshold,
+        drive_amount: effects.drive_amount,
+        output_gain: effects.output_gain,
     }
 }
 
@@ -2724,6 +2787,11 @@ mod tests {
             cutoff_hz: None,
             resonance: None,
             enabled: true,
+            parameters: crate::model::effect_parameter_specs("Distortion")
+                .iter()
+                .map(|spec| (spec.name.to_owned(), spec.default))
+                .collect(),
+            parameter_overrides: Vec::new(),
         });
         project.tracks[1].routing.effect_order.push(9_002);
         let surge_driven =
