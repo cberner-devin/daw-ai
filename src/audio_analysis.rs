@@ -463,17 +463,18 @@ fn render_audio_samples(
             continue;
         }
         let mut rendered = vec![0.0; mix.len()];
+        let mut audio_input = vec![0.0; mix.len()];
+        mix_audio_clips(track, start_sample, &mut audio_input)?;
         let render_state = TrackRenderState::new(project, track, start, end);
         render_track(
             project,
             track,
             &render_state,
-            start,
             start_sample,
+            &audio_input,
             &mut rendered,
             &mut event_onsets,
         )?;
-        render_surge_audio_clips(project, track, &render_state, start_sample, &mut rendered)?;
         apply_track_gain(project, track, &render_state, start_sample, &mut rendered);
         for (output, sample) in mix.iter_mut().zip(rendered) {
             *output += sample;
@@ -520,70 +521,6 @@ fn mix_audio_clips(
                 output[output_index] += *sample * clip.gain;
             }
         }
-    }
-    Ok(())
-}
-
-fn render_surge_audio_clips(
-    project: &Project,
-    track: &Track,
-    render_state: &TrackRenderState<'_>,
-    start_sample: usize,
-    output: &mut [f32],
-) -> Result<(), String> {
-    if track.audio_clips.is_empty() {
-        return Ok(());
-    }
-    let mut clips = vec![0.0; output.len()];
-    mix_audio_clips(track, start_sample, &mut clips)?;
-    if !track.effects.iter().any(|effect| effect.enabled) {
-        for (sample, clip) in output.iter_mut().zip(clips) {
-            *sample += clip;
-        }
-        return Ok(());
-    }
-
-    let input_id = u64::MAX;
-    let mut effects = Vec::with_capacity(track.effects.len() + 1);
-    effects.push(crate::model::Effect {
-        id: input_id,
-        name: "Audio Input".to_owned(),
-        mix: 1.0,
-        cutoff_hz: None,
-        resonance: None,
-        enabled: true,
-        parameters: std::collections::BTreeMap::new(),
-        parameter_overrides: Vec::new(),
-    });
-    effects.extend(track.effects.iter().cloned());
-    let mut effect_order = Vec::with_capacity(track.routing.effect_order.len() + 1);
-    effect_order.push(input_id);
-    effect_order.extend(track.routing.effect_order.iter().copied());
-    let mut instrument = track.instrument.clone();
-    instrument.preset = "Init".to_owned();
-    instrument.parameter_overrides.clear();
-    let mut engine =
-        crate::surge::Engine::new(&instrument, &effects, &effect_order, SAMPLE_RATE as f32)?;
-
-    let mut output_index = 0;
-    while output_index < output.len() {
-        let block_start = start_sample + output_index;
-        let count = crate::surge::BLOCK_SIZE.min(output.len() - output_index);
-        set_surge_effect_controls(
-            &mut engine,
-            project,
-            track,
-            render_state,
-            precise_sample_time(block_start),
-        )?;
-        let mut input = [[0.0; crate::surge::BLOCK_SIZE]; 2];
-        input[0][..count].copy_from_slice(&clips[output_index..output_index + count]);
-        input[1][..count].copy_from_slice(&clips[output_index..output_index + count]);
-        let block = engine.process_with_input(input);
-        for index in 0..count {
-            output[output_index + index] += (block[0][index] + block[1][index]) * 0.5;
-        }
-        output_index += count;
     }
     Ok(())
 }
@@ -647,11 +584,12 @@ fn render_track(
     project: &Project,
     track: &Track,
     render_state: &TrackRenderState<'_>,
-    start: f64,
     start_sample: usize,
+    audio_input: &[f32],
     output: &mut [f32],
     event_onsets: &mut Vec<f32>,
 ) -> Result<(), String> {
+    let start = precise_sample_time(start_sample);
     let beat_duration = 60.0 / f64::from(project.bpm);
     let mut midi = Vec::new();
     for (sequence, occurrence) in render_state.occurrences.iter().enumerate() {
@@ -683,10 +621,31 @@ fn render_track(
     }
     midi.sort_by_key(|event| (event.sample, event.note_on));
 
+    let process_audio_through_effects =
+        !track.audio_clips.is_empty() && track.effects.iter().any(|effect| effect.enabled);
+    let mut effects = track.effects.clone();
+    let mut effect_order = track.routing.effect_order.clone();
+    if process_audio_through_effects {
+        let input_id = u64::MAX;
+        effects.insert(
+            0,
+            crate::model::Effect {
+                id: input_id,
+                name: "Audio Input".to_owned(),
+                mix: 1.0,
+                cutoff_hz: None,
+                resonance: None,
+                enabled: true,
+                parameters: std::collections::BTreeMap::new(),
+                parameter_overrides: Vec::new(),
+            },
+        );
+        effect_order.insert(0, input_id);
+    }
     let mut engine = crate::surge::Engine::new(
         &track.instrument,
-        &track.effects,
-        &track.routing.effect_order,
+        &effects,
+        &effect_order,
         SAMPLE_RATE as f32,
     )?;
     let mut event_index = midi.partition_point(|event| event.sample < start_sample);
@@ -737,9 +696,21 @@ fn render_track(
             engine.set_parameter(name, value)?;
         }
         set_surge_effect_controls(&mut engine, project, track, render_state, time)?;
-        let block = engine.process();
+        let block = if process_audio_through_effects {
+            let mut input = [[0.0; crate::surge::BLOCK_SIZE]; 2];
+            input[0][..count].copy_from_slice(&audio_input[output_index..output_index + count]);
+            input[1][..count].copy_from_slice(&audio_input[output_index..output_index + count]);
+            engine.process_with_input(input)
+        } else {
+            engine.process()
+        };
         for index in 0..count {
-            output[output_index + index] = (block[0][index] + block[1][index]) * 0.5;
+            let dry_audio = if process_audio_through_effects {
+                0.0
+            } else {
+                audio_input[output_index + index]
+            };
+            output[output_index + index] = (block[0][index] + block[1][index]) * 0.5 + dry_audio;
         }
         output_index += count;
     }
@@ -2989,6 +2960,53 @@ mod tests {
                 "track effects must process audio clips in both engines"
             );
         }
+        std::fs::remove_file(path).expect("remove audio clip fixture");
+    }
+
+    #[test]
+    fn surge_midi_and_audio_share_one_track_engine() {
+        let (mut project, path) = audio_clip_project();
+        let track_id = project.tracks[0].id;
+        project.tracks[0].clips.push(Clip {
+            id: 9_110,
+            label: "MIDI layer".to_owned(),
+            start: 0.0,
+            end: 1.0,
+            source_start: 0.0,
+            style: "test".to_owned(),
+            playback_mode: "once".to_owned(),
+            loop_beats: 1.0,
+            events: vec![ClipEvent {
+                id: 9_111,
+                kind: "note".to_owned(),
+                time: 0.0,
+                duration: 0.8,
+                pitch: 57,
+                velocity: 1.0,
+            }],
+        });
+        project.tracks[0].effects.push(crate::model::Effect {
+            id: 9_112,
+            name: "Distortion".to_owned(),
+            mix: 1.0,
+            cutoff_hz: None,
+            resonance: None,
+            enabled: true,
+            parameters: crate::model::effect_parameter_specs("Distortion")
+                .iter()
+                .map(|spec| (spec.name.to_owned(), spec.default))
+                .collect(),
+            parameter_overrides: Vec::new(),
+        });
+        project.tracks[0].routing.effect_order.push(9_112);
+
+        crate::surge::reset_engine_creation_count();
+        render_region(&project, &[track_id], 0.0, 1.0).expect("combined track render");
+        assert_eq!(
+            crate::surge::engine_creation_count(),
+            1,
+            "MIDI and audio clips on one track must share one Surge effect instance"
+        );
         std::fs::remove_file(path).expect("remove audio clip fixture");
     }
 

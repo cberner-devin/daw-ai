@@ -40,6 +40,10 @@ const STARTER_PATCH_BASE: &[(&str, f32)] = &[
 ];
 
 static SURGE_ENGINE_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+thread_local! {
+    static ENGINE_CREATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 pub(crate) struct Engine {
     synth: SurgeSynthesizer,
@@ -56,6 +60,8 @@ impl Engine {
         effect_order: &[u64],
         sample_rate: f32,
     ) -> Result<Self, String> {
+        #[cfg(test)]
+        ENGINE_CREATIONS.set(ENGINE_CREATIONS.get() + 1);
         let guard = SURGE_ENGINE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -276,6 +282,16 @@ impl Engine {
             .get(&(effect_id, parameter.to_owned()))
             .and_then(|native| self.parameter_value(native))
     }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_engine_creation_count() {
+    ENGINE_CREATIONS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn engine_creation_count() -> usize {
+    ENGINE_CREATIONS.get()
 }
 
 pub(crate) const SURGE_EFFECT_TYPES: &[&str] = &[
