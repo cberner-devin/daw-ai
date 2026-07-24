@@ -174,16 +174,16 @@ impl Engine {
     }
 
     fn apply_preset(&mut self, preset: &str) -> Result<(), String> {
-        if let Some(factory) = crate::surge_presets::find(preset) {
+        if let Some(preset) = preset_parameters(preset) {
+            for &(parameter, value) in STARTER_PATCH_BASE.iter().chain(preset) {
+                self.set_parameter(parameter, value)?;
+            }
+        } else if let Some(factory) = crate::surge_presets::find(preset) {
             let mut data = std::fs::read(&factory.path)
                 .map_err(|error| format!("could not read Surge XT preset {preset}: {error}"))?;
             self.synth.load_raw(&mut data, Some(true));
         } else {
-            let preset = preset_parameters(preset)
-                .ok_or_else(|| format!("unsupported Surge XT preset: {preset}"))?;
-            for &(parameter, value) in STARTER_PATCH_BASE.iter().chain(preset) {
-                self.set_parameter(parameter, value)?;
-            }
+            return Err(format!("unsupported Surge XT preset: {preset}"));
         }
         // Oscillator types can change the names of their mode parameters.
         self.synth.process();

@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::{env, fs};
 
 pub(crate) const FACTORY_PREFIX: &str = "Factory/";
@@ -31,18 +32,46 @@ pub(crate) fn catalog() -> Vec<Preset> {
     let Some(root) = factory_root() else {
         return Vec::new();
     };
+    catalog_for_root(&root).as_ref().clone()
+}
+
+fn catalog_for_root(root: &Path) -> Arc<Vec<Preset>> {
+    static CATALOGS: OnceLock<Mutex<HashMap<PathBuf, Arc<Vec<Preset>>>>> = OnceLock::new();
+    let catalogs = CATALOGS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(catalog) = catalogs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(root)
+        .cloned()
+    {
+        return catalog;
+    }
+
     let mut presets = Vec::new();
-    collect_presets(&root, &root, &mut presets);
+    collect_presets(root, root, &mut presets);
     presets.sort_by(|left, right| {
         left.category
             .cmp(&right.category)
             .then_with(|| left.name.cmp(&right.name))
     });
-    presets
+    let catalog = Arc::new(presets);
+    catalogs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(root.to_owned())
+        .or_insert_with(|| Arc::clone(&catalog))
+        .clone()
 }
 
 pub(crate) fn find(id: &str) -> Option<Preset> {
-    catalog().into_iter().find(|preset| preset.id == id)
+    if !is_factory_id(id) {
+        return None;
+    }
+    let root = factory_root()?;
+    catalog_for_root(&root)
+        .iter()
+        .find(|preset| preset.id == id)
+        .cloned()
 }
 
 pub(crate) fn browse<'a>(presets: &'a [Preset], path: &str) -> Option<PresetLevel<'a>> {
@@ -152,6 +181,26 @@ fn collect_presets(root: &Path, directory: &Path, presets: &mut Vec<Preset>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_root_catalog_is_indexed_once() {
+        let root = std::env::temp_dir().join(format!(
+            "daw-ai-preset-cache-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let pads = root.join("Pads");
+        fs::create_dir_all(&pads).expect("preset fixture directory");
+        fs::write(pads.join("Cached.fxp"), b"fixture").expect("preset fixture");
+
+        let first = catalog_for_root(&root);
+        let second = catalog_for_root(&root);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id, "Factory/Pads/Cached");
+
+        fs::remove_dir_all(root).expect("remove preset fixture");
+    }
 
     #[test]
     fn factory_ids_are_stable_and_safe() {
